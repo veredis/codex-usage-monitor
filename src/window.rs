@@ -618,6 +618,10 @@ struct QuotaAlert {
     message: String,
 }
 
+// Providers can report slightly different absolute reset timestamps for the
+// same quota window. Keep those shifts from re-arming an already sent alert.
+const RESET_TIME_JITTER_SECONDS: u64 = 5 * 60;
+
 fn collect_low_quota_alerts(state: &mut AppState, data: &AppUsageData) -> Vec<QuotaAlert> {
     let threshold = state.alert_threshold_percent;
     if threshold == 0 {
@@ -732,9 +736,32 @@ fn append_quota_alert(
         .map(|value| value.as_secs().to_string())
         .unwrap_or_else(|| "unknown".to_string());
     let key = format!("{prefix}{reset_key}");
-    notified.retain(|existing| !existing.starts_with(&prefix) || existing == &key);
-
     let remaining = poller::remaining_percentage(section.percentage).round() as u8;
+
+    let same_window_key = notified.iter().find(|existing| {
+        let Some(existing_reset) = existing.strip_prefix(&prefix) else {
+            return false;
+        };
+        match (reset_key.as_str(), existing_reset) {
+            ("unknown", "unknown") => true,
+            (current, previous) => match (current.parse::<u64>(), previous.parse::<u64>()) {
+                (Ok(current), Ok(previous)) => {
+                    current.abs_diff(previous) <= RESET_TIME_JITTER_SECONDS
+                }
+                _ => false,
+            },
+        }
+    });
+    if let Some(existing) = same_window_key {
+        if existing != &key {
+            let existing = existing.clone();
+            notified.remove(&existing);
+            notified.insert(key);
+        }
+        return;
+    }
+
+    notified.retain(|existing| !existing.starts_with(&prefix));
     if remaining > threshold || !notified.insert(key) {
         return;
     }
@@ -2314,6 +2341,7 @@ fn do_poll(send_hwnd: SendHwnd) {
         Ok(data) => {
             let mut state = lock_state();
             let mut quota_alerts = Vec::new();
+            let mut quota_notification_state_changed = false;
             if let Some(s) = state.as_mut() {
                 if let Some(claude_code) = data.claude_code.as_ref() {
                     s.session_percent = claude_code.session.percentage;
@@ -2343,7 +2371,9 @@ fn do_poll(send_hwnd: SendHwnd) {
                     }
                 }
 
+                let notified_before = s.notified_quota_windows.clone();
                 quota_alerts = collect_low_quota_alerts(s, &data);
+                quota_notification_state_changed = s.notified_quota_windows != notified_before;
                 s.data = Some(data);
                 s.last_poll_ok = true;
                 refresh_usage_texts(s);
@@ -2370,7 +2400,7 @@ fn do_poll(send_hwnd: SendHwnd) {
                     alert.title, alert.message
                 ));
             }
-            if !quota_alerts.is_empty() {
+            if !quota_alerts.is_empty() || quota_notification_state_changed {
                 save_state_settings();
             }
 
@@ -4493,6 +4523,36 @@ mod tests {
             &next,
         );
         assert_eq!(alerts.len(), 2);
+        assert_eq!(notified.len(), 1);
+    }
+
+    #[test]
+    fn low_quota_alert_ignores_accumulating_reset_time_jitter() {
+        let mut alerts = Vec::new();
+        let mut notified = BTreeSet::new();
+        let first_reset = UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+
+        for offset in [0, 4 * 60, 8 * 60, 12 * 60] {
+            let section = crate::models::UsageSection {
+                percentage: 96.0,
+                resets_at: Some(first_reset + Duration::from_secs(offset)),
+            };
+            append_quota_alert(
+                &mut alerts,
+                &mut notified,
+                5,
+                LanguageId::English,
+                tray_icon::TrayIconKind::Codex,
+                "codex",
+                "Codex",
+                "session",
+                "5-hour quota",
+                &section,
+            );
+        }
+
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].message.contains("4% remaining"));
         assert_eq!(notified.len(), 1);
     }
 }
