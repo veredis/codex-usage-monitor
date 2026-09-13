@@ -1,11 +1,15 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{BOOL, FILETIME, HWND, LPARAM, RECT, SYSTEMTIME};
+use windows::Win32::Foundation::{BOOL, COLORREF, FILETIME, HWND, LPARAM, RECT, SYSTEMTIME};
+use windows::Win32::Graphics::Dwm::DwmGetColorizationColor;
+use windows::Win32::Graphics::Gdi::{GetSysColor, COLOR_HIGHLIGHT};
 use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
+use windows::Win32::UI::Controls::Dialogs::{ChooseColorW, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW};
 use windows::Win32::UI::Shell::{SHAppBarMessage, ABM_GETTASKBARPOS, APPBARDATA};
 use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::UI::ViewManagement::{UIColorType, UISettings};
 
 // Window style constants
 pub const WS_POPUP_STYLE: u32 = 0x80000000;
@@ -231,7 +235,54 @@ impl Color {
         Self { r, g, b }
     }
 
+    pub const fn from_colorref(value: u32) -> Self {
+        Self {
+            r: (value & 0xFF) as u8,
+            g: ((value >> 8) & 0xFF) as u8,
+            b: ((value >> 16) & 0xFF) as u8,
+        }
+    }
+
     pub fn to_colorref(self) -> u32 {
         colorref(self.r, self.g, self.b)
+    }
+}
+
+/// Get the current Windows UI accent color, with the DWM/highlight colors as
+/// fallbacks for older or unavailable Windows Runtime configurations.
+pub fn windows_accent_color() -> Color {
+    if let Ok(settings) = UISettings::new() {
+        if let Ok(accent) = settings.GetColorValue(UIColorType::Accent) {
+            return Color::new(accent.R, accent.G, accent.B);
+        }
+    }
+
+    unsafe {
+        let mut colorization = 0u32;
+        let mut opaque_blend = BOOL(0);
+        if DwmGetColorizationColor(&mut colorization, &mut opaque_blend).is_ok() {
+            return Color::from_colorref(colorization);
+        }
+
+        Color::from_colorref(GetSysColor(COLOR_HIGHLIGHT))
+    }
+}
+
+/// Show the native Windows color picker and return the selected color.
+pub fn choose_custom_color(hwnd: HWND, initial: Color) -> Option<Color> {
+    unsafe {
+        let mut custom_colors = [COLORREF(0); 16];
+        let mut chooser = CHOOSECOLORW {
+            lStructSize: std::mem::size_of::<CHOOSECOLORW>() as u32,
+            hwndOwner: hwnd,
+            rgbResult: COLORREF(initial.to_colorref()),
+            lpCustColors: custom_colors.as_mut_ptr(),
+            Flags: CC_FULLOPEN | CC_RGBINIT,
+            ..Default::default()
+        };
+
+        ChooseColorW(&mut chooser)
+            .as_bool()
+            .then(|| Color::from_colorref(chooser.rgbResult.0))
     }
 }

@@ -21,7 +21,10 @@ It sits in your taskbar and shows how much of your Codex usage window remains wi
 - Optional Claude Code usage alongside Codex
 - Optional Antigravity model usage bars for Google's 5-hour and weekly Gemini quota windows
 - A live countdown until each limit resets
-- Optional low-quota alerts at 10%, 20%, or 30% remaining, deduplicated per reset window
+- Optional low-quota alerts at 5%, 10%, 20%, or 30% remaining, deduplicated per reset window
+- Remaining or used quota display modes, with Remaining as the default
+- Windows accent-colored or custom-colored usage bars
+- A 30-second update-frequency option
 - Independent display controls for the 5-hour and weekly rows
 - A small native widget that lives directly in the Windows taskbar
 - One system tray icon that matches the desktop app icon
@@ -112,9 +115,13 @@ Hovering over the tray icon shows a compact summary for all enabled services. Le
 
 ### Usage Display And Alerts
 
-Use the right-click **Usage display** menu to show both quota rows or only one. The app always keeps at least one row visible.
+Use the right-click **Usage display** menu to choose whether the bars and percentages show remaining or used quota, and to show both quota rows or only one. The app always keeps at least one row visible.
 
-Use **Quota alerts** to choose a remaining-quota threshold of 10%, 20%, or 30%. Alerts are off by default. Each provider and quota window is notified only once until its reset time changes, including across app restarts.
+Use **Bar color** to follow the current Windows accent or choose a custom color with the native Windows color picker. Use **Update frequency** to choose the polling interval, including 30 seconds.
+
+Use **Quota alerts** to choose a remaining-quota threshold of 5%, 10%, 20%, or 30%. Alerts are off by default. Each provider and quota window is notified only once until its reset time changes, including across app restarts.
+
+This fork preserves the original project and MIT license while adding these usage-display, bar-color, polling, alert, and compact reset-time options. It is not an official upstream release.
 
 In Simplified Chinese, the compact taskbar rows use `5h` / `7d`, one continuous progress bar, remaining percentage, and a concrete local reset value such as `18:30重置` or `07/17重置`.
 

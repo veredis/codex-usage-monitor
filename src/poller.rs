@@ -1613,48 +1613,81 @@ fn is_leap(y: u64) -> bool {
 pub fn format_line(
     section: &UsageSection,
     strings: Strings,
-    show_remaining_in_chinese: bool,
+    is_simplified_chinese: bool,
+    display_remaining: bool,
     window: UsageWindowKind,
 ) -> String {
-    if show_remaining_in_chinese {
-        return format_simplified_chinese_line(section, window);
+    if is_simplified_chinese {
+        return format_simplified_chinese_line(section, display_remaining, window);
     }
 
-    let pct = format!("{:.0}%", section.percentage);
+    let percentage = if display_remaining {
+        remaining_percentage(section.percentage)
+    } else {
+        section.percentage.clamp(0.0, 100.0)
+    };
+    let pct = format!("{percentage:.0}%");
     let cd = format_countdown(section.resets_at, strings);
     if cd.is_empty() {
         pct
     } else {
-        format!("{pct} \u{00b7} {cd}")
+        format!("{pct} {cd}")
     }
 }
 
-fn format_simplified_chinese_line(section: &UsageSection, window: UsageWindowKind) -> String {
-    let remaining = remaining_percentage(section.percentage);
+fn format_simplified_chinese_line(
+    section: &UsageSection,
+    display_remaining: bool,
+    window: UsageWindowKind,
+) -> String {
+    let percentage = if display_remaining {
+        remaining_percentage(section.percentage)
+    } else {
+        section.percentage.clamp(0.0, 100.0)
+    };
     let reset = section
         .resets_at
         .and_then(native_interop::system_time_to_local);
-    format_simplified_chinese_values(remaining, reset, window)
+    format_simplified_chinese_values_with_label(
+        percentage,
+        reset,
+        window,
+        if display_remaining {
+            "剩余"
+        } else {
+            "已用"
+        },
+    )
 }
 
+#[cfg(test)]
 fn format_simplified_chinese_values(
     remaining: f64,
     reset: Option<windows::Win32::Foundation::SYSTEMTIME>,
     window: UsageWindowKind,
 ) -> String {
+    format_simplified_chinese_values_with_label(remaining, reset, window, "剩余")
+}
+
+fn format_simplified_chinese_values_with_label(
+    percentage: f64,
+    reset: Option<windows::Win32::Foundation::SYSTEMTIME>,
+    window: UsageWindowKind,
+    label: &str,
+) -> String {
     let Some(reset) = reset else {
-        return format!("剩余{remaining:.0}%");
+        return format!("{label}{percentage:.0}%");
     };
     match window {
         UsageWindowKind::Session => {
             format!(
-                "剩余{remaining:.0}%  {:02}:{:02}重置",
+                "{label}{percentage:.0}% {:02}:{:02}重置",
                 reset.wHour, reset.wMinute
             )
         }
         UsageWindowKind::Weekly => {
             format!(
-                "剩余{remaining:.0}%  {:02}/{:02}重置",
+                "{label}{percentage:.0}% {:02}/{:02}重置",
                 reset.wMonth, reset.wDay
             )
         }
@@ -1694,7 +1727,12 @@ fn format_countdown_from_secs(total_secs: u64, strings: Strings) -> String {
     if total_days >= 1 {
         format!("{total_days}{}", strings.day_suffix)
     } else if total_hours >= 1 {
-        format!("{total_hours}{}", strings.hour_suffix)
+        format!(
+            "{total_hours}{}{:02}{}",
+            strings.hour_suffix,
+            total_mins % 60,
+            strings.minute_suffix
+        )
     } else if total_mins >= 1 {
         format!("{total_mins}{}", strings.minute_suffix)
     } else {
@@ -1841,7 +1879,7 @@ mod tests {
             resets_at: None,
         };
         assert_eq!(
-            format_line(&section, strings, true, UsageWindowKind::Session),
+            format_line(&section, strings, true, true, UsageWindowKind::Session),
             "剩余70%"
         );
         let session_reset = windows::Win32::Foundation::SYSTEMTIME {
@@ -1851,7 +1889,7 @@ mod tests {
         };
         assert_eq!(
             format_simplified_chinese_values(82.0, Some(session_reset), UsageWindowKind::Session,),
-            "剩余82%  18:30重置"
+            "剩余82% 18:30重置"
         );
         let weekly_reset = windows::Win32::Foundation::SYSTEMTIME {
             wMonth: 7,
@@ -1860,8 +1898,37 @@ mod tests {
         };
         assert_eq!(
             format_simplified_chinese_values(97.0, Some(weekly_reset), UsageWindowKind::Weekly,),
-            "剩余97%  07/17重置"
+            "剩余97% 07/17重置"
         );
+    }
+
+    #[test]
+    fn usage_display_mode_complements_percentage_for_remaining() {
+        let section = UsageSection {
+            percentage: 18.0,
+            resets_at: None,
+        };
+        let strings = crate::localization::LanguageId::English.strings();
+
+        assert_eq!(
+            format_line(&section, strings, false, true, UsageWindowKind::Session),
+            "82%"
+        );
+        assert_eq!(
+            format_line(&section, strings, false, false, UsageWindowKind::Session),
+            "18%"
+        );
+    }
+
+    #[test]
+    fn countdown_format_keeps_hours_and_minutes_compact() {
+        let strings = crate::localization::LanguageId::English.strings();
+        assert_eq!(
+            format_countdown_from_secs(3 * 3600 + 14 * 60, strings),
+            "3h14m"
+        );
+        assert_eq!(format_countdown_from_secs(3600 + 3 * 60, strings), "1h03m");
+        assert_eq!(format_countdown_from_secs(47 * 60, strings), "47m");
     }
 
     #[test]
