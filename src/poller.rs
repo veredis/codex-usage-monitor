@@ -11,7 +11,7 @@ use std::os::windows::process::CommandExt;
 
 use crate::diagnose;
 use crate::localization::Strings;
-use crate::models::{AppUsageData, UsageData, UsageSection};
+use crate::models::{AppUsageData, CreditBalance, UsageData, UsageSection};
 use crate::native_interop;
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
@@ -93,6 +93,20 @@ struct CodexTokenData {
 #[derive(Deserialize)]
 struct CodexUsageResponse {
     rate_limit: Option<Option<Box<CodexRateLimitDetails>>>,
+    credits: Option<CodexCredits>,
+}
+
+#[derive(Deserialize)]
+struct CodexCredits {
+    unlimited: Option<bool>,
+    balance: Option<CodexCreditBalanceValue>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CodexCreditBalanceValue {
+    Text(String),
+    Number(f64),
 }
 
 #[derive(Deserialize)]
@@ -897,8 +911,12 @@ fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData,
 }
 
 fn codex_usage_from_response(response: CodexUsageResponse) -> Option<UsageData> {
-    let details = *response.rate_limit.flatten()?;
     let mut data = UsageData::default();
+    data.credits = parse_codex_credits(response.credits);
+
+    let Some(details) = response.rate_limit.flatten().map(|details| *details) else {
+        return data.credits.is_some().then_some(data);
+    };
     let mut has_session = false;
     let mut has_weekly = false;
 
@@ -939,6 +957,25 @@ fn codex_usage_from_response(response: CodexUsageResponse) -> Option<UsageData> 
     }
 
     Some(data)
+}
+
+fn parse_codex_credits(credits: Option<CodexCredits>) -> Option<CreditBalance> {
+    let credits = credits?;
+    if credits.unlimited == Some(true) {
+        return Some(CreditBalance::Unlimited);
+    }
+
+    let balance = credits.balance?;
+    let amount = match balance {
+        CodexCreditBalanceValue::Text(value) => value.parse::<f64>().ok()?,
+        CodexCreditBalanceValue::Number(value) => value,
+    };
+    if !amount.is_finite() || amount < 0.0 {
+        // A malformed negative balance should remain unknown rather than
+        // being turned into a fabricated zero balance.
+        return None;
+    }
+    Some(CreditBalance::Amount(amount))
 }
 
 fn codex_window_kind(window: &CodexRateLimitWindow) -> Option<UsageWindowKind> {
@@ -1009,7 +1046,11 @@ fn fetch_antigravity_usage_from_endpoint(
     let session = fetch_antigravity_model_quota(base_url, token, project.as_deref())?;
     let weekly = UsageSection::default();
 
-    Ok(UsageData { session, weekly })
+    Ok(UsageData {
+        session,
+        weekly,
+        ..UsageData::default()
+    })
 }
 
 fn fetch_antigravity_project(base_url: &str, token: &str) -> Result<Option<String>, PollError> {
@@ -1797,6 +1838,7 @@ mod tests {
                 resets_at: None,
             },
             weekly: UsageSection::default(),
+            ..UsageData::default()
         }
     }
 
@@ -1829,6 +1871,71 @@ mod tests {
         assert!(usage.session.resets_at.is_none());
         assert_eq!(usage.weekly.percentage, 21.0);
         assert!(usage.weekly.resets_at.is_some());
+    }
+
+    #[test]
+    fn codex_credits_preserve_decimal_and_zero_balances() {
+        let response: CodexUsageResponse = serde_json::from_str(
+            r#"{
+                "rate_limit": {
+                    "primary_window": null,
+                    "secondary_window": null
+                },
+                "credits": {
+                    "has_credits": true,
+                    "unlimited": false,
+                    "balance": "98.5000000000"
+                }
+            }"#,
+        )
+        .unwrap();
+        let usage = codex_usage_from_response(response).unwrap();
+        assert_eq!(usage.credits, Some(CreditBalance::Amount(98.5)));
+
+        let response: CodexUsageResponse = serde_json::from_str(
+            r#"{
+                "rate_limit": null,
+                "credits": {
+                    "has_credits": true,
+                    "unlimited": false,
+                    "balance": "0"
+                }
+            }"#,
+        )
+        .unwrap();
+        let usage = codex_usage_from_response(response).unwrap();
+        assert_eq!(usage.credits, Some(CreditBalance::Amount(0.0)));
+    }
+
+    #[test]
+    fn codex_credits_keep_missing_and_unlimited_states_distinct() {
+        let response: CodexUsageResponse = serde_json::from_str(
+            r#"{
+                "rate_limit": null,
+                "credits": {
+                    "has_credits": false,
+                    "unlimited": false,
+                    "balance": null
+                }
+            }"#,
+        )
+        .unwrap();
+        let usage = codex_usage_from_response(response);
+        assert!(usage.is_none());
+
+        let response: CodexUsageResponse = serde_json::from_str(
+            r#"{
+                "rate_limit": null,
+                "credits": {
+                    "has_credits": true,
+                    "unlimited": true,
+                    "balance": null
+                }
+            }"#,
+        )
+        .unwrap();
+        let usage = codex_usage_from_response(response).unwrap();
+        assert_eq!(usage.credits, Some(CreditBalance::Unlimited));
     }
 
     #[test]

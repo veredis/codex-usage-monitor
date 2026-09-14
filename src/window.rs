@@ -19,7 +19,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
-use crate::models::AppUsageData;
+use crate::models::{AppUsageData, CreditBalance};
 use crate::native_interop::{
     self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, TIMER_UPDATE_CHECK, WM_APP_TRAY,
     WM_APP_USAGE_UPDATED,
@@ -75,6 +75,8 @@ struct AppState {
     show_session_window: bool,
     show_weekly_window: bool,
     usage_display: UsageDisplayMode,
+    credit_display: CreditDisplayMode,
+    codex_credit_text: String,
     bar_color: Option<String>,
     alert_threshold_percent: u8,
     notified_quota_windows: BTreeSet<String>,
@@ -153,6 +155,9 @@ const IDM_ALERT_5: u16 = 81;
 const IDM_ALERT_10: u16 = 82;
 const IDM_ALERT_20: u16 = 83;
 const IDM_ALERT_30: u16 = 84;
+const IDM_CREDIT_DISPLAY_ALWAYS: u16 = 85;
+const IDM_CREDIT_DISPLAY_WHEN_NEEDED: u16 = 86;
+const IDM_CREDIT_DISPLAY_OFF: u16 = 87;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
@@ -353,6 +358,8 @@ struct SettingsFile {
     show_weekly_window: bool,
     #[serde(default = "default_usage_display")]
     usage_display: String,
+    #[serde(default = "default_credit_display")]
+    credit_display: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     bar_color: Option<String>,
     #[serde(default)]
@@ -376,6 +383,7 @@ impl Default for SettingsFile {
             show_session_window: true,
             show_weekly_window: true,
             usage_display: default_usage_display(),
+            credit_display: default_credit_display(),
             bar_color: None,
             alert_threshold_percent: 0,
             notified_quota_windows: Vec::new(),
@@ -389,6 +397,10 @@ fn default_poll_interval() -> u32 {
 
 fn default_usage_display() -> String {
     "remaining".to_string()
+}
+
+fn default_credit_display() -> String {
+    "always".to_string()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -414,6 +426,33 @@ impl UsageDisplayMode {
         match self {
             Self::Remaining => "remaining",
             Self::Used => "used",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CreditDisplayMode {
+    Always,
+    WhenNeeded,
+    Off,
+}
+
+impl CreditDisplayMode {
+    fn from_setting(value: &str) -> Self {
+        if value.eq_ignore_ascii_case("when_needed") {
+            Self::WhenNeeded
+        } else if value.eq_ignore_ascii_case("off") {
+            Self::Off
+        } else {
+            Self::Always
+        }
+    }
+
+    fn as_setting(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::WhenNeeded => "when_needed",
+            Self::Off => "off",
         }
     }
 }
@@ -524,6 +563,9 @@ fn normalize_settings(mut settings: SettingsFile) -> SettingsFile {
             .as_setting()
             .to_string();
     }
+    settings.credit_display = CreditDisplayMode::from_setting(&settings.credit_display)
+        .as_setting()
+        .to_string();
     settings.bar_color = settings
         .bar_color
         .as_deref()
@@ -562,6 +604,7 @@ fn save_state_settings() {
             show_session_window: s.show_session_window,
             show_weekly_window: s.show_weekly_window,
             usage_display: s.usage_display.as_setting().to_string(),
+            credit_display: s.credit_display.as_setting().to_string(),
             bar_color: s.bar_color.clone(),
             alert_threshold_percent: s.alert_threshold_percent,
             notified_quota_windows: s.notified_quota_windows.iter().cloned().collect(),
@@ -588,12 +631,33 @@ fn service_tooltip(
     show_session_window: bool,
     show_weekly_window: bool,
 ) -> String {
+    service_tooltip_with_credit(
+        service,
+        session_text,
+        weekly_text,
+        show_session_window,
+        show_weekly_window,
+        None,
+    )
+}
+
+fn service_tooltip_with_credit(
+    service: &str,
+    session_text: &str,
+    weekly_text: &str,
+    show_session_window: bool,
+    show_weekly_window: bool,
+    credit: Option<(&str, &str)>,
+) -> String {
     let mut parts = Vec::new();
     if show_session_window {
         parts.push(format!("5h {session_text}"));
     }
     if show_weekly_window {
         parts.push(format!("7d {weekly_text}"));
+    }
+    if let Some((label, value)) = credit.filter(|(_, value)| !value.is_empty()) {
+        parts.push(format!("{label} {value}"));
     }
     format!("{service}: {}", parts.join(" | "))
 }
@@ -917,12 +981,13 @@ fn tray_icon_data_from_state() -> Option<tray_icon::TrayIconData> {
                 ));
             }
             if s.show_codex {
-                services.push(service_tooltip(
+                services.push(service_tooltip_with_credit(
                     strings.codex_model,
                     &s.codex_session_text,
                     &s.codex_weekly_text,
                     s.show_session_window,
                     s.show_weekly_window,
+                    Some((strings.credits, &s.codex_credit_text)),
                 ));
             }
             if s.show_antigravity {
@@ -1157,6 +1222,11 @@ fn refresh_usage_texts(state: &mut AppState) {
     }
 
     if let Some(codex) = data.codex.as_ref() {
+        state.codex_credit_text = codex
+            .credits
+            .as_ref()
+            .map(format_credit_balance)
+            .unwrap_or_default();
         state.codex_session_text = poller::format_line(
             &codex.session,
             strings,
@@ -1172,6 +1242,7 @@ fn refresh_usage_texts(state: &mut AppState) {
             poller::UsageWindowKind::Weekly,
         );
     } else if state.show_codex {
+        state.codex_credit_text.clear();
         state.codex_session_text = "!".to_string();
         state.codex_weekly_text = "!".to_string();
     }
@@ -1640,6 +1711,8 @@ const SIMPLIFIED_CHINESE_LABEL_WIDTH: i32 = 20;
 const SIMPLIFIED_CHINESE_TEXT_WIDTH: i32 = 126;
 const MODEL_RIGHT_MARGIN: i32 = 3;
 const RIGHT_MARGIN: i32 = 1;
+const CREDIT_TEXT_WIDTH: i32 = 60;
+const CREDIT_PANEL_WIDTH: i32 = 64;
 const WIDGET_HEIGHT: i32 = 46;
 
 fn is_drag_handle_point(client_x: i32, client_y: i32) -> bool {
@@ -1692,14 +1765,59 @@ fn usage_percent_for_display(display_remaining: bool, used_percentage: f64) -> f
     }
 }
 
-fn total_widget_width_for(active_models: i32, language: LanguageId) -> i32 {
+fn format_credit_balance(balance: &CreditBalance) -> String {
+    match balance {
+        CreditBalance::Amount(amount) => format!("{:.0}", amount.floor()),
+        CreditBalance::Unlimited => "∞".to_string(),
+    }
+}
+
+fn codex_credit_panel_visible(
+    show_codex: bool,
+    display: CreditDisplayMode,
+    data: Option<&AppUsageData>,
+) -> bool {
+    if !show_codex {
+        return false;
+    }
+    let Some(codex) = data.and_then(|data| data.codex.as_ref()) else {
+        return false;
+    };
+    if codex.credits.is_none() {
+        return false;
+    }
+
+    match display {
+        CreditDisplayMode::Always => true,
+        CreditDisplayMode::WhenNeeded => {
+            let session_empty =
+                poller::remaining_percentage(codex.session.percentage).round() == 0.0;
+            let weekly_empty = poller::remaining_percentage(codex.weekly.percentage).round() == 0.0;
+            session_empty || weekly_empty
+        }
+        CreditDisplayMode::Off => false,
+    }
+}
+
+fn total_widget_width_for(
+    active_models: i32,
+    language: LanguageId,
+    credit_panel_visible: bool,
+) -> i32 {
     let bar_segments = row_bar_segment_count(active_models);
     let (label_width, text_width) = usage_layout_widths(language);
     let model_width = (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * bar_segments - sc(SEGMENT_GAP)
         + sc(BAR_RIGHT_MARGIN)
         + sc(text_width);
 
-    sc(LEFT_DIVIDER_W)
+    let credits_width = if credit_panel_visible {
+        sc(CREDIT_PANEL_WIDTH)
+    } else {
+        0
+    };
+
+    credits_width
+        + sc(LEFT_DIVIDER_W)
         + sc(DIVIDER_RIGHT_MARGIN)
         + sc(label_width)
         + sc(LABEL_RIGHT_MARGIN)
@@ -1716,11 +1834,12 @@ fn total_widget_width_for_state(state: &AppState) -> i32 {
             state.show_antigravity,
         ),
         state.language,
+        codex_credit_panel_visible(state.show_codex, state.credit_display, state.data.as_ref()),
     )
 }
 
 fn total_widget_width() -> i32 {
-    let (active_models, language) = {
+    let (active_models, language, credit_panel_visible) = {
         let state = lock_state();
         state
             .as_ref()
@@ -1728,11 +1847,12 @@ fn total_widget_width() -> i32 {
                 (
                     active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity),
                     s.language,
+                    codex_credit_panel_visible(s.show_codex, s.credit_display, s.data.as_ref()),
                 )
             })
-            .unwrap_or((1, LanguageId::English))
+            .unwrap_or((1, LanguageId::English, false))
     };
-    total_widget_width_for(active_models, language)
+    total_widget_width_for(active_models, language, credit_panel_visible)
 }
 
 fn selected_bar_color(setting: Option<&str>) -> Color {
@@ -1856,7 +1976,7 @@ pub fn run() {
             WS_POPUP,
             0,
             0,
-            total_widget_width_for(initial_model_count, language),
+            total_widget_width_for(initial_model_count, language, false),
             sc(WIDGET_HEIGHT),
             HWND::default(),
             HMENU::default(),
@@ -1907,6 +2027,8 @@ pub fn run() {
                 codex_session_text: "--".to_string(),
                 codex_weekly_percent: 0.0,
                 codex_weekly_text: "--".to_string(),
+                credit_display: CreditDisplayMode::from_setting(&settings.credit_display),
+                codex_credit_text: String::new(),
                 antigravity_session_percent: 0.0,
                 antigravity_session_text: "--".to_string(),
                 antigravity_weekly_percent: 0.0,
@@ -2050,6 +2172,8 @@ fn render_layered() {
         show_session_window,
         show_weekly_window,
         display_remaining,
+        credit_panel_visible,
+        codex_credit_text,
         bar_color_setting,
     ) = {
         let state = lock_state();
@@ -2078,6 +2202,8 @@ fn render_layered() {
                 s.show_session_window,
                 s.show_weekly_window,
                 s.usage_display.displays_remaining(),
+                codex_credit_panel_visible(s.show_codex, s.credit_display, s.data.as_ref()),
+                s.codex_credit_text.clone(),
                 s.bar_color.clone(),
             ),
             None => return,
@@ -2176,6 +2302,8 @@ fn render_layered() {
             show_session_window,
             show_weekly_window,
             display_remaining,
+            credit_panel_visible,
+            &codex_credit_text,
         );
 
         // Background pixels → alpha 1 (nearly invisible but still hittable for right-click).
@@ -2254,6 +2382,8 @@ fn paint_content(
     show_session_window: bool,
     show_weekly_window: bool,
     display_remaining: bool,
+    credit_panel_visible: bool,
+    credit_text: &str,
 ) {
     unsafe {
         let session_pct = usage_percent_for_display(display_remaining, session_pct);
@@ -2314,7 +2444,12 @@ fn paint_content(
         FillRect(hdc, &right_rect, right_brush);
         let _ = DeleteObject(right_brush);
 
-        let content_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
+        let base_content_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
+        let content_x = if credit_panel_visible {
+            base_content_x + sc(CREDIT_PANEL_WIDTH)
+        } else {
+            base_content_x
+        };
         let row2_y = height - sc(5) - sc(SEGMENT_H);
         let row1_y = row2_y - sc(10) - sc(SEGMENT_H);
         let single_row_y = (height - sc(SEGMENT_H)) / 2;
@@ -2340,6 +2475,19 @@ fn paint_content(
             PCWSTR::from_raw(font_name.as_ptr()),
         );
         let old_font = SelectObject(hdc, font);
+
+        if credit_panel_visible {
+            draw_credit_panel(
+                hdc,
+                base_content_x,
+                row1_y,
+                row2_y,
+                strings.credits,
+                credit_text,
+                text_color,
+                CREDIT_TEXT_WIDTH,
+            );
+        }
 
         if show_session_window {
             draw_row(
@@ -2452,7 +2600,10 @@ fn do_poll(send_hwnd: SendHwnd) {
             let mut state = lock_state();
             let mut quota_alerts = Vec::new();
             let mut quota_notification_state_changed = false;
+            let mut credit_panel_visibility_changed = false;
             if let Some(s) = state.as_mut() {
+                let credit_panel_was_visible =
+                    codex_credit_panel_visible(s.show_codex, s.credit_display, s.data.as_ref());
                 if let Some(claude_code) = data.claude_code.as_ref() {
                     s.session_percent = claude_code.session.percentage;
                     s.weekly_percent = claude_code.weekly.percentage;
@@ -2487,6 +2638,8 @@ fn do_poll(send_hwnd: SendHwnd) {
                 s.data = Some(data);
                 s.last_poll_ok = true;
                 refresh_usage_texts(s);
+                credit_panel_visibility_changed = credit_panel_was_visible
+                    != codex_credit_panel_visible(s.show_codex, s.credit_display, s.data.as_ref());
 
                 // Recovered from errors — restore normal poll interval
                 if s.retry_count > 0 {
@@ -2502,6 +2655,10 @@ fn do_poll(send_hwnd: SendHwnd) {
                 s.auth_watch_snapshot.clear();
             }
             drop(state);
+
+            if credit_panel_visibility_changed {
+                position_at_taskbar();
+            }
 
             for alert in &quota_alerts {
                 tray_icon::notify_balloon(hwnd, alert.kind, &alert.title, &alert.message);
@@ -3320,6 +3477,38 @@ unsafe extern "system" fn wnd_proc(
                     render_layered();
                     sync_tray_icons(hwnd);
                 }
+                IDM_CREDIT_DISPLAY_ALWAYS
+                | IDM_CREDIT_DISPLAY_WHEN_NEEDED
+                | IDM_CREDIT_DISPLAY_OFF => {
+                    let visibility_changed = {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            let was_visible = codex_credit_panel_visible(
+                                s.show_codex,
+                                s.credit_display,
+                                s.data.as_ref(),
+                            );
+                            s.credit_display = match id {
+                                IDM_CREDIT_DISPLAY_WHEN_NEEDED => CreditDisplayMode::WhenNeeded,
+                                IDM_CREDIT_DISPLAY_OFF => CreditDisplayMode::Off,
+                                _ => CreditDisplayMode::Always,
+                            };
+                            was_visible
+                                != codex_credit_panel_visible(
+                                    s.show_codex,
+                                    s.credit_display,
+                                    s.data.as_ref(),
+                                )
+                        } else {
+                            false
+                        }
+                    };
+                    save_state_settings();
+                    if visibility_changed {
+                        position_at_taskbar();
+                    }
+                    render_layered();
+                }
                 IDM_BAR_COLOR_WINDOWS_ACCENT => {
                     {
                         let mut state = lock_state();
@@ -3532,6 +3721,7 @@ fn show_context_menu(hwnd: HWND) {
             show_session_window,
             show_weekly_window,
             usage_display,
+            credit_display,
             bar_color,
             alert_threshold_percent,
         ) = {
@@ -3552,6 +3742,7 @@ fn show_context_menu(hwnd: HWND) {
                     s.show_session_window,
                     s.show_weekly_window,
                     s.usage_display,
+                    s.credit_display,
                     s.bar_color.clone(),
                     s.alert_threshold_percent,
                 ),
@@ -3570,6 +3761,7 @@ fn show_context_menu(hwnd: HWND) {
                     true,
                     true,
                     UsageDisplayMode::Remaining,
+                    CreditDisplayMode::Always,
                     None,
                     0,
                 ),
@@ -3757,6 +3949,46 @@ fn show_context_menu(hwnd: HWND) {
             MF_POPUP,
             usage_menu.0 as usize,
             PCWSTR::from_raw(usage_label.as_ptr()),
+        );
+
+        let credit_menu = CreatePopupMenu().unwrap();
+        let credit_items = [
+            (
+                IDM_CREDIT_DISPLAY_ALWAYS,
+                CreditDisplayMode::Always,
+                strings.credit_always,
+            ),
+            (
+                IDM_CREDIT_DISPLAY_WHEN_NEEDED,
+                CreditDisplayMode::WhenNeeded,
+                strings.credit_when_needed,
+            ),
+            (
+                IDM_CREDIT_DISPLAY_OFF,
+                CreditDisplayMode::Off,
+                strings.credit_off,
+            ),
+        ];
+        for (id, mode, label) in credit_items {
+            let label = native_interop::wide_str(label);
+            let flags = if credit_display == mode {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            };
+            let _ = AppendMenuW(
+                credit_menu,
+                flags,
+                id as usize,
+                PCWSTR::from_raw(label.as_ptr()),
+            );
+        }
+        let credit_label = native_interop::wide_str(strings.credit_display);
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            credit_menu.0 as usize,
+            PCWSTR::from_raw(credit_label.as_ptr()),
         );
 
         // Low-quota alert threshold submenu. Zero means opt-out.
@@ -4039,6 +4271,8 @@ fn paint(hdc: HDC, hwnd: HWND) {
         show_session_window,
         show_weekly_window,
         display_remaining,
+        credit_panel_visible,
+        codex_credit_text,
         bar_color_setting,
     ) = {
         let state = lock_state();
@@ -4065,6 +4299,8 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.show_session_window,
                 s.show_weekly_window,
                 s.usage_display.displays_remaining(),
+                codex_credit_panel_visible(s.show_codex, s.credit_display, s.data.as_ref()),
+                s.codex_credit_text.clone(),
                 s.bar_color.clone(),
             ),
             None => return,
@@ -4131,6 +4367,8 @@ fn paint(hdc: HDC, hwnd: HWND) {
             show_session_window,
             show_weekly_window,
             display_remaining,
+            credit_panel_visible,
+            &codex_credit_text,
         );
 
         let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
@@ -4138,6 +4376,36 @@ fn paint(hdc: HDC, hwnd: HWND) {
         SelectObject(mem_dc, old_bmp);
         let _ = DeleteObject(mem_bmp);
         let _ = DeleteDC(mem_dc);
+    }
+}
+
+fn draw_credit_panel(
+    hdc: HDC,
+    x: i32,
+    header_y: i32,
+    value_y: i32,
+    header: &str,
+    value: &str,
+    text_color: &Color,
+    text_width: i32,
+) {
+    unsafe {
+        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
+        for (text, y) in [(header, header_y), (value, value_y)] {
+            let mut text_wide: Vec<u16> = text.encode_utf16().collect();
+            let mut text_rect = RECT {
+                left: x,
+                top: y,
+                right: x + sc(text_width),
+                bottom: y + sc(SEGMENT_H),
+            };
+            let _ = DrawTextW(
+                hdc,
+                &mut text_wide,
+                &mut text_rect,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            );
+        }
     }
 }
 
@@ -4370,6 +4638,49 @@ mod tests {
             "5-hour",
             &section,
         );
+    }
+
+    fn append_test_codex_weekly_alert(
+        alerts: &mut Vec<QuotaAlert>,
+        notified: &mut BTreeSet<String>,
+        threshold: u8,
+        remaining: f64,
+        reset_offset: u64,
+    ) {
+        let section = test_quota_section(remaining, reset_offset);
+        append_quota_alert(
+            alerts,
+            notified,
+            threshold,
+            LanguageId::English,
+            tray_icon::TrayIconKind::Codex,
+            "codex",
+            "Codex",
+            "weekly",
+            "7d",
+            &section,
+        );
+    }
+
+    fn test_codex_data(
+        credits: Option<CreditBalance>,
+        session_remaining: f64,
+        weekly_remaining: f64,
+    ) -> AppUsageData {
+        AppUsageData {
+            codex: Some(crate::models::UsageData {
+                session: crate::models::UsageSection {
+                    percentage: 100.0 - session_remaining,
+                    resets_at: None,
+                },
+                weekly: crate::models::UsageSection {
+                    percentage: 100.0 - weekly_remaining,
+                    resets_at: None,
+                },
+                credits,
+            }),
+            ..AppUsageData::default()
+        }
     }
 
     #[test]
@@ -4791,5 +5102,217 @@ mod tests {
             .all(|alert| alert.title == "Codex quota exhausted"));
         assert_eq!(notified.len(), 1);
         assert!(notified.contains("codex:session:exhausted:2000018000"));
+    }
+
+    #[test]
+    fn weekly_low_quota_alert_fires_at_five_percent_remaining() {
+        let mut alerts = Vec::new();
+        let mut notified = BTreeSet::new();
+
+        append_test_codex_weekly_alert(&mut alerts, &mut notified, 5, 5.0, 0);
+
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].title, "Codex quota alert");
+        assert!(alerts[0].message.contains("7d quota has 5% remaining"));
+    }
+
+    #[test]
+    fn weekly_threshold_then_exhaustion_alerts_are_independent() {
+        let mut alerts = Vec::new();
+        let mut notified = BTreeSet::new();
+
+        append_test_codex_weekly_alert(&mut alerts, &mut notified, 5, 4.0, 0);
+        append_test_codex_weekly_alert(&mut alerts, &mut notified, 5, 0.0, 0);
+
+        assert_eq!(alerts.len(), 2);
+        assert_eq!(alerts[1].title, "Codex quota exhausted");
+        assert_eq!(notified.len(), 2);
+    }
+
+    #[test]
+    fn repeated_weekly_low_polls_do_not_duplicate_threshold_alert() {
+        let mut alerts = Vec::new();
+        let mut notified = BTreeSet::new();
+
+        append_test_codex_weekly_alert(&mut alerts, &mut notified, 5, 4.0, 0);
+        append_test_codex_weekly_alert(&mut alerts, &mut notified, 5, 3.0, 0);
+
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].title, "Codex quota alert");
+    }
+
+    #[test]
+    fn repeated_weekly_zero_polls_do_not_duplicate_exhaustion_alert() {
+        let mut alerts = Vec::new();
+        let mut notified = BTreeSet::new();
+
+        append_test_codex_weekly_alert(&mut alerts, &mut notified, 5, 0.0, 0);
+        append_test_codex_weekly_alert(&mut alerts, &mut notified, 5, 0.0, 0);
+
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].title, "Codex quota exhausted");
+    }
+
+    #[test]
+    fn persisted_weekly_alert_state_survives_restart() {
+        let mut alerts = Vec::new();
+        let mut notified = BTreeSet::new();
+        append_test_codex_weekly_alert(&mut alerts, &mut notified, 5, 4.0, 0);
+        append_test_codex_weekly_alert(&mut alerts, &mut notified, 5, 0.0, 0);
+
+        let persisted: BTreeSet<String> =
+            serde_json::from_str(&serde_json::to_string(&notified).unwrap()).unwrap();
+        let mut restarted_alerts = Vec::new();
+        let mut restarted_notified = persisted;
+        append_test_codex_weekly_alert(&mut restarted_alerts, &mut restarted_notified, 5, 0.0, 0);
+
+        assert!(restarted_alerts.is_empty());
+        assert_eq!(restarted_notified, notified);
+    }
+
+    #[test]
+    fn weekly_reset_time_jitter_does_not_rearm_alerts() {
+        let mut alerts = Vec::new();
+        let mut notified = BTreeSet::new();
+
+        for offset in [0, 4 * 60, 8 * 60, 12 * 60] {
+            append_test_codex_weekly_alert(&mut alerts, &mut notified, 5, 0.0, offset);
+        }
+
+        assert_eq!(alerts.len(), 1);
+        assert!(notified.contains("codex:weekly:exhausted:2000000720"));
+    }
+
+    #[test]
+    fn genuine_new_weekly_window_rearms_alerts() {
+        let mut alerts = Vec::new();
+        let mut notified = BTreeSet::new();
+
+        append_test_codex_weekly_alert(&mut alerts, &mut notified, 5, 0.0, 0);
+        append_test_codex_weekly_alert(&mut alerts, &mut notified, 5, 0.0, 18_000);
+
+        assert_eq!(alerts.len(), 2);
+        assert!(notified.contains("codex:weekly:exhausted:2000018000"));
+    }
+
+    #[test]
+    fn credit_balance_floors_without_overstating_balance() {
+        assert_eq!(format_credit_balance(&CreditBalance::Amount(360.89)), "360");
+        assert_eq!(format_credit_balance(&CreditBalance::Amount(360.01)), "360");
+        assert_eq!(format_credit_balance(&CreditBalance::Amount(360.0)), "360");
+        assert_eq!(format_credit_balance(&CreditBalance::Amount(0.99)), "0");
+        assert_eq!(format_credit_balance(&CreditBalance::Amount(0.0)), "0");
+        assert_eq!(format_credit_balance(&CreditBalance::Unlimited), "∞");
+    }
+
+    #[test]
+    fn credit_panel_visibility_obeys_display_mode_and_quota_state() {
+        let positive = test_codex_data(Some(CreditBalance::Amount(341.0)), 82.0, 41.0);
+        let zero_session = test_codex_data(Some(CreditBalance::Amount(0.0)), 0.0, 41.0);
+        let zero_weekly = test_codex_data(Some(CreditBalance::Unlimited), 82.0, 0.0);
+        let unknown = test_codex_data(None, 0.0, 0.0);
+
+        assert!(codex_credit_panel_visible(
+            true,
+            CreditDisplayMode::Always,
+            Some(&positive)
+        ));
+        assert!(codex_credit_panel_visible(
+            true,
+            CreditDisplayMode::Always,
+            Some(&zero_session)
+        ));
+        assert!(!codex_credit_panel_visible(
+            true,
+            CreditDisplayMode::Always,
+            Some(&unknown)
+        ));
+        assert!(!codex_credit_panel_visible(
+            true,
+            CreditDisplayMode::WhenNeeded,
+            Some(&positive)
+        ));
+        assert!(codex_credit_panel_visible(
+            true,
+            CreditDisplayMode::WhenNeeded,
+            Some(&zero_session)
+        ));
+        assert!(codex_credit_panel_visible(
+            true,
+            CreditDisplayMode::WhenNeeded,
+            Some(&zero_weekly)
+        ));
+        assert!(!codex_credit_panel_visible(
+            true,
+            CreditDisplayMode::WhenNeeded,
+            Some(&unknown)
+        ));
+        assert!(!codex_credit_panel_visible(
+            true,
+            CreditDisplayMode::Off,
+            Some(&zero_session)
+        ));
+        assert!(!codex_credit_panel_visible(
+            false,
+            CreditDisplayMode::Always,
+            Some(&positive)
+        ));
+    }
+
+    #[test]
+    fn credit_panel_visibility_hides_after_exhaustion_recovers() {
+        let exhausted = test_codex_data(Some(CreditBalance::Amount(12.0)), 0.0, 25.0);
+        let usable = test_codex_data(Some(CreditBalance::Amount(12.0)), 12.0, 25.0);
+
+        assert!(codex_credit_panel_visible(
+            true,
+            CreditDisplayMode::WhenNeeded,
+            Some(&exhausted)
+        ));
+        assert!(!codex_credit_panel_visible(
+            true,
+            CreditDisplayMode::WhenNeeded,
+            Some(&usable)
+        ));
+    }
+
+    #[test]
+    fn credit_panel_expands_widget_without_changing_quota_area_width() {
+        let without_credits = total_widget_width_for(1, LanguageId::English, false);
+        let with_credits = total_widget_width_for(1, LanguageId::English, true);
+
+        assert_eq!(with_credits - without_credits, sc(CREDIT_PANEL_WIDTH));
+    }
+
+    #[test]
+    fn old_settings_default_to_always_credit_display_and_new_value_persists() {
+        let old: SettingsFile = serde_json::from_str(r#"{"show_codex":true}"#).unwrap();
+        assert_eq!(
+            normalize_settings(old).credit_display,
+            default_credit_display()
+        );
+
+        let settings = SettingsFile {
+            credit_display: "when_needed".to_string(),
+            ..SettingsFile::default()
+        };
+        let serialized = serde_json::to_string(&settings).unwrap();
+        let restored: SettingsFile = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(normalize_settings(restored).credit_display, "when_needed");
+    }
+
+    #[test]
+    fn codex_tooltip_includes_known_credit_balance() {
+        assert_eq!(
+            service_tooltip_with_credit(
+                "Codex",
+                "82% 2h",
+                "41% 3d",
+                true,
+                true,
+                Some(("Credits", "341")),
+            ),
+            "Codex: 5h 82% 2h | 7d 41% 3d | Credits 341"
+        );
     }
 }

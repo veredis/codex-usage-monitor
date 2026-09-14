@@ -6,10 +6,17 @@ pub struct UsageSection {
     pub resets_at: Option<SystemTime>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum CreditBalance {
+    Amount(f64),
+    Unlimited,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct UsageData {
     pub session: UsageSection,
     pub weekly: UsageSection,
+    pub credits: Option<CreditBalance>,
 }
 
 #[derive(Clone, Debug, Default)]
