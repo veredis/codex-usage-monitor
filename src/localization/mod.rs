@@ -215,6 +215,8 @@ pub struct Strings {
     pub credit_always: &'static str,
     pub credit_when_needed: &'static str,
     pub credit_off: &'static str,
+    pub credit_left: &'static str,
+    pub credit_right: &'static str,
     pub session_window: &'static str,
     pub weekly_window: &'static str,
     pub now: &'static str,

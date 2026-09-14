@@ -76,6 +76,7 @@ struct AppState {
     show_weekly_window: bool,
     usage_display: UsageDisplayMode,
     credit_display: CreditDisplayMode,
+    credit_position: CreditPosition,
     codex_credit_text: String,
     bar_color: Option<String>,
     alert_threshold_percent: u8,
@@ -158,6 +159,8 @@ const IDM_ALERT_30: u16 = 84;
 const IDM_CREDIT_DISPLAY_ALWAYS: u16 = 85;
 const IDM_CREDIT_DISPLAY_WHEN_NEEDED: u16 = 86;
 const IDM_CREDIT_DISPLAY_OFF: u16 = 87;
+const IDM_CREDIT_POSITION_LEFT: u16 = 88;
+const IDM_CREDIT_POSITION_RIGHT: u16 = 89;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
@@ -360,6 +363,8 @@ struct SettingsFile {
     usage_display: String,
     #[serde(default = "default_credit_display")]
     credit_display: String,
+    #[serde(default = "default_credit_position")]
+    credit_position: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     bar_color: Option<String>,
     #[serde(default)]
@@ -384,6 +389,7 @@ impl Default for SettingsFile {
             show_weekly_window: true,
             usage_display: default_usage_display(),
             credit_display: default_credit_display(),
+            credit_position: default_credit_position(),
             bar_color: None,
             alert_threshold_percent: 0,
             notified_quota_windows: Vec::new(),
@@ -401,6 +407,10 @@ fn default_usage_display() -> String {
 
 fn default_credit_display() -> String {
     "always".to_string()
+}
+
+fn default_credit_position() -> String {
+    "left".to_string()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -453,6 +463,29 @@ impl CreditDisplayMode {
             Self::Always => "always",
             Self::WhenNeeded => "when_needed",
             Self::Off => "off",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CreditPosition {
+    Left,
+    Right,
+}
+
+impl CreditPosition {
+    fn from_setting(value: &str) -> Self {
+        if value.eq_ignore_ascii_case("right") {
+            Self::Right
+        } else {
+            Self::Left
+        }
+    }
+
+    fn as_setting(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
         }
     }
 }
@@ -566,6 +599,9 @@ fn normalize_settings(mut settings: SettingsFile) -> SettingsFile {
     settings.credit_display = CreditDisplayMode::from_setting(&settings.credit_display)
         .as_setting()
         .to_string();
+    settings.credit_position = CreditPosition::from_setting(&settings.credit_position)
+        .as_setting()
+        .to_string();
     settings.bar_color = settings
         .bar_color
         .as_deref()
@@ -605,6 +641,7 @@ fn save_state_settings() {
             show_weekly_window: s.show_weekly_window,
             usage_display: s.usage_display.as_setting().to_string(),
             credit_display: s.credit_display.as_setting().to_string(),
+            credit_position: s.credit_position.as_setting().to_string(),
             bar_color: s.bar_color.clone(),
             alert_threshold_percent: s.alert_threshold_percent,
             notified_quota_windows: s.notified_quota_windows.iter().cloned().collect(),
@@ -1702,17 +1739,15 @@ const SEGMENT_GAP: i32 = 1;
 const SEGMENT_COUNT: i32 = 10;
 
 const LEFT_DIVIDER_W: i32 = 3;
-const DIVIDER_RIGHT_MARGIN: i32 = 10;
 const LABEL_WIDTH: i32 = 18;
-const LABEL_RIGHT_MARGIN: i32 = 10;
-const BAR_RIGHT_MARGIN: i32 = 4;
 const TEXT_WIDTH: i32 = 62;
 const SIMPLIFIED_CHINESE_LABEL_WIDTH: i32 = 20;
 const SIMPLIFIED_CHINESE_TEXT_WIDTH: i32 = 126;
-const MODEL_RIGHT_MARGIN: i32 = 3;
 const RIGHT_MARGIN: i32 = 1;
-const CREDIT_TEXT_WIDTH: i32 = 60;
-const CREDIT_PANEL_WIDTH: i32 = 64;
+const HORIZONTAL_GUTTER: i32 = 4;
+const CREDIT_BALANCE_WIDTH_SAMPLE: &str = "999999";
+const CREDIT_TEXT_FALLBACK_WIDTH: i32 = 60;
+const CREDIT_VERTICAL_GAP: i32 = 2;
 const WIDGET_HEIGHT: i32 = 46;
 
 fn is_drag_handle_point(client_x: i32, client_y: i32) -> bool {
@@ -1746,14 +1781,129 @@ fn row_bar_segment_count(active_models: i32) -> i32 {
     }
 }
 
+fn measure_text_width(text: &str) -> Option<i32> {
+    unsafe {
+        let hdc = GetDC(HWND::default());
+        if hdc.is_invalid() {
+            return None;
+        }
+
+        let font_name = native_interop::wide_str("Segoe UI");
+        let font = CreateFontW(
+            sc(-12),
+            0,
+            0,
+            0,
+            FW_MEDIUM.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET.0 as u32,
+            OUT_TT_PRECIS.0 as u32,
+            CLIP_DEFAULT_PRECIS.0 as u32,
+            CLEARTYPE_QUALITY.0 as u32,
+            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+            PCWSTR::from_raw(font_name.as_ptr()),
+        );
+        if font.is_invalid() {
+            ReleaseDC(HWND::default(), hdc);
+            return None;
+        }
+
+        let old_font = SelectObject(hdc, font);
+        let text_wide: Vec<u16> = text.encode_utf16().collect();
+        let mut size = SIZE::default();
+        let measured = GetTextExtentPoint32W(hdc, &text_wide, &mut size).as_bool();
+        SelectObject(hdc, old_font);
+        let _ = DeleteObject(font);
+        ReleaseDC(HWND::default(), hdc);
+
+        if measured && size.cx > 0 {
+            let dpi = CURRENT_DPI.load(Ordering::Relaxed).max(1);
+            Some(((size.cx as f64 * 96.0 / dpi as f64).ceil() as i32).max(1))
+        } else {
+            None
+        }
+    }
+}
+
+fn measured_column_width(texts: &[&str], fallback: i32) -> i32 {
+    texts
+        .iter()
+        .filter_map(|text| measure_text_width(text))
+        .max()
+        .unwrap_or(fallback)
+        .max(1)
+}
+
 fn usage_layout_widths(language: LanguageId) -> (i32, i32) {
-    if language == LanguageId::SimplifiedChinese {
-        (
-            SIMPLIFIED_CHINESE_LABEL_WIDTH,
-            SIMPLIFIED_CHINESE_TEXT_WIDTH,
-        )
+    let strings = language.strings();
+    let label_fallback = if language == LanguageId::SimplifiedChinese {
+        SIMPLIFIED_CHINESE_LABEL_WIDTH
     } else {
-        (LABEL_WIDTH, TEXT_WIDTH)
+        LABEL_WIDTH
+    };
+    (
+        measured_column_width(
+            &[strings.session_window, strings.weekly_window],
+            label_fallback,
+        ),
+        if language == LanguageId::SimplifiedChinese {
+            SIMPLIFIED_CHINESE_TEXT_WIDTH
+        } else {
+            TEXT_WIDTH
+        },
+    )
+}
+
+fn credit_layout_widths(strings: Strings) -> (i32, i32) {
+    let text_width = measured_column_width(
+        &[strings.credits, CREDIT_BALANCE_WIDTH_SAMPLE, "∞"],
+        CREDIT_TEXT_FALLBACK_WIDTH,
+    );
+    (text_width, text_width + HORIZONTAL_GUTTER)
+}
+
+fn credit_panel_y_positions(height: i32) -> (i32, i32) {
+    let segment_height = sc(SEGMENT_H);
+    let gap = sc(CREDIT_VERTICAL_GAP);
+    let stack_height = segment_height * 2 + gap;
+    let header_y = (height - stack_height) / 2;
+    (header_y, header_y + segment_height + gap)
+}
+
+fn quota_area_width_for(active_models: i32, language: LanguageId) -> i32 {
+    let bar_segments = row_bar_segment_count(active_models);
+    let (label_width, text_width) = usage_layout_widths(language);
+    let model_width = (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * bar_segments - sc(SEGMENT_GAP)
+        + sc(HORIZONTAL_GUTTER)
+        + sc(text_width);
+
+    sc(label_width)
+        + sc(HORIZONTAL_GUTTER)
+        + model_width * active_models
+        + sc(HORIZONTAL_GUTTER) * (active_models - 1)
+}
+
+fn widget_content_positions_for(
+    active_models: i32,
+    language: LanguageId,
+    credit_panel_visible: bool,
+    credit_position: CreditPosition,
+) -> (i32, Option<i32>) {
+    let base_content_x = sc(LEFT_DIVIDER_W) + sc(HORIZONTAL_GUTTER);
+    if !credit_panel_visible {
+        return (base_content_x, None);
+    }
+
+    let credit_panel_width = sc(credit_layout_widths(language.strings()).1);
+    let quota_area_width = quota_area_width_for(active_models, language);
+    match credit_position {
+        CreditPosition::Left => (base_content_x + credit_panel_width, Some(base_content_x)),
+        CreditPosition::Right => (
+            base_content_x,
+            Some(base_content_x + quota_area_width + sc(HORIZONTAL_GUTTER)),
+        ),
     }
 }
 
@@ -1804,26 +1954,15 @@ fn total_widget_width_for(
     language: LanguageId,
     credit_panel_visible: bool,
 ) -> i32 {
-    let bar_segments = row_bar_segment_count(active_models);
-    let (label_width, text_width) = usage_layout_widths(language);
-    let model_width = (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * bar_segments - sc(SEGMENT_GAP)
-        + sc(BAR_RIGHT_MARGIN)
-        + sc(text_width);
+    let quota_area_width = quota_area_width_for(active_models, language);
 
     let credits_width = if credit_panel_visible {
-        sc(CREDIT_PANEL_WIDTH)
+        sc(credit_layout_widths(language.strings()).1)
     } else {
         0
     };
 
-    credits_width
-        + sc(LEFT_DIVIDER_W)
-        + sc(DIVIDER_RIGHT_MARGIN)
-        + sc(label_width)
-        + sc(LABEL_RIGHT_MARGIN)
-        + model_width * active_models
-        + sc(MODEL_RIGHT_MARGIN) * (active_models - 1)
-        + sc(RIGHT_MARGIN)
+    credits_width + sc(LEFT_DIVIDER_W) + sc(HORIZONTAL_GUTTER) + quota_area_width + sc(RIGHT_MARGIN)
 }
 
 fn total_widget_width_for_state(state: &AppState) -> i32 {
@@ -2028,6 +2167,7 @@ pub fn run() {
                 codex_weekly_percent: 0.0,
                 codex_weekly_text: "--".to_string(),
                 credit_display: CreditDisplayMode::from_setting(&settings.credit_display),
+                credit_position: CreditPosition::from_setting(&settings.credit_position),
                 codex_credit_text: String::new(),
                 antigravity_session_percent: 0.0,
                 antigravity_session_text: "--".to_string(),
@@ -2173,6 +2313,7 @@ fn render_layered() {
         show_weekly_window,
         display_remaining,
         credit_panel_visible,
+        credit_position,
         codex_credit_text,
         bar_color_setting,
     ) = {
@@ -2203,6 +2344,7 @@ fn render_layered() {
                 s.show_weekly_window,
                 s.usage_display.displays_remaining(),
                 codex_credit_panel_visible(s.show_codex, s.credit_display, s.data.as_ref()),
+                s.credit_position,
                 s.codex_credit_text.clone(),
                 s.bar_color.clone(),
             ),
@@ -2303,6 +2445,7 @@ fn render_layered() {
             show_weekly_window,
             display_remaining,
             credit_panel_visible,
+            credit_position,
             &codex_credit_text,
         );
 
@@ -2383,6 +2526,7 @@ fn paint_content(
     show_weekly_window: bool,
     display_remaining: bool,
     credit_panel_visible: bool,
+    credit_position: CreditPosition,
     credit_text: &str,
 ) {
     unsafe {
@@ -2395,6 +2539,7 @@ fn paint_content(
         let antigravity_weekly_pct =
             usage_percent_for_display(display_remaining, antigravity_weekly_pct);
         let (label_width, text_width) = usage_layout_widths(language);
+        let (credit_text_width, _) = credit_layout_widths(strings);
 
         let client_rect = RECT {
             left: 0,
@@ -2444,12 +2589,13 @@ fn paint_content(
         FillRect(hdc, &right_rect, right_brush);
         let _ = DeleteObject(right_brush);
 
-        let base_content_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
-        let content_x = if credit_panel_visible {
-            base_content_x + sc(CREDIT_PANEL_WIDTH)
-        } else {
-            base_content_x
-        };
+        let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
+        let (content_x, credit_x) = widget_content_positions_for(
+            active_models,
+            language,
+            credit_panel_visible,
+            credit_position,
+        );
         let row2_y = height - sc(5) - sc(SEGMENT_H);
         let row1_y = row2_y - sc(10) - sc(SEGMENT_H);
         let single_row_y = (height - sc(SEGMENT_H)) / 2;
@@ -2476,16 +2622,17 @@ fn paint_content(
         );
         let old_font = SelectObject(hdc, font);
 
-        if credit_panel_visible {
+        if let Some(credit_x) = credit_x {
+            let (credit_header_y, credit_value_y) = credit_panel_y_positions(height);
             draw_credit_panel(
                 hdc,
-                base_content_x,
-                row1_y,
-                row2_y,
+                credit_x,
+                credit_header_y,
+                credit_value_y,
                 strings.credits,
                 credit_text,
                 text_color,
-                CREDIT_TEXT_WIDTH,
+                credit_text_width,
             );
         }
 
@@ -3509,6 +3656,20 @@ unsafe extern "system" fn wnd_proc(
                     }
                     render_layered();
                 }
+                IDM_CREDIT_POSITION_LEFT | IDM_CREDIT_POSITION_RIGHT => {
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            s.credit_position = if id == IDM_CREDIT_POSITION_RIGHT {
+                                CreditPosition::Right
+                            } else {
+                                CreditPosition::Left
+                            };
+                        }
+                    }
+                    save_state_settings();
+                    render_layered();
+                }
                 IDM_BAR_COLOR_WINDOWS_ACCENT => {
                     {
                         let mut state = lock_state();
@@ -3722,6 +3883,7 @@ fn show_context_menu(hwnd: HWND) {
             show_weekly_window,
             usage_display,
             credit_display,
+            credit_position,
             bar_color,
             alert_threshold_percent,
         ) = {
@@ -3743,6 +3905,7 @@ fn show_context_menu(hwnd: HWND) {
                     s.show_weekly_window,
                     s.usage_display,
                     s.credit_display,
+                    s.credit_position,
                     s.bar_color.clone(),
                     s.alert_threshold_percent,
                 ),
@@ -3762,6 +3925,7 @@ fn show_context_menu(hwnd: HWND) {
                     true,
                     UsageDisplayMode::Remaining,
                     CreditDisplayMode::Always,
+                    CreditPosition::Left,
                     None,
                     0,
                 ),
@@ -3972,6 +4136,33 @@ fn show_context_menu(hwnd: HWND) {
         for (id, mode, label) in credit_items {
             let label = native_interop::wide_str(label);
             let flags = if credit_display == mode {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            };
+            let _ = AppendMenuW(
+                credit_menu,
+                flags,
+                id as usize,
+                PCWSTR::from_raw(label.as_ptr()),
+            );
+        }
+        let _ = AppendMenuW(credit_menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let position_items = [
+            (
+                IDM_CREDIT_POSITION_LEFT,
+                CreditPosition::Left,
+                strings.credit_left,
+            ),
+            (
+                IDM_CREDIT_POSITION_RIGHT,
+                CreditPosition::Right,
+                strings.credit_right,
+            ),
+        ];
+        for (id, position, label) in position_items {
+            let label = native_interop::wide_str(label);
+            let flags = if credit_position == position {
                 MF_CHECKED
             } else {
                 MENU_ITEM_FLAGS(0)
@@ -4272,6 +4463,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
         show_weekly_window,
         display_remaining,
         credit_panel_visible,
+        credit_position,
         codex_credit_text,
         bar_color_setting,
     ) = {
@@ -4300,6 +4492,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.show_weekly_window,
                 s.usage_display.displays_remaining(),
                 codex_credit_panel_visible(s.show_codex, s.credit_display, s.data.as_ref()),
+                s.credit_position,
                 s.codex_credit_text.clone(),
                 s.bar_color.clone(),
             ),
@@ -4368,6 +4561,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
             show_weekly_window,
             display_remaining,
             credit_panel_visible,
+            credit_position,
             &codex_credit_text,
         );
 
@@ -4466,7 +4660,7 @@ fn draw_row(
             DT_LEFT | DT_VCENTER | DT_SINGLELINE,
         );
 
-        let mut model_x = x + sc(label_width) + sc(LABEL_RIGHT_MARGIN);
+        let mut model_x = x + sc(label_width) + sc(HORIZONTAL_GUTTER);
         if show_claude_code {
             draw_usage_bar(
                 hdc,
@@ -4480,7 +4674,7 @@ fn draw_row(
                 &claude_value_color,
                 text_width,
             );
-            model_x += model_usage_width(segment_count, text_width) + sc(MODEL_RIGHT_MARGIN);
+            model_x += model_usage_width(segment_count, text_width) + sc(HORIZONTAL_GUTTER);
         }
         if show_codex {
             draw_usage_bar(
@@ -4495,7 +4689,7 @@ fn draw_row(
                 &codex_value_color,
                 text_width,
             );
-            model_x += model_usage_width(segment_count, text_width) + sc(MODEL_RIGHT_MARGIN);
+            model_x += model_usage_width(segment_count, text_width) + sc(HORIZONTAL_GUTTER);
         }
         if show_antigravity {
             draw_usage_bar(
@@ -4516,7 +4710,7 @@ fn draw_row(
 
 fn model_usage_width(segment_count: i32, text_width: i32) -> i32 {
     (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * segment_count - sc(SEGMENT_GAP)
-        + sc(BAR_RIGHT_MARGIN)
+        + sc(HORIZONTAL_GUTTER)
         + sc(text_width)
 }
 
@@ -4572,7 +4766,7 @@ fn draw_usage_bar(
             let _ = DeleteObject(rgn);
         }
 
-        let text_x = bar_x + bar_width + sc(BAR_RIGHT_MARGIN);
+        let text_x = bar_x + bar_width + sc(HORIZONTAL_GUTTER);
         let mut text_wide: Vec<u16> = text.encode_utf16().collect();
         let mut text_rect = RECT {
             left: text_x,
@@ -5280,25 +5474,74 @@ mod tests {
     fn credit_panel_expands_widget_without_changing_quota_area_width() {
         let without_credits = total_widget_width_for(1, LanguageId::English, false);
         let with_credits = total_widget_width_for(1, LanguageId::English, true);
+        let credit_panel_width = credit_layout_widths(LanguageId::English.strings()).1;
 
-        assert_eq!(with_credits - without_credits, sc(CREDIT_PANEL_WIDTH));
+        assert_eq!(with_credits - without_credits, sc(credit_panel_width));
     }
 
     #[test]
-    fn old_settings_default_to_always_credit_display_and_new_value_persists() {
+    fn credit_panel_stack_is_centered_with_a_compact_vertical_gap() {
+        let height = sc(WIDGET_HEIGHT);
+        let (header_y, value_y) = credit_panel_y_positions(height);
+        let segment_height = sc(SEGMENT_H);
+        let gap = sc(CREDIT_VERTICAL_GAP);
+        let stack_height = segment_height * 2 + gap;
+
+        assert_eq!(value_y - header_y, segment_height + gap);
+        assert_eq!(header_y, (height - stack_height) / 2);
+    }
+
+    #[test]
+    fn credit_position_defaults_left_and_persists_independently() {
         let old: SettingsFile = serde_json::from_str(r#"{"show_codex":true}"#).unwrap();
-        assert_eq!(
-            normalize_settings(old).credit_display,
-            default_credit_display()
-        );
+        let old = normalize_settings(old);
+        assert_eq!(old.credit_display, default_credit_display());
+        assert_eq!(old.credit_position, default_credit_position());
 
         let settings = SettingsFile {
-            credit_display: "when_needed".to_string(),
+            credit_display: "off".to_string(),
+            credit_position: "right".to_string(),
             ..SettingsFile::default()
         };
         let serialized = serde_json::to_string(&settings).unwrap();
         let restored: SettingsFile = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(normalize_settings(restored).credit_display, "when_needed");
+        let restored = normalize_settings(restored);
+        assert_eq!(restored.credit_display, "off");
+        assert_eq!(restored.credit_position, "right");
+
+        let switched_visibility = normalize_settings(SettingsFile {
+            credit_display: "always".to_string(),
+            credit_position: restored.credit_position,
+            ..SettingsFile::default()
+        });
+        assert_eq!(switched_visibility.credit_position, "right");
+    }
+
+    #[test]
+    fn credit_position_layout_keeps_width_and_drag_handle_for_both_sides() {
+        let (left_quota_x, left_credit_x) =
+            widget_content_positions_for(1, LanguageId::English, true, CreditPosition::Left);
+        let (right_quota_x, right_credit_x) =
+            widget_content_positions_for(1, LanguageId::English, true, CreditPosition::Right);
+
+        assert!(left_credit_x.unwrap() < left_quota_x);
+        assert!(right_quota_x < right_credit_x.unwrap());
+        let base_content_x = sc(LEFT_DIVIDER_W) + sc(HORIZONTAL_GUTTER);
+        let (credit_text_width, credit_panel_width) =
+            credit_layout_widths(LanguageId::English.strings());
+        let quota_area_width = quota_area_width_for(1, LanguageId::English);
+        let total_width = total_widget_width_for(1, LanguageId::English, true);
+        assert_eq!(left_credit_x.unwrap(), base_content_x);
+        assert_eq!(
+            left_credit_x.unwrap() + sc(credit_panel_width) + quota_area_width + sc(RIGHT_MARGIN),
+            total_width
+        );
+        assert_eq!(
+            right_credit_x.unwrap() + sc(credit_text_width) + sc(RIGHT_MARGIN),
+            total_width
+        );
+        assert!(is_drag_handle_point(1, sc(WIDGET_HEIGHT) / 2));
+        assert_eq!(row_bar_segment_count(1), SEGMENT_COUNT);
     }
 
     #[test]

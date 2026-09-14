@@ -41,6 +41,7 @@ Important defaults and settings:
 - **Bar color:** Windows accent. Choose **Custom...** to open the native color picker and save a custom color.
 - **Update frequency:** Includes a 30-second interval, in addition to longer intervals.
 - **Credit display:** Always by default. Choose **Always**, **When needed**, or **Off**. Always shows the Credits column when valid credit data is available; When needed shows it when either Codex 5-hour or weekly remaining usage reaches 0%; Off hides it. A known zero balance displays as `0`, while missing or unknown data is not treated as zero. Finite balances are shown as whole credits using floor display, and no dollar value is shown.
+- **Credit position:** Left by default. Choose **Left** or **Right** independently of Credit display. Turning Credits Off keeps the selected side, which is restored when the column is shown again.
 - **Quota alerts:** Disabled by default; thresholds are based on remaining quota. When enabled at any threshold, the app also sends a separate one-time alert if that quota window reaches 0% remaining. Turning alerts Off disables both notifications.
 
 Drag the widget's divider to reposition it. On multi-monitor systems, drag it to the taskbar where you want it displayed.
@@ -75,7 +76,7 @@ Preferences are stored in:
 %APPDATA%\CodexUsage\settings.json
 ```
 
-This includes display mode, bar color, polling interval, alert threshold, credit-display preference, visible rows, provider selection, language, widget position, and startup preference. Existing settings files remain compatible; missing newer fields use their defaults.
+This includes display mode, bar color, polling interval, alert threshold, credit-display and credit-position preferences, visible rows, provider selection, language, widget position, and startup preference. Existing settings files remain compatible; missing newer fields use their defaults.
 
 For installation and upgrade details, see [docs/installation.md](docs/installation.md).
 

@@ -37,6 +37,8 @@ pub(super) const STRINGS: Strings = Strings {
     credit_always: "常に",
     credit_when_needed: "必要な場合",
     credit_off: "オフ",
+    credit_left: "左",
+    credit_right: "右",
     session_window: "5h",
     weekly_window: "7d",
     now: "今",

@@ -37,6 +37,8 @@ pub(super) const STRINGS: Strings = Strings {
     credit_always: "항상",
     credit_when_needed: "필요할 때",
     credit_off: "끄기",
+    credit_left: "왼쪽",
+    credit_right: "오른쪽",
     session_window: "5시간",
     weekly_window: "7일",
     now: "지금",

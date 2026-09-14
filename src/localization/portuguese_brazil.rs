@@ -37,6 +37,8 @@ pub(super) const STRINGS: Strings = Strings {
     credit_always: "Sempre",
     credit_when_needed: "Quando necessário",
     credit_off: "Desativado",
+    credit_left: "Esquerda",
+    credit_right: "Direita",
     session_window: "5h",
     weekly_window: "7d",
     now: "agora",

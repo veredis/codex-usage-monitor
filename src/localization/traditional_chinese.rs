@@ -37,6 +37,8 @@ pub(super) const STRINGS: Strings = Strings {
     credit_always: "一律",
     credit_when_needed: "需要時",
     credit_off: "關閉",
+    credit_left: "左",
+    credit_right: "右",
     session_window: "5h",
     weekly_window: "7d",
     now: "現在",
