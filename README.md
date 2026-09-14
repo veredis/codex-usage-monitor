@@ -39,7 +39,7 @@ Important defaults and settings:
 - **Usage display:** Remaining. Choose Used if you prefer to see the portion already consumed.
 - **Bar color:** Windows accent. Choose **Custom...** to open the native color picker and save a custom color.
 - **Update frequency:** Includes a 30-second interval, in addition to longer intervals.
-- **Quota alerts:** Disabled by default; thresholds are based on remaining quota.
+- **Quota alerts:** Disabled by default; thresholds are based on remaining quota. When enabled at any threshold, the app also sends a separate one-time alert if that quota window reaches 0% remaining. Turning alerts Off disables both notifications.
 
 Drag the widget's divider to reposition it. On multi-monitor systems, drag it to the taskbar where you want it displayed.
 

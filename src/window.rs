@@ -618,6 +618,12 @@ struct QuotaAlert {
     message: String,
 }
 
+#[derive(Clone, Copy)]
+enum QuotaAlertType {
+    Threshold,
+    Exhausted,
+}
+
 // Providers can report slightly different absolute reset timestamps for the
 // same quota window. Keep those shifts from re-arming an already sent alert.
 const RESET_TIME_JITTER_SECONDS: u64 = 5 * 60;
@@ -729,20 +735,83 @@ fn append_quota_alert(
     window_label: &str,
     section: &crate::models::UsageSection,
 ) {
-    let prefix = format!("{provider_key}:{window_key}:");
+    if threshold == 0 {
+        return;
+    }
+
     let reset_key = section
         .resets_at
         .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
         .map(|value| value.as_secs().to_string())
         .unwrap_or_else(|| "unknown".to_string());
-    let key = format!("{prefix}{reset_key}");
     let remaining = poller::remaining_percentage(section.percentage).round() as u8;
 
+    // Keep the existing threshold-key format for compatibility with persisted
+    // settings, and use a separate namespace for the backup exhaustion alert.
+    let threshold_prefix = format!("{provider_key}:{window_key}:");
+    let (threshold_key, threshold_notified) = reconcile_quota_alert_window(
+        notified,
+        &threshold_prefix,
+        &reset_key,
+        QuotaAlertType::Threshold,
+    );
+    let exhausted_prefix = format!("{provider_key}:{window_key}:exhausted:");
+    let (exhausted_key, exhausted_notified) = reconcile_quota_alert_window(
+        notified,
+        &exhausted_prefix,
+        &reset_key,
+        QuotaAlertType::Exhausted,
+    );
+
+    // A direct jump to 0% is represented by the exhaustion alert only. If the
+    // threshold alert was sent on an earlier poll, the independent exhaustion
+    // alert is still allowed through here.
+    if remaining == 0 {
+        if exhausted_notified || !notified.insert(exhausted_key) {
+            return;
+        }
+        append_quota_alert_notification(
+            alerts,
+            language,
+            kind,
+            provider_label,
+            window_label,
+            section,
+            remaining,
+            QuotaAlertType::Exhausted,
+        );
+        return;
+    }
+
+    if remaining <= threshold && !threshold_notified && notified.insert(threshold_key) {
+        append_quota_alert_notification(
+            alerts,
+            language,
+            kind,
+            provider_label,
+            window_label,
+            section,
+            remaining,
+            QuotaAlertType::Threshold,
+        );
+    }
+}
+
+fn reconcile_quota_alert_window(
+    notified: &mut BTreeSet<String>,
+    prefix: &str,
+    reset_key: &str,
+    alert_type: QuotaAlertType,
+) -> (String, bool) {
+    let key = format!("{prefix}{reset_key}");
     let same_window_key = notified.iter().find(|existing| {
-        let Some(existing_reset) = existing.strip_prefix(&prefix) else {
+        let Some(existing_reset) = existing.strip_prefix(prefix) else {
             return false;
         };
-        match (reset_key.as_str(), existing_reset) {
+        if !matches_alert_type(existing_reset, alert_type) {
+            return false;
+        }
+        match (reset_key, existing_reset) {
             ("unknown", "unknown") => true,
             (current, previous) => match (current.parse::<u64>(), previous.parse::<u64>()) {
                 (Ok(current), Ok(previous)) => {
@@ -756,33 +825,74 @@ fn append_quota_alert(
         if existing != &key {
             let existing = existing.clone();
             notified.remove(&existing);
-            notified.insert(key);
+            notified.insert(key.clone());
         }
-        return;
+        return (key, true);
     }
 
-    notified.retain(|existing| !existing.starts_with(&prefix));
-    if remaining > threshold || !notified.insert(key) {
-        return;
-    }
+    notified.retain(|existing| {
+        let Some(existing_reset) = existing.strip_prefix(prefix) else {
+            return true;
+        };
+        !matches_alert_type(existing_reset, alert_type)
+    });
+    (key, false)
+}
 
+fn matches_alert_type(reset_key: &str, alert_type: QuotaAlertType) -> bool {
+    match alert_type {
+        // Threshold keys predate the separate exhaustion namespace.
+        QuotaAlertType::Threshold => !reset_key.starts_with("exhausted:"),
+        QuotaAlertType::Exhausted => true,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_quota_alert_notification(
+    alerts: &mut Vec<QuotaAlert>,
+    language: LanguageId,
+    kind: tray_icon::TrayIconKind,
+    provider_label: &str,
+    window_label: &str,
+    section: &crate::models::UsageSection,
+    remaining: u8,
+    alert_type: QuotaAlertType,
+) {
     let reset = format_precise_reset_time(section.resets_at);
     let (title, message) = if language == LanguageId::SimplifiedChinese {
-        (
-            format!("{provider_label} 额度提醒"),
-            format!(
-                "{window_label}额度仅剩 {remaining}%，重置时间：{}",
-                reset.unwrap_or_else(|| "未知".to_string())
+        match alert_type {
+            QuotaAlertType::Threshold => (
+                format!("{provider_label} 额度提醒"),
+                format!(
+                    "{window_label}额度仅剩 {remaining}%，重置时间：{}",
+                    reset.unwrap_or_else(|| "未知".to_string())
+                ),
             ),
-        )
+            QuotaAlertType::Exhausted => (
+                format!("{provider_label} 额度已用尽"),
+                format!(
+                    "{window_label}额度已用尽，仅剩 0%，重置时间：{}",
+                    reset.unwrap_or_else(|| "未知".to_string())
+                ),
+            ),
+        }
     } else {
-        (
-            format!("{provider_label} quota alert"),
-            format!(
-                "{window_label} quota has {remaining}% remaining. Reset: {}",
-                reset.unwrap_or_else(|| "unknown".to_string())
+        match alert_type {
+            QuotaAlertType::Threshold => (
+                format!("{provider_label} quota alert"),
+                format!(
+                    "{window_label} quota has {remaining}% remaining. Reset: {}",
+                    reset.unwrap_or_else(|| "unknown".to_string())
+                ),
             ),
-        )
+            QuotaAlertType::Exhausted => (
+                format!("{provider_label} quota exhausted"),
+                format!(
+                    "{window_label} quota has 0% remaining. Reset: {}",
+                    reset.unwrap_or_else(|| "unknown".to_string())
+                ),
+            ),
+        }
     };
     alerts.push(QuotaAlert {
         kind,
@@ -4233,6 +4343,35 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
 mod tests {
     use super::*;
 
+    fn test_quota_section(remaining: f64, reset_offset: u64) -> crate::models::UsageSection {
+        crate::models::UsageSection {
+            percentage: 100.0 - remaining,
+            resets_at: Some(UNIX_EPOCH + Duration::from_secs(2_000_000_000 + reset_offset)),
+        }
+    }
+
+    fn append_test_codex_session_alert(
+        alerts: &mut Vec<QuotaAlert>,
+        notified: &mut BTreeSet<String>,
+        threshold: u8,
+        remaining: f64,
+        reset_offset: u64,
+    ) {
+        let section = test_quota_section(remaining, reset_offset);
+        append_quota_alert(
+            alerts,
+            notified,
+            threshold,
+            LanguageId::English,
+            tray_icon::TrayIconKind::Codex,
+            "codex",
+            "Codex",
+            "session",
+            "5-hour",
+            &section,
+        );
+    }
+
     #[test]
     fn service_tooltip_combines_visible_quota_rows() {
         assert_eq!(
@@ -4554,5 +4693,103 @@ mod tests {
         assert_eq!(alerts.len(), 1);
         assert!(alerts[0].message.contains("4% remaining"));
         assert_eq!(notified.len(), 1);
+    }
+
+    #[test]
+    fn low_quota_alert_fires_then_exhaustion_alert_fires() {
+        let mut alerts = Vec::new();
+        let mut notified = BTreeSet::new();
+
+        append_test_codex_session_alert(&mut alerts, &mut notified, 5, 4.0, 0);
+        append_test_codex_session_alert(&mut alerts, &mut notified, 5, 0.0, 0);
+
+        assert_eq!(alerts.len(), 2);
+        assert_eq!(alerts[0].title, "Codex quota alert");
+        assert_eq!(alerts[1].title, "Codex quota exhausted");
+        assert!(alerts[1].message.contains("5-hour quota has 0% remaining"));
+        assert_eq!(notified.len(), 2);
+    }
+
+    #[test]
+    fn quota_alerts_off_suppress_threshold_and_exhaustion_alerts() {
+        let mut alerts = Vec::new();
+        let mut notified = BTreeSet::new();
+
+        append_test_codex_session_alert(&mut alerts, &mut notified, 0, 4.0, 0);
+        append_test_codex_session_alert(&mut alerts, &mut notified, 0, 0.0, 0);
+
+        assert!(alerts.is_empty());
+        assert!(notified.is_empty());
+    }
+
+    #[test]
+    fn direct_jump_to_zero_only_sends_exhaustion_alert() {
+        let mut alerts = Vec::new();
+        let mut notified = BTreeSet::new();
+
+        append_test_codex_session_alert(&mut alerts, &mut notified, 5, 50.0, 0);
+        append_test_codex_session_alert(&mut alerts, &mut notified, 5, 0.0, 0);
+
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].title, "Codex quota exhausted");
+        assert_eq!(notified.len(), 1);
+    }
+
+    #[test]
+    fn repeated_zero_remaining_polls_do_not_repeat_exhaustion_alert() {
+        let mut alerts = Vec::new();
+        let mut notified = BTreeSet::new();
+
+        append_test_codex_session_alert(&mut alerts, &mut notified, 5, 0.0, 0);
+        append_test_codex_session_alert(&mut alerts, &mut notified, 5, 0.0, 0);
+
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].title, "Codex quota exhausted");
+    }
+
+    #[test]
+    fn persisted_exhaustion_state_does_not_repeat_alert_after_restart() {
+        let mut alerts = Vec::new();
+        let mut notified = BTreeSet::new();
+        append_test_codex_session_alert(&mut alerts, &mut notified, 5, 0.0, 0);
+
+        let persisted: BTreeSet<String> =
+            serde_json::from_str(&serde_json::to_string(&notified).unwrap()).unwrap();
+        let mut restarted_alerts = Vec::new();
+        let mut restarted_notified = persisted;
+        append_test_codex_session_alert(&mut restarted_alerts, &mut restarted_notified, 5, 0.0, 0);
+
+        assert!(restarted_alerts.is_empty());
+        assert_eq!(restarted_notified, notified);
+    }
+
+    #[test]
+    fn exhaustion_alert_ignores_reset_time_jitter_and_rebases_state() {
+        let mut alerts = Vec::new();
+        let mut notified = BTreeSet::new();
+
+        for offset in [0, 4 * 60, 8 * 60, 12 * 60] {
+            append_test_codex_session_alert(&mut alerts, &mut notified, 5, 0.0, offset);
+        }
+
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(notified.len(), 1);
+        assert!(notified.contains("codex:session:exhausted:2000000720"));
+    }
+
+    #[test]
+    fn exhaustion_alert_rearms_for_a_genuine_new_quota_window() {
+        let mut alerts = Vec::new();
+        let mut notified = BTreeSet::new();
+
+        append_test_codex_session_alert(&mut alerts, &mut notified, 5, 0.0, 0);
+        append_test_codex_session_alert(&mut alerts, &mut notified, 5, 0.0, 18_000);
+
+        assert_eq!(alerts.len(), 2);
+        assert!(alerts
+            .iter()
+            .all(|alert| alert.title == "Codex quota exhausted"));
+        assert_eq!(notified.len(), 1);
+        assert!(notified.contains("codex:session:exhausted:2000018000"));
     }
 }
