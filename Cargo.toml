@@ -1,11 +1,11 @@
 [package]
 name = "codex-usage"
-version = "1.9.1"
+version = "1.9.1-veredis.7"
 edition = "2021"
 license = "MIT"
 description = "Codex Usage"
 homepage = "https://github.com/upstream-ray/codex-usage-monitor"
-repository = "https://github.com/upstream-ray/codex-usage-monitor"
+repository = "https://github.com/veredis/codex-usage-monitor"
 
 [package.metadata.winres]
 CompanyName = "Ray"
@@ -23,6 +23,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
 sha2 = "0.10"
+semver = "1"
 
 [dependencies.windows]
 version = "0.58"

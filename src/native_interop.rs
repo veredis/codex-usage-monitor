@@ -25,6 +25,7 @@ pub const TIMER_POLL: usize = 1;
 pub const TIMER_COUNTDOWN: usize = 2;
 pub const TIMER_RESET_POLL: usize = 3;
 pub const TIMER_UPDATE_CHECK: usize = 4;
+pub const TIMER_CREDENTIAL_WATCH: usize = 5;
 
 // Custom messages
 pub const WM_APP: u32 = 0x8000;
@@ -102,6 +103,41 @@ pub fn find_child_window(parent: HWND, class_name: &str) -> Option<HWND> {
             _ => None,
         }
     }
+}
+
+/// Return visible direct child rectangles for taskbar collision avoidance.
+/// The shell owns these windows; callers use the rectangles only as a
+/// conservative geometry hint and must tolerate an empty result.
+pub fn visible_child_window_rects(parent: HWND, exclude: Option<HWND>) -> Vec<RECT> {
+    struct Collection {
+        exclude: Option<HWND>,
+        rectangles: Vec<RECT>,
+    }
+
+    let rectangles = Vec::new();
+    unsafe extern "system" fn collect_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let collection = &mut *(lparam.0 as *mut Collection);
+        if collection.exclude != Some(hwnd) && IsWindowVisible(hwnd).as_bool() {
+            if let Some(rect) = get_window_rect_safe(hwnd) {
+                if rect.right > rect.left && rect.bottom > rect.top {
+                    collection.rectangles.push(rect);
+                }
+            }
+        }
+        BOOL(1)
+    }
+    let mut collection = Collection {
+        exclude,
+        rectangles,
+    };
+    unsafe {
+        let _ = EnumChildWindows(
+            parent,
+            Some(collect_proc),
+            LPARAM(&mut collection as *mut Collection as isize),
+        );
+    }
+    collection.rectangles
 }
 
 /// Get taskbar position via SHAppBarMessage

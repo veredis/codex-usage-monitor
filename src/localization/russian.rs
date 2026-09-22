@@ -1,7 +1,5 @@
 use super::Strings;
 
-pub(super) const UPDATE_VIA_WINGET_LABEL: &str = "Обновить через WinGet";
-
 pub(super) const STRINGS: Strings = Strings {
     window_title: "Codex Usage",
     refresh: "Обновить",
@@ -10,6 +8,7 @@ pub(super) const STRINGS: Strings = Strings {
     five_minutes: "5 минут",
     fifteen_minutes: "15 минут",
     one_hour: "1 час",
+    adaptive: "Адаптивный",
     models: "Модели",
     claude_code_model: "Claude Code",
     codex_model: "Codex",
@@ -17,9 +16,12 @@ pub(super) const STRINGS: Strings = Strings {
     settings: "Настройки",
     start_with_windows: "Запускать вместе с Windows",
     reset_position: "Сбросить позицию",
+    show_drag_handle: "Показывать маркер перетаскивания",
+    enable_codex_mcp: "Включить интеграцию MCP",
     language: "Язык",
     system_default: "Системный по умолчанию",
     check_for_updates: "Проверить обновления",
+    open_log_file: "Открыть файл журнала",
     checking_for_updates: "Проверка обновлений...",
     updates: "Обновления",
     update_in_progress: "Проверка обновлений уже выполняется.",
@@ -33,12 +35,13 @@ pub(super) const STRINGS: Strings = Strings {
     exit: "Выход",
     show_widget: "Показать виджет",
     credits: "Кредиты",
-    credit_display: "Отображение кредитов",
+    credit_display: "Кредиты / Luna Reserve",
     credit_always: "Всегда",
     credit_when_needed: "При необходимости",
     credit_off: "Выкл.",
     credit_left: "Слева",
     credit_right: "Справа",
+    credit_usd_estimate: "USD",
     session_window: "5ч",
     weekly_window: "7д",
     now: "сейчас",
@@ -47,7 +50,7 @@ pub(super) const STRINGS: Strings = Strings {
     minute_suffix: "м",
     second_suffix: "с",
     token_expired_title: "Ошибка авторизации Claude Code",
-    token_expired_body: "Запустите 'claude' в терминале, затем используйте '/login' и следуйте инструкциям. После этого обновите или перезапустите приложение.",
+    token_expired_body: "Требуется аутентификация CLI Claude Code; вход в настольное приложение Claude недостаточен. Запустите 'claude' в терминале, затем используйте '/login' и следуйте инструкциям. После этого обновите или перезапустите приложение.",
     codex_token_expired_title: "Ошибка авторизации Codex",
     codex_token_expired_body: "Запустите 'codex' в терминале и следуйте инструкциям для входа. После этого обновите или перезапустите приложение.",
     antigravity_token_expired_title: "Ошибка авторизации Antigravity",

@@ -1,7 +1,5 @@
 use super::Strings;
 
-pub(super) const UPDATE_VIA_WINGET_LABEL: &str = "Bijwerken via WinGet";
-
 pub(super) const STRINGS: Strings = Strings {
     window_title: "Codex Usage",
     refresh: "Vernieuwen",
@@ -10,6 +8,7 @@ pub(super) const STRINGS: Strings = Strings {
     five_minutes: "5 minuten",
     fifteen_minutes: "15 minuten",
     one_hour: "1 uur",
+    adaptive: "Adaptief",
     models: "Modellen",
     claude_code_model: "Claude Code",
     codex_model: "Codex",
@@ -17,9 +16,12 @@ pub(super) const STRINGS: Strings = Strings {
     settings: "Instellingen",
     start_with_windows: "Opstarten met Windows",
     reset_position: "Positie herstellen",
+    show_drag_handle: "Sleepgreep tonen",
+    enable_codex_mcp: "MCP-integratie inschakelen",
     language: "Taal",
     system_default: "Systeemstandaard",
     check_for_updates: "Controleren op updates",
+    open_log_file: "Logbestand openen",
     checking_for_updates: "Controleren op updates...",
     updates: "Updates",
     update_in_progress: "Er is al een updatecontrole bezig.",
@@ -33,12 +35,13 @@ pub(super) const STRINGS: Strings = Strings {
     exit: "Afsluiten",
     show_widget: "Widget tonen",
     credits: "Credits",
-    credit_display: "Creditweergave",
+    credit_display: "Credits / Luna Reserve",
     credit_always: "Altijd",
     credit_when_needed: "Indien nodig",
     credit_off: "Uit",
     credit_left: "Links",
     credit_right: "Rechts",
+    credit_usd_estimate: "USD",
     session_window: "5u",
     weekly_window: "7d",
     now: "nu",
@@ -46,7 +49,7 @@ pub(super) const STRINGS: Strings = Strings {
     hour_suffix: "u",
     minute_suffix: "m",
     token_expired_title: "Claude Code-authenticatiefout",
-    token_expired_body: "Voer 'claude' uit in een terminal, gebruik daarna '/login' en volg de stappen. Ververs of herstart de app daarna.",
+    token_expired_body: "Claude Code CLI-authenticatie is vereist; aanmelden bij de Claude-desktopapp is niet voldoende. Voer 'claude' uit in een terminal, gebruik daarna '/login' en volg de stappen. Ververs of herstart de app daarna.",
     codex_token_expired_title: "Codex-authenticatiefout",
     codex_token_expired_body: "Voer 'codex' uit in een terminal en volg de aanmeldstappen. Ververs of herstart de app daarna.",
     antigravity_token_expired_title: "Antigravity-authenticatiefout",

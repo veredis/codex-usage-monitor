@@ -1,7 +1,5 @@
 use super::Strings;
 
-pub(super) const UPDATE_VIA_WINGET_LABEL: &str = "Atualizar via WinGet";
-
 pub(super) const STRINGS: Strings = Strings {
     window_title: "Codex Usage",
     refresh: "Atualizar",
@@ -10,6 +8,7 @@ pub(super) const STRINGS: Strings = Strings {
     five_minutes: "5 Minutos",
     fifteen_minutes: "15 Minutos",
     one_hour: "1 Hora",
+    adaptive: "Adaptativo",
     models: "Modelos",
     claude_code_model: "Claude Code",
     codex_model: "Codex",
@@ -17,9 +16,12 @@ pub(super) const STRINGS: Strings = Strings {
     settings: "Configurações",
     start_with_windows: "Iniciar com o Windows",
     reset_position: "Redefinir Posição",
+    show_drag_handle: "Mostrar alça de arraste",
+    enable_codex_mcp: "Ativar integração MCP",
     language: "Idioma",
     system_default: "Padrão do Sistema",
     check_for_updates: "Busca atualizações",
+    open_log_file: "Abrir arquivo de log",
     checking_for_updates: "Buscando por atualizações...",
     updates: "Atualizações",
     update_in_progress: "Uma verificação de atualização já está em andamento.",
@@ -33,12 +35,13 @@ pub(super) const STRINGS: Strings = Strings {
     exit: "Sair",
     show_widget: "Exibir Widget",
     credits: "Créditos",
-    credit_display: "Exibição de créditos",
+    credit_display: "Créditos / Luna Reserve",
     credit_always: "Sempre",
     credit_when_needed: "Quando necessário",
     credit_off: "Desativado",
     credit_left: "Esquerda",
     credit_right: "Direita",
+    credit_usd_estimate: "USD",
     session_window: "5h",
     weekly_window: "7d",
     now: "agora",
@@ -47,7 +50,7 @@ pub(super) const STRINGS: Strings = Strings {
     minute_suffix: "m",
     second_suffix: "s",
     token_expired_title: "Erro de Autenticação do Claude Code",
-    token_expired_body: "Execute 'claude' em um terminal, use '/login' e siga as instruções. Depois disso, atualize ou reinicie este aplicativo.",
+    token_expired_body: "A autenticação da CLI do Claude Code é necessária; entrar no aplicativo Claude para desktop não é suficiente. Execute 'claude' em um terminal, use '/login' e siga as instruções. Depois disso, atualize ou reinicie este aplicativo.",
     codex_token_expired_title: "Erro de Autenticação do Codex",
     codex_token_expired_body: "Execute 'codex' em um terminal e siga as instruções de login. Depois disso, atualize ou reinicie este aplicativo.",
     antigravity_token_expired_title: "Erro de Autenticação do Antigravity",

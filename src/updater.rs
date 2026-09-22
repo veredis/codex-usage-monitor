@@ -19,14 +19,10 @@ const CHECKSUM_ASSET_NAME: &str = "codex-usage.exe.sha256";
 const HELPER_EXE_NAME: &str = "updater-helper.exe";
 const DOWNLOAD_EXE_NAME: &str = "update-download.exe";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
-const CREATE_NEW_CONSOLE: u32 = 0x00000010;
-// Keep this aligned with the package identifier used in winget-pkgs.
-const WINGET_PACKAGE_ID: &str = "Ray.CodexUsage";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InstallChannel {
     Portable,
-    Winget,
 }
 
 #[derive(Clone, Debug)]
@@ -73,10 +69,9 @@ pub fn handle_cli_mode(args: &[String]) -> Option<i32> {
 }
 
 pub fn current_install_channel() -> InstallChannel {
-    match std::env::current_exe() {
-        Ok(path) if is_winget_install_path(&path) => InstallChannel::Winget,
-        _ => InstallChannel::Portable,
-    }
+    // This fork has no corresponding WinGet package. Always use the portable
+    // updater so an upstream package can never replace the fork.
+    InstallChannel::Portable
 }
 
 pub fn check_for_updates() -> Result<UpdateCheckResult, String> {
@@ -84,29 +79,6 @@ pub fn check_for_updates() -> Result<UpdateCheckResult, String> {
         Some(release) => Ok(UpdateCheckResult::Available(release)),
         None => Ok(UpdateCheckResult::UpToDate),
     }
-}
-
-pub fn begin_winget_update() -> Result<(), String> {
-    let current_exe =
-        std::env::current_exe().map_err(|e| format!("Unable to locate current executable: {e}"))?;
-    let current_dir = current_exe
-        .parent()
-        .ok_or_else(|| "Unable to determine the app directory for restart.".to_string())?;
-    let command = winget_upgrade_command(
-        std::process::id(),
-        &current_exe.to_string_lossy(),
-        &current_dir.to_string_lossy(),
-    );
-
-    Command::new("powershell.exe")
-        .arg("-NoLogo")
-        .arg("-Command")
-        .arg(&command)
-        .creation_flags(CREATE_NEW_CONSOLE)
-        .spawn()
-        .map_err(|e| format!("Unable to launch WinGet update command: {e}"))?;
-
-    Ok(())
 }
 
 pub fn begin_self_update(release: &ReleaseDescriptor) -> Result<(), String> {
@@ -429,41 +401,6 @@ fn updates_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "Unable to resolve a writable local updates directory.".to_string())
 }
 
-fn winget_upgrade_command(pid: u32, target: &str, working_dir: &str) -> String {
-    let target = powershell_single_quoted(target);
-    let working_dir = powershell_single_quoted(working_dir);
-    let package_id = WINGET_PACKAGE_ID;
-
-    format!(
-        concat!(
-            "$ErrorActionPreference = 'Stop'; ",
-            "$pidToWait = {pid}; ",
-            "$target = '{target}'; ",
-            "$workingDir = '{working_dir}'; ",
-            "try {{ Wait-Process -Id $pidToWait -Timeout 30 -ErrorAction Stop }} catch {{ }}; ",
-            "winget upgrade --id {package_id} --exact; ",
-            "$exitCode = $LASTEXITCODE; ",
-            "if ($exitCode -eq 0) {{ ",
-            "Start-Sleep -Seconds 2; ",
-            "Start-Process -FilePath $target -WorkingDirectory $workingDir; ",
-            "exit 0 ",
-            "}}; ",
-            "Write-Host ''; ",
-            "Write-Host 'WinGet update failed with exit code' $exitCode; ",
-            "Read-Host 'Press Enter to close'; ",
-            "exit $exitCode"
-        ),
-        pid = pid,
-        target = target,
-        working_dir = working_dir,
-        package_id = package_id,
-    )
-}
-
-fn powershell_single_quoted(value: &str) -> String {
-    value.replace('\'', "''")
-}
-
 fn backup_path_for(target: &Path) -> PathBuf {
     let file_name = target
         .file_name()
@@ -509,72 +446,15 @@ fn user_agent() -> &'static str {
     concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"))
 }
 
-fn is_winget_install_path(path: &Path) -> bool {
-    let normalized_path = normalize_path(path);
-    winget_install_roots()
-        .into_iter()
-        .map(|root| normalize_path(&root))
-        .any(|root| normalized_path.starts_with(&root))
-}
-
-fn winget_install_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-
-    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-        roots.push(
-            PathBuf::from(local_app_data)
-                .join("Microsoft")
-                .join("WinGet")
-                .join("Packages"),
-        );
-    }
-
-    if let Ok(program_files) = std::env::var("ProgramFiles") {
-        roots.push(PathBuf::from(program_files).join("WinGet").join("Packages"));
-    } else {
-        roots.push(PathBuf::from(r"C:\Program Files\WinGet\Packages"));
-    }
-
-    if let Ok(program_files_x86) = std::env::var("ProgramFiles(x86)") {
-        roots.push(
-            PathBuf::from(program_files_x86)
-                .join("WinGet")
-                .join("Packages"),
-        );
-    } else {
-        roots.push(PathBuf::from(r"C:\Program Files (x86)\WinGet\Packages"));
-    }
-
-    roots
-}
-
-fn normalize_path(path: &Path) -> String {
-    let normalized = path
-        .to_string_lossy()
-        .replace('/', "\\")
-        .trim_end_matches('\\')
-        .to_ascii_lowercase();
-
-    normalized
-        .strip_prefix("\\\\?\\unc\\")
-        .map(|rest| format!("\\\\{rest}"))
-        .or_else(|| normalized.strip_prefix("\\\\?\\").map(str::to_owned))
-        .unwrap_or(normalized)
-}
-
 fn is_version_newer(candidate: &str, current: &str) -> bool {
-    parse_version(candidate) > parse_version(current)
+    match (parse_version(candidate), parse_version(current)) {
+        (Some(candidate), Some(current)) => candidate > current,
+        _ => false,
+    }
 }
 
-fn parse_version(version: &str) -> (u32, u32, u32) {
-    let core = version.split('-').next().unwrap_or(version);
-    let mut parts = core.split('.').map(|part| part.parse::<u32>().unwrap_or(0));
-
-    (
-        parts.next().unwrap_or(0),
-        parts.next().unwrap_or(0),
-        parts.next().unwrap_or(0),
-    )
+fn parse_version(version: &str) -> Option<semver::Version> {
+    semver::Version::parse(version.trim().trim_start_matches(['v', 'V'])).ok()
 }
 
 fn show_error_message(title: &str, message: &str) {
@@ -618,6 +498,25 @@ mod tests {
             hash.to_ascii_uppercase()
         );
         assert!(parse_release_checksum("not-a-checksum").is_err());
+    }
+
+    #[test]
+    fn compares_full_fork_semver_and_v_prefixed_tags() {
+        assert!(is_version_newer("v1.9.1-veredis.7", "1.9.1-veredis.6"));
+        assert!(!is_version_newer("1.9.1-veredis.6", "v1.9.1-veredis.6"));
+        assert!(!is_version_newer("1.9.1-veredis.5", "1.9.1-veredis.6"));
+        assert!(is_version_newer("1.10.0-veredis.1", "1.9.1-veredis.6"));
+        assert!(!is_version_newer("v0.8.2-veredis.5", "1.9.1-veredis.6"));
+    }
+
+    #[test]
+    fn resolves_updates_from_this_fork_repository_metadata() {
+        assert_eq!(github_repo().unwrap(), ("veredis", "codex-usage-monitor"));
+    }
+
+    #[test]
+    fn fork_updates_are_always_portable() {
+        assert_eq!(current_install_channel(), InstallChannel::Portable);
     }
 
     #[test]

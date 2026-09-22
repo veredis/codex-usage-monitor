@@ -11,7 +11,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$Repository = 'upstream-ray/codex-usage-monitor'
+$Repository = 'veredis/codex-usage-monitor'
 $InstallDirectory = Join-Path $env:LOCALAPPDATA 'Programs\CodexUsage'
 $TargetPath = Join-Path $InstallDirectory 'codex-usage.exe'
 $InstalledUninstaller = Join-Path $InstallDirectory 'uninstall.ps1'

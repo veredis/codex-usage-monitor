@@ -1,7 +1,5 @@
 use super::Strings;
 
-pub(super) const UPDATE_VIA_WINGET_LABEL: &str = "通过 WinGet 更新";
-
 pub(super) const STRINGS: Strings = Strings {
     window_title: "Codex Usage",
     refresh: "立即刷新",
@@ -10,6 +8,7 @@ pub(super) const STRINGS: Strings = Strings {
     five_minutes: "5 分钟",
     fifteen_minutes: "15 分钟",
     one_hour: "1 小时",
+    adaptive: "自适应",
     models: "监控服务",
     claude_code_model: "Claude Code",
     codex_model: "Codex",
@@ -17,9 +16,12 @@ pub(super) const STRINGS: Strings = Strings {
     settings: "设置",
     start_with_windows: "开机自动启动",
     reset_position: "重置位置",
+    show_drag_handle: "显示拖动手柄",
+    enable_codex_mcp: "启用 MCP 集成",
     language: "语言",
     system_default: "跟随系统",
     check_for_updates: "检查更新",
+    open_log_file: "打开日志文件",
     checking_for_updates: "正在检查更新...",
     updates: "更新",
     update_in_progress: "正在检查更新，请稍候。",
@@ -33,12 +35,13 @@ pub(super) const STRINGS: Strings = Strings {
     exit: "退出",
     show_widget: "显示任务栏组件",
     credits: "积分",
-    credit_display: "积分显示",
+    credit_display: "积分 / Luna Reserve",
     credit_always: "始终",
     credit_when_needed: "需要时",
     credit_off: "关闭",
     credit_left: "左",
     credit_right: "右",
+    credit_usd_estimate: "USD",
     session_window: "5h",
     weekly_window: "7d",
     now: "现在",
@@ -48,7 +51,7 @@ pub(super) const STRINGS: Strings = Strings {
     second_suffix: "秒",
     token_expired_title: "Claude Code 登录已失效",
     token_expired_body:
-        "请在终端中运行 'claude'，输入 '/login' 并按提示重新登录。完成后请刷新或重启本工具。",
+        "需要 Claude Code CLI 身份验证；仅登录 Claude 桌面应用还不够。请在终端中运行 'claude'，输入 '/login' 并按提示重新登录。完成后请刷新或重启本工具。",
     codex_token_expired_title: "Codex 登录已失效",
     codex_token_expired_body: "请在终端中运行 'codex' 并按提示重新登录。完成后请刷新或重启本工具。",
     antigravity_token_expired_title: "Antigravity 登录已失效",

@@ -1,7 +1,5 @@
 use super::Strings;
 
-pub(super) const UPDATE_VIA_WINGET_LABEL: &str = "WinGet で更新";
-
 pub(super) const STRINGS: Strings = Strings {
     window_title: "Codex Usage",
     refresh: "更新",
@@ -10,6 +8,7 @@ pub(super) const STRINGS: Strings = Strings {
     five_minutes: "5分",
     fifteen_minutes: "15分",
     one_hour: "1時間",
+    adaptive: "自動調整",
     models: "モデル",
     claude_code_model: "Claude Code",
     codex_model: "Codex",
@@ -17,9 +16,12 @@ pub(super) const STRINGS: Strings = Strings {
     settings: "設定",
     start_with_windows: "Windows と同時に開始",
     reset_position: "位置をリセット",
+    show_drag_handle: "ドラッグハンドルを表示",
+    enable_codex_mcp: "MCP 連携を有効にする",
     language: "言語",
     system_default: "システム既定",
     check_for_updates: "更新を確認",
+    open_log_file: "ログファイルを開く",
     checking_for_updates: "更新を確認しています...",
     updates: "更新",
     update_in_progress: "更新確認は既に実行中です。",
@@ -33,12 +35,13 @@ pub(super) const STRINGS: Strings = Strings {
     exit: "終了",
     show_widget: "ウィジェットを表示",
     credits: "クレジット",
-    credit_display: "クレジット表示",
+    credit_display: "クレジット / Luna Reserve",
     credit_always: "常に",
     credit_when_needed: "必要な場合",
     credit_off: "オフ",
     credit_left: "左",
     credit_right: "右",
+    credit_usd_estimate: "USD",
     session_window: "5h",
     weekly_window: "7d",
     now: "今",
@@ -46,7 +49,7 @@ pub(super) const STRINGS: Strings = Strings {
     hour_suffix: "時間",
     minute_suffix: "分",
     token_expired_title: "認証エラー",
-    token_expired_body: "ターミナルで 'claude' を実行し、'/login' を使って案内に従ってください。その後、このアプリを更新するか再起動してください。",
+    token_expired_body: "Claude Code CLI の認証が必要です。Claude デスクトップアプリにサインインしているだけでは不十分です。ターミナルで 'claude' を実行し、'/login' を使って案内に従ってください。その後、このアプリを更新するか再起動してください。",
     codex_token_expired_title: "Codex 認証エラー",
     codex_token_expired_body: "ターミナルで 'codex' を実行し、サインインの案内に従ってください。その後、このアプリを更新または再起動してください。",
     antigravity_token_expired_title: "Antigravity 認証エラー",

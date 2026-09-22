@@ -2,8 +2,11 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::hash::{Hash, Hasher};
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
@@ -11,11 +14,10 @@ use std::os::windows::process::CommandExt;
 
 use crate::diagnose;
 use crate::localization::Strings;
-use crate::models::{AppUsageData, CreditBalance, UsageData, UsageSection};
+use crate::models::{AppUsageData, CreditBalance, LunaReserveUsage, UsageData, UsageSection};
 use crate::native_interop;
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
-const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const ANTIGRAVITY_CREDENTIAL_TARGET: &str = "gemini:antigravity";
 const ANTIGRAVITY_ENDPOINTS: &[&str] = &[
@@ -24,8 +26,18 @@ const ANTIGRAVITY_ENDPOINTS: &[&str] = &[
     "https://cloudcode-pa.googleapis.com",
 ];
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+const CLAUDE_EXEC_REFRESH_COOLDOWN_SECS: u64 = 24 * 60 * 60;
+const CLAUDE_PASSIVE_RECOVERY_POLLS: u8 = 3;
 
-const MODEL_FALLBACK_CHAIN: &[&str] = &["claude-3-haiku-20240307", "claude-haiku-4-5-20251001"];
+static LAST_CLAUDE_EXEC_REFRESH_UNIX: AtomicU64 = AtomicU64::new(0);
+static CLAUDE_PASSIVE_RECOVERY_FAILURES: AtomicU8 = AtomicU8::new(0);
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PollError {
@@ -58,14 +70,32 @@ impl PollError {
     }
 }
 
+pub fn is_transient_error(error: PollError) -> bool {
+    matches!(
+        error,
+        PollError::NetworkUnavailable | PollError::RateLimited | PollError::ServerError
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CredentialWatchMode {
     ActiveSource,
     AllSources,
+    Codex,
     Antigravity,
 }
 
 pub type CredentialWatchSnapshot = Vec<String>;
+
+#[derive(Default)]
+pub struct PollOutcome {
+    pub data: AppUsageData,
+    pub claude_error: Option<PollError>,
+    pub codex_error: Option<PollError>,
+    pub antigravity_error: Option<PollError>,
+    pub first_error: Option<PollError>,
+    pub has_success: bool,
+}
 
 #[derive(Deserialize)]
 struct UsageResponse {
@@ -93,7 +123,25 @@ struct CodexTokenData {
 #[derive(Deserialize)]
 struct CodexUsageResponse {
     rate_limit: Option<Option<Box<CodexRateLimitDetails>>>,
+    #[serde(default)]
+    ordinary_usage_allowed: Option<bool>,
     credits: Option<CodexCredits>,
+    #[serde(default)]
+    additional_rate_limits: Option<Vec<CodexAdditionalRateLimit>>,
+    #[serde(default)]
+    rate_limit_upsell: Option<CodexRateLimitUpsell>,
+}
+
+#[derive(Deserialize)]
+struct CodexRateLimitUpsell {
+    banner_type: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CodexAdditionalRateLimit {
+    limit_name: Option<String>,
+    metered_feature: Option<String>,
+    rate_limit: Option<Option<Box<CodexRateLimitDetails>>>,
 }
 
 #[derive(Deserialize)]
@@ -111,6 +159,10 @@ enum CodexCreditBalanceValue {
 
 #[derive(Deserialize)]
 struct CodexRateLimitDetails {
+    #[serde(default)]
+    allowed: Option<bool>,
+    #[serde(default)]
+    limit_reached: Option<bool>,
     primary_window: Option<Option<Box<CodexRateLimitWindow>>>,
     secondary_window: Option<Option<Box<CodexRateLimitWindow>>>,
 }
@@ -212,11 +264,10 @@ extern "system" {
     fn CredFree(buffer: *mut c_void);
 }
 
-pub fn poll(
-    show_claude_code: bool,
-    show_codex: bool,
-    show_antigravity: bool,
-) -> Result<AppUsageData, PollError> {
+pub fn poll(show_claude_code: bool, show_codex: bool, show_antigravity: bool) -> PollOutcome {
+    diagnose::log(format!(
+        "usage poll started providers=claude:{show_claude_code},codex:{show_codex},antigravity:{show_antigravity}"
+    ));
     poll_with(
         show_claude_code,
         show_codex,
@@ -240,15 +291,19 @@ fn poll_with(
     mut poll_claude_code: impl FnMut() -> Result<UsageData, PollError>,
     mut poll_codex: impl FnMut() -> Result<UsageData, PollError>,
     mut poll_antigravity: impl FnMut() -> Result<UsageData, PollError>,
-) -> Result<AppUsageData, PollError> {
+) -> PollOutcome {
     let mut data = AppUsageData::default();
     let mut first_error = None;
+    let mut claude_error = None;
+    let mut codex_error = None;
+    let mut antigravity_error = None;
     let active_provider_count = show_claude_code as u8 + show_codex as u8 + show_antigravity as u8;
 
     if show_claude_code {
         match poll_claude_code() {
             Ok(claude_code) => data.claude_code = Some(claude_code),
             Err(error) => {
+                claude_error = Some(error);
                 if active_provider_count > 1 {
                     diagnose::log(format!("Claude Code usage poll failed: {error:?}"));
                 }
@@ -261,6 +316,7 @@ fn poll_with(
         match poll_codex() {
             Ok(codex) => data.codex = Some(codex),
             Err(error) => {
+                codex_error = Some(error);
                 if active_provider_count > 1 {
                     diagnose::log(format!("Codex usage poll failed: {error:?}"));
                 }
@@ -273,6 +329,7 @@ fn poll_with(
         match poll_antigravity() {
             Ok(antigravity) => data.antigravity = Some(antigravity),
             Err(error) => {
+                antigravity_error = Some(error);
                 if active_provider_count > 1 {
                     diagnose::log(format!("Antigravity usage poll failed: {error:?}"));
                 }
@@ -281,10 +338,59 @@ fn poll_with(
         }
     }
 
-    if data.claude_code.is_none() && data.codex.is_none() && data.antigravity.is_none() {
-        Err(first_error.unwrap_or(PollError::RequestFailed))
-    } else {
-        Ok(data)
+    let has_success =
+        data.claude_code.is_some() || data.codex.is_some() || data.antigravity.is_some();
+    if let Some(codex) = data.codex.as_ref() {
+        let reset = |value: Option<SystemTime>| {
+            value
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs())
+        };
+        let credits_state = match codex.credits.as_ref() {
+            Some(CreditBalance::Amount(_)) => "amount",
+            Some(CreditBalance::Unlimited) => "unlimited",
+            None => "unknown",
+        };
+        diagnose::log(format!(
+            "Codex usage poll succeeded session_used={:.2}% session_remaining={:.2}% session_reset_unix={:?} weekly_used={:.2}% weekly_remaining={:.2}% weekly_reset_unix={:?} credits={credits_state}",
+            codex.session.percentage,
+            remaining_percentage(codex.session.percentage),
+            reset(codex.session.resets_at),
+            codex.weekly.percentage,
+            remaining_percentage(codex.weekly.percentage),
+            reset(codex.weekly.resets_at),
+        ));
+        if let Some(reserve) = codex.luna_reserve.as_ref() {
+            let reset = reserve
+                .section
+                .resets_at
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs());
+            diagnose::log(format!(
+                "Codex Luna Reserve available={} active={:?} used={:.2}% remaining={:.2}% reset_unix={reset:?}",
+                reserve.available,
+                reserve.active,
+                reserve.section.percentage,
+                remaining_percentage(reserve.section.percentage),
+            ));
+        }
+    }
+    diagnose::log(format!(
+        "usage poll completed status={} codex_error={:?}",
+        if has_success {
+            "partial_or_ok"
+        } else {
+            "failed"
+        },
+        codex_error
+    ));
+    PollOutcome {
+        data,
+        claude_error,
+        codex_error,
+        antigravity_error,
+        first_error,
+        has_success,
     }
 }
 
@@ -292,7 +398,9 @@ fn poll_claude_code() -> Result<UsageData, PollError> {
     let creds = match read_first_credentials() {
         Some(c) => c,
         None => {
-            diagnose::log("poll failed: no Claude credentials found");
+            diagnose::log(
+                "Claude Code CLI credentials missing; Claude Desktop sign-in is not used for CLI monitoring",
+            );
             return Err(PollError::NoCredentials);
         }
     };
@@ -311,15 +419,7 @@ fn poll_codex() -> Result<UsageData, PollError> {
         }
     };
 
-    match fetch_codex_usage(&creds.access_token, creds.account_id.as_deref()) {
-        Ok(data) => Ok(data),
-        Err(PollError::AuthRequired) => {
-            cli_refresh_codex_token();
-            let refreshed = read_codex_credentials().ok_or(PollError::TokenExpired)?;
-            fetch_codex_usage(&refreshed.access_token, refreshed.account_id.as_deref())
-        }
-        Err(error) => Err(error),
-    }
+    fetch_codex_usage(&creds.access_token, creds.account_id.as_deref())
 }
 
 fn poll_antigravity() -> Result<UsageData, PollError> {
@@ -335,16 +435,44 @@ fn poll_antigravity() -> Result<UsageData, PollError> {
 }
 
 fn refresh_or_fallback(mut creds: Credentials) -> Result<Credentials, PollError> {
+    let mut passive_failure = None;
     loop {
         if !is_token_expired(creds.expires_at) {
+            CLAUDE_PASSIVE_RECOVERY_FAILURES.store(0, Ordering::Release);
             return Ok(creds);
         }
 
         let source = creds.source.clone();
-        cli_refresh_token(&source);
+        if passive_failure.is_none() {
+            passive_failure = Some(
+                CLAUDE_PASSIVE_RECOVERY_FAILURES
+                    .fetch_add(1, Ordering::AcqRel)
+                    .saturating_add(1),
+            );
+        }
+        let passive_failure_count = passive_failure.unwrap_or(CLAUDE_PASSIVE_RECOVERY_POLLS);
+        if claude_passive_recovery_should_defer(passive_failure_count) {
+            diagnose::log(
+                format!(
+                    "Claude credentials are expired; passive auth recovery poll {passive_failure_count}/{CLAUDE_PASSIVE_RECOVERY_POLLS}, no model task started"
+                ),
+            );
+        } else if claude_exec_refresh_allowed(now_unix_secs()) {
+            diagnose::log(
+                "Claude passive auth recovery exhausted; starting guarded last-resort model refresh",
+            );
+            cli_refresh_token(&source);
+        } else {
+            diagnose::log(
+                "Claude credentials are expired; last-resort model refresh cooldown is active",
+            );
+        }
 
         match read_credentials_from_source(&source) {
-            Some(refreshed) if !is_token_expired(refreshed.expires_at) => return Ok(refreshed),
+            Some(refreshed) if !is_token_expired(refreshed.expires_at) => {
+                CLAUDE_PASSIVE_RECOVERY_FAILURES.store(0, Ordering::Release);
+                return Ok(refreshed);
+            }
             Some(_) => diagnose::log(format!(
                 "credentials from {source:?} still expired after refresh attempt"
             )),
@@ -353,11 +481,32 @@ fn refresh_or_fallback(mut creds: Credentials) -> Result<Credentials, PollError>
             )),
         }
 
+        if claude_passive_recovery_should_defer(passive_failure_count) {
+            return Err(PollError::TokenExpired);
+        }
+
         match read_next_credentials_after(&source) {
-            Some(next) => creds = next,
+            Some(next) => {
+                creds = next;
+                passive_failure = Some(passive_failure_count);
+            }
             None => return Err(PollError::TokenExpired),
         }
     }
+}
+
+fn claude_passive_recovery_should_defer(failures: u8) -> bool {
+    failures < CLAUDE_PASSIVE_RECOVERY_POLLS
+}
+
+fn claude_exec_refresh_allowed(now: u64) -> bool {
+    let previous = LAST_CLAUDE_EXEC_REFRESH_UNIX.load(Ordering::Acquire);
+    if previous != 0 && now.saturating_sub(previous) < CLAUDE_EXEC_REFRESH_COOLDOWN_SECS {
+        return false;
+    }
+    LAST_CLAUDE_EXEC_REFRESH_UNIX
+        .compare_exchange(previous, now, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
 }
 
 /// Invoke the Claude CLI with a minimal prompt to force its internal
@@ -448,48 +597,188 @@ fn cli_refresh_wsl_token(distro: &str) {
     wait_for_refresh(&mut child);
 }
 
-fn cli_refresh_codex_token() {
+/// Ask Codex's own auth manager to refresh OAuth without starting a model task.
+/// This uses the app-server's documented account/read refreshToken operation.
+pub fn refresh_codex_token_model_free() -> bool {
     let codex_path = resolve_windows_codex_path();
-    let is_cmd = codex_path.to_lowercase().ends_with(".cmd");
-    let is_ps1 = codex_path.to_lowercase().ends_with(".ps1");
+    diagnose::log("starting model-free Codex app-server auth refresh");
+    let mut command = codex_command(&codex_path, &["app-server", "--stdio"]);
+    command
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    let mut child = match command.spawn() {
+        Ok(c) => c,
+        Err(error) => {
+            diagnose::log_error(
+                "unable to start Codex app-server for model-free refresh",
+                error,
+            );
+            return false;
+        }
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        return false;
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        return false;
+    };
+    let (sender, receiver) = mpsc::channel::<String>();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            match line {
+                Ok(line) => {
+                    if sender.send(line).is_err() {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+    });
+
+    let initialized = write_app_server_request(&mut stdin, app_server_initialize_request())
+        && receive_app_server_response(&receiver, 1).is_some_and(|response| {
+            response.get("error").is_none() && response.get("result").is_some()
+        });
+
+    let refreshed = if initialized
+        && write_app_server_request(&mut stdin, app_server_initialized_notification())
+        && write_app_server_request(&mut stdin, app_server_account_refresh_request())
+    {
+        receive_app_server_response(&receiver, 2).is_some_and(|response| {
+            response.get("error").is_none() && response.get("result").is_some()
+        })
+    } else {
+        false
+    };
+
+    drop(stdin);
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if started.elapsed() < Duration::from_secs(2) => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+        }
+    }
+    let _ = reader.join();
     diagnose::log(format!(
-        "attempting Windows Codex token refresh via {codex_path}"
+        "model-free Codex app-server auth refresh {}",
+        if refreshed { "completed" } else { "failed" }
     ));
+    refreshed
+}
 
-    let args: &[&str] = &["exec", "."];
+/// Last-resort legacy recovery. Callers gate this behind passive retries and a
+/// persistent cooldown; unlike app-server refresh, this may consume model use.
+pub fn run_codex_exec_last_resort() -> bool {
+    let codex_path = resolve_windows_codex_path();
+    diagnose::log("starting last-resort Codex exec auth refresh (may use model allowance)");
+    let mut command = codex_command(&codex_path, &["exec", "."]);
+    command
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            diagnose::log_error("unable to spawn last-resort Codex exec auth refresh", error);
+            return false;
+        }
+    };
+    wait_for_refresh(&mut child)
+}
 
-    let mut cmd = if is_cmd {
-        let mut c = Command::new("cmd.exe");
-        c.arg("/c").arg(&codex_path).args(args);
-        c
-    } else if is_ps1 {
-        let mut c = Command::new("powershell.exe");
-        c.arg("-NoProfile")
+fn codex_command(codex_path: &str, args: &[&str]) -> Command {
+    if codex_path.to_ascii_lowercase().ends_with(".cmd") {
+        let mut command = Command::new("cmd.exe");
+        command.arg("/c").arg(codex_path).args(args);
+        command
+    } else if codex_path.to_ascii_lowercase().ends_with(".ps1") {
+        let mut command = Command::new("powershell.exe");
+        command
+            .arg("-NoProfile")
             .arg("-ExecutionPolicy")
             .arg("Bypass")
             .arg("-File")
-            .arg(&codex_path)
+            .arg(codex_path)
             .args(args);
-        c
+        command
     } else {
-        let mut c = Command::new(&codex_path);
-        c.args(args);
-        c
-    };
-    cmd.creation_flags(CREATE_NO_WINDOW)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        let mut command = Command::new(codex_path);
+        command.args(args);
+        command
+    }
+}
 
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(error) => {
-            diagnose::log_error("unable to spawn Windows Codex token refresh", error);
-            return;
+fn write_app_server_request(
+    stdin: &mut std::process::ChildStdin,
+    value: serde_json::Value,
+) -> bool {
+    serde_json::to_writer(&mut *stdin, &value).is_ok()
+        && stdin.write_all(b"\n").is_ok()
+        && stdin.flush().is_ok()
+}
+
+fn app_server_initialize_request() -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "clientInfo": {
+                "name": "codex_usage_monitor",
+                "title": "Codex Usage Monitor",
+                "version": crate::build_info::VERSION
+            },
+            "capabilities": {"experimentalApi": false}
         }
-    };
+    })
+}
 
-    wait_for_refresh(&mut child);
+fn app_server_initialized_notification() -> serde_json::Value {
+    serde_json::json!({"jsonrpc":"2.0","method":"initialized","params":{}})
+}
+
+fn app_server_account_refresh_request() -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc":"2.0",
+        "id":2,
+        "method":"account/read",
+        "params":{"refreshToken":true}
+    })
+}
+
+fn receive_app_server_response(
+    receiver: &mpsc::Receiver<String>,
+    request_id: u64,
+) -> Option<serde_json::Value> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let line = receiver.recv_timeout(remaining).ok()?;
+        let Ok(message) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if message.get("id").and_then(serde_json::Value::as_u64) == Some(request_id) {
+            return Some(message);
+        }
+    }
 }
 
 /// Spawn a command and wait up to `timeout` for it to finish.
@@ -513,20 +802,21 @@ fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Option<std::process
     }
 }
 
-fn wait_for_refresh(child: &mut std::process::Child) {
+fn wait_for_refresh(child: &mut std::process::Child) -> bool {
     // Wait up to 30 seconds; don't block the poll thread forever.
     let start = std::time::Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => return status.success(),
             Ok(None) => {
                 if start.elapsed() > Duration::from_secs(30) {
                     let _ = child.kill();
-                    break;
+                    let _ = child.wait();
+                    return false;
                 }
                 std::thread::sleep(Duration::from_millis(500));
             }
-            Err(_) => break,
+            Err(_) => return false,
         }
     }
 }
@@ -542,6 +832,7 @@ fn resolve_windows_claude_path() -> String {
             .status()
             .is_ok()
         {
+            diagnose::log(format!("Claude CLI resolved via PATH command={name}"));
             return name.to_string();
         }
     }
@@ -557,6 +848,7 @@ fn resolve_windows_claude_path() -> String {
                 if let Some(first_line) = stdout.lines().next() {
                     let path = first_line.trim().to_string();
                     if !path.is_empty() {
+                        diagnose::log("Claude CLI resolved via where.exe");
                         return path;
                     }
                 }
@@ -564,7 +856,31 @@ fn resolve_windows_claude_path() -> String {
         }
     }
 
+    // Common native Claude Code installs are sometimes not added to PATH.
+    // PATH/where.exe remain preferred; these candidates are deliberately
+    // derived from the current user's profile rather than hard-coded.
+    if let Some(home) = dirs::home_dir() {
+        for candidate in claude_user_install_candidates(&home) {
+            if candidate.is_file() {
+                diagnose::log("Claude CLI resolved from the user-local install directory");
+                return candidate.to_string_lossy().to_string();
+            }
+        }
+    }
+
+    diagnose::log(
+        "Claude CLI executable was not found on PATH or in the user-local install directory",
+    );
     "claude.cmd".to_string()
+}
+
+fn claude_user_install_candidates(home: &std::path::Path) -> Vec<PathBuf> {
+    let bin = home.join(".local").join("bin");
+    vec![
+        bin.join("claude.cmd"),
+        bin.join("claude.exe"),
+        bin.join("claude"),
+    ]
 }
 
 fn resolve_windows_codex_path() -> String {
@@ -630,12 +946,16 @@ pub fn credential_watch_snapshot(mode: CredentialWatchMode) -> CredentialWatchSn
     if mode == CredentialWatchMode::Antigravity {
         return vec![antigravity_credential_watch_signature()];
     }
+    if mode == CredentialWatchMode::Codex {
+        return vec![codex_credential_watch_signature()];
+    }
 
     let sources = match mode {
         CredentialWatchMode::ActiveSource => read_first_credentials()
             .map(|creds| vec![creds.source])
             .unwrap_or_else(all_known_credential_sources),
         CredentialWatchMode::AllSources => all_known_credential_sources(),
+        CredentialWatchMode::Codex => unreachable!(),
         CredentialWatchMode::Antigravity => unreachable!(),
     };
 
@@ -727,36 +1047,13 @@ fn wsl_credential_watch_signature(distro: &str) -> Option<String> {
 }
 
 fn fetch_usage_with_fallback(token: &str) -> Result<UsageData, PollError> {
-    // Try the dedicated usage endpoint first
-    match try_usage_endpoint(token)? {
-        Some(data) => {
-            // If reset timers are missing, fill them in from the Messages API
-            if data.session.resets_at.is_none() || data.weekly.resets_at.is_none() {
-                if let Ok(fallback) = fetch_usage_via_messages(token) {
-                    let mut merged = data;
-                    if merged.session.resets_at.is_none() {
-                        merged.session.resets_at = fallback.session.resets_at;
-                    }
-                    if merged.weekly.resets_at.is_none() {
-                        merged.weekly.resets_at = fallback.weekly.resets_at;
-                    }
-                    return Ok(merged);
-                }
-            }
-            return Ok(data);
-        }
-        None => {}
-    }
-
-    // Fall back to Messages API with rate limit headers
-    let result = fetch_usage_via_messages(token);
-    if result.is_err() {
-        diagnose::log("usage endpoint and Messages API fallback both failed");
-    }
-    result
+    // The dedicated usage endpoint is a passive read. Do not fall back to a
+    // Messages request: that request is a real model invocation and can
+    // consume the user's Claude allowance.
+    try_usage_endpoint(token)
 }
 
-fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
+fn try_usage_endpoint(token: &str) -> Result<UsageData, PollError> {
     let agent = build_agent()?;
 
     let resp = match agent
@@ -768,119 +1065,41 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
         Ok(resp) => resp,
         Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
             diagnose::log(format!(
-                "usage endpoint returned auth error status {code}; re-login required"
+                "Claude Code usage endpoint returned auth error status {code}; CLI credentials are stale or invalid"
             ));
             return Err(PollError::AuthRequired);
         }
-        Err(_) => return Ok(None),
+        Err(ureq::Error::Status(code, _)) => return Err(classify_http_status(code)),
+        Err(error) => return Err(classify_ureq_error(&error)),
     };
 
     let response: UsageResponse = match resp.into_json() {
         Ok(response) => response,
-        Err(_) => return Ok(None),
+        Err(_) => return Err(PollError::RequestFailed),
     };
     let mut data = UsageData::default();
 
     if let Some(bucket) = &response.five_hour {
         data.session.percentage = bucket.utilization;
         data.session.resets_at = parse_iso8601(bucket.resets_at.as_deref());
+        data.session.available = true;
     }
 
     if let Some(bucket) = &response.seven_day {
         data.weekly.percentage = bucket.utilization;
         data.weekly.resets_at = parse_iso8601(bucket.resets_at.as_deref());
+        data.weekly.available = true;
     }
 
-    Ok(Some(data))
-}
-
-fn fetch_usage_via_messages(token: &str) -> Result<UsageData, PollError> {
-    let agent = build_agent()?;
-    let mut last_error = PollError::RequestFailed;
-
-    for model in MODEL_FALLBACK_CHAIN {
-        let body = serde_json::json!({
-            "model": model,
-            "max_tokens": 1,
-            "messages": [{"role": "user", "content": "."}]
-        });
-
-        let response = match agent
-            .post(MESSAGES_URL)
-            .set("Authorization", &format!("Bearer {token}"))
-            .set("anthropic-version", "2023-06-01")
-            .set("anthropic-beta", "oauth-2025-04-20")
-            .send_json(&body)
-        {
-            Ok(resp) => resp,
-            Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
-                diagnose::log(format!(
-                    "messages endpoint returned auth error status {code}; re-login required"
-                ));
-                return Err(PollError::AuthRequired);
-            }
-            Err(ureq::Error::Status(code, resp)) => {
-                last_error = classify_http_status(code);
-                resp
-            }
-            Err(error) => {
-                last_error = classify_ureq_error(&error);
-                continue;
-            }
-        };
-
-        let h5 = response.header("anthropic-ratelimit-unified-5h-utilization");
-        let h7 = response.header("anthropic-ratelimit-unified-7d-utilization");
-        let hs = response.header("anthropic-ratelimit-unified-status");
-
-        if h5.is_some() || h7.is_some() || hs.is_some() {
-            return Ok(parse_rate_limit_headers(&response));
-        }
+    if !data.session.available && !data.weekly.available {
+        return Err(PollError::RequestFailed);
     }
-
-    Err(last_error)
-}
-
-fn parse_rate_limit_headers(response: &ureq::Response) -> UsageData {
-    let mut data = UsageData::default();
-
-    data.session.percentage =
-        get_header_f64(response, "anthropic-ratelimit-unified-5h-utilization") * 100.0;
-    data.session.resets_at = unix_to_system_time(get_header_i64(
-        response,
-        "anthropic-ratelimit-unified-5h-reset",
-    ));
-
-    data.weekly.percentage =
-        get_header_f64(response, "anthropic-ratelimit-unified-7d-utilization") * 100.0;
-    data.weekly.resets_at = unix_to_system_time(get_header_i64(
-        response,
-        "anthropic-ratelimit-unified-7d-reset",
-    ));
-
-    let overall_reset = get_header_i64(response, "anthropic-ratelimit-unified-reset");
-
-    if data.session.percentage == 0.0 && data.weekly.percentage == 0.0 {
-        let status = response.header("anthropic-ratelimit-unified-status");
-        if status == Some("rejected") {
-            let claim = response.header("anthropic-ratelimit-unified-representative-claim");
-            match claim {
-                Some("five_hour") => data.session.percentage = 100.0,
-                Some("seven_day") => data.weekly.percentage = 100.0,
-                _ => {}
-            }
-        }
-
-        if data.session.resets_at.is_none() && overall_reset.is_some() {
-            data.session.resets_at = unix_to_system_time(overall_reset);
-        }
-    }
-
-    data
+    Ok(data)
 }
 
 fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData, PollError> {
     let agent = build_agent()?;
+    diagnose::log_verbose("sending Codex usage request; authorization header omitted");
     let mut request = agent
         .get(CODEX_USAGE_URL)
         .set("Authorization", &format!("Bearer {token}"))
@@ -907,15 +1126,76 @@ fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData,
         }
     };
 
-    codex_usage_from_response(response).ok_or(PollError::RequestFailed)
+    let data = codex_usage_from_response(response).ok_or(PollError::RequestFailed)?;
+    diagnose::log_verbose(format!(
+        "Codex response normalized session_window={} weekly_window={} credits_state={}",
+        data.session.available,
+        data.weekly.available,
+        match data.credits.as_ref() {
+            Some(CreditBalance::Amount(_)) => "amount",
+            Some(CreditBalance::Unlimited) => "unlimited",
+            None => "unknown",
+        }
+    ));
+    Ok(data)
 }
 
 fn codex_usage_from_response(response: CodexUsageResponse) -> Option<UsageData> {
     let mut data = UsageData::default();
     data.credits = parse_codex_credits(response.credits);
 
+    let ordinary_allowed = response.ordinary_usage_allowed.or_else(|| {
+        response
+            .rate_limit
+            .as_ref()
+            .and_then(|value| value.as_ref())
+            .and_then(|details| details.allowed)
+    });
+    let explicit_reserve_active = response
+        .rate_limit_upsell
+        .as_ref()
+        .and_then(|upsell| upsell.banner_type.as_deref())
+        .map(|banner| banner.eq_ignore_ascii_case("luna_reserve"));
+
+    if let Some(reserve) = response.additional_rate_limits.as_ref().and_then(|limits| {
+        limits.iter().find(|limit| {
+            limit
+                .limit_name
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case("gpt-reserve"))
+                || limit
+                    .metered_feature
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("gpt-reserve"))
+        })
+    }) {
+        if let Some(details) = reserve.rate_limit.as_ref().and_then(|value| value.as_ref()) {
+            let window = details
+                .primary_window
+                .as_ref()
+                .and_then(|value| value.as_ref())
+                .or_else(|| {
+                    details
+                        .secondary_window
+                        .as_ref()
+                        .and_then(|value| value.as_ref())
+                });
+            if let Some(window) = window {
+                let available =
+                    details.allowed != Some(false) && details.limit_reached != Some(true);
+                let active = explicit_reserve_active
+                    .map(|is_reserve| is_reserve && ordinary_allowed == Some(false) && available);
+                data.luna_reserve = Some(LunaReserveUsage {
+                    section: codex_section_from_window(window),
+                    available,
+                    active,
+                });
+            }
+        }
+    }
+
     let Some(details) = response.rate_limit.flatten().map(|details| *details) else {
-        return data.credits.is_some().then_some(data);
+        return (data.credits.is_some() || data.luna_reserve.is_some()).then_some(data);
     };
     let mut has_session = false;
     let mut has_weekly = false;
@@ -992,6 +1272,7 @@ fn codex_section_from_window(window: &CodexRateLimitWindow) -> UsageSection {
     UsageSection {
         percentage: window.used_percent,
         resets_at: unix_to_system_time(Some(window.reset_at)),
+        available: true,
     }
 }
 
@@ -1176,6 +1457,7 @@ fn antigravity_section_from_quota(quota: AntigravityQuotaInfo) -> Option<UsageSe
     Some(UsageSection {
         percentage: (1.0 - remaining) * 100.0,
         resets_at: parse_iso8601(quota.reset_time.as_deref()),
+        available: true,
     })
 }
 
@@ -1186,6 +1468,7 @@ fn antigravity_section_from_summary_bucket(
     Some(UsageSection {
         percentage: (1.0 - remaining) * 100.0,
         resets_at: parse_iso8601(bucket.reset_time.as_deref()),
+        available: true,
     })
 }
 
@@ -1276,17 +1559,6 @@ fn is_antigravity_display_model(model: &str) -> bool {
         || model.starts_with("imagen")
 }
 
-fn get_header_f64(response: &ureq::Response, name: &str) -> f64 {
-    response
-        .header(name)
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(0.0)
-}
-
-fn get_header_i64(response: &ureq::Response, name: &str) -> Option<i64> {
-    response.header(name).and_then(|s| s.parse::<i64>().ok())
-}
-
 fn unix_to_system_time(unix_secs: Option<i64>) -> Option<SystemTime> {
     let secs = unix_secs?;
     if secs < 0 {
@@ -1361,6 +1633,20 @@ fn codex_auth_path() -> Option<PathBuf> {
     Some(dirs::home_dir()?.join(".codex").join("auth.json"))
 }
 
+fn codex_credential_watch_signature() -> String {
+    let Some(path) = codex_auth_path() else {
+        return "codex-auth|path-unavailable".to_string();
+    };
+    match std::fs::read(path) {
+        Ok(content) => {
+            let mut hasher = DefaultHasher::new();
+            content.hash(&mut hasher);
+            format!("codex-auth|present|{}|{}", content.len(), hasher.finish())
+        }
+        Err(_) => "codex-auth|missing".to_string(),
+    }
+}
+
 fn read_codex_credentials() -> Option<CodexTokenData> {
     let auth_path = codex_auth_path()?;
     let content = match std::fs::read_to_string(&auth_path) {
@@ -1377,8 +1663,93 @@ fn read_codex_credentials() -> Option<CodexTokenData> {
         }
     };
 
-    let auth: CodexAuthFile = serde_json::from_str(&content).ok()?;
-    auth.tokens.filter(|tokens| !tokens.access_token.is_empty())
+    let auth: CodexAuthFile = match serde_json::from_str(&content) {
+        Ok(auth) => auth,
+        Err(_) => {
+            // Serde errors can quote unexpected values from the credential file.
+            diagnose::log("unable to parse Codex auth metadata; contents omitted");
+            return None;
+        }
+    };
+    let tokens = auth
+        .tokens
+        .filter(|tokens| !tokens.access_token.is_empty())?;
+    diagnose::log_verbose(
+        "Codex credential metadata loaded; access-token and account fields omitted",
+    );
+    if let Some(expiration) = jwt_expiration_unix(&tokens.access_token) {
+        diagnose_codex_token_expiry(expiration);
+    }
+    Some(tokens)
+}
+
+fn jwt_expiration_unix(token: &str) -> Option<u64> {
+    let payload = token.split('.').nth(1)?;
+    let decoded = decode_base64_url(payload)?;
+    serde_json::from_slice::<serde_json::Value>(&decoded)
+        .ok()?
+        .get("exp")?
+        .as_u64()
+}
+
+fn decode_base64_url(input: &str) -> Option<Vec<u8>> {
+    if input.len() % 4 == 1 {
+        return None;
+    }
+    let mut output = Vec::with_capacity(input.len() * 3 / 4);
+    let mut accumulator = 0u32;
+    let mut bits = 0u8;
+    for byte in input.bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            _ => return None,
+        } as u32;
+        accumulator = (accumulator << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            output.push((accumulator >> bits) as u8);
+            accumulator &= (1u32 << bits).saturating_sub(1);
+        }
+    }
+    Some(output)
+}
+
+fn diagnose_codex_token_expiry(expiration_unix: u64) {
+    static LAST_LOGGED_EXPIRATION: std::sync::OnceLock<std::sync::Mutex<Option<u64>>> =
+        std::sync::OnceLock::new();
+    let last_logged = LAST_LOGGED_EXPIRATION.get_or_init(|| std::sync::Mutex::new(None));
+    let Ok(mut last_logged) = last_logged.lock() else {
+        return;
+    };
+    if *last_logged == Some(expiration_unix) {
+        return;
+    }
+    *last_logged = Some(expiration_unix);
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    if expiration_unix >= now {
+        let remaining = expiration_unix - now;
+        diagnose::log(format!(
+            "Codex access token expires in {}h{:02}m",
+            remaining / 3600,
+            (remaining % 3600) / 60
+        ));
+    } else {
+        let elapsed = now - expiration_unix;
+        diagnose::log(format!(
+            "Codex access token expired {}h{:02}m ago",
+            elapsed / 3600,
+            (elapsed % 3600) / 60
+        ));
+    }
 }
 
 fn read_antigravity_credentials() -> Option<AntigravityTokenData> {
@@ -1676,6 +2047,47 @@ pub fn format_line(
     }
 }
 
+/// Format Codex using the reset timestamp, with a compact label for the
+/// initial five-hour session countdown.
+pub fn format_codex_line(
+    section: &UsageSection,
+    strings: Strings,
+    is_simplified_chinese: bool,
+    display_remaining: bool,
+    window: UsageWindowKind,
+) -> String {
+    // Simplified Chinese displays the localized wall-clock reset time rather
+    // than a duration, so keep its existing formatter unchanged.
+    if is_simplified_chinese {
+        return format_line(
+            section,
+            strings,
+            is_simplified_chinese,
+            display_remaining,
+            window,
+        );
+    }
+
+    let percentage = if display_remaining {
+        remaining_percentage(section.percentage)
+    } else {
+        section.percentage.clamp(0.0, 100.0)
+    };
+    let percentage = format!("{percentage:.0}%");
+    let countdown = section
+        .resets_at
+        .map(|reset| match reset.duration_since(SystemTime::now()) {
+            Ok(remaining) => format_codex_countdown_from_secs(remaining.as_secs(), strings, window),
+            Err(_) => strings.now.to_string(),
+        })
+        .unwrap_or_default();
+    if countdown.is_empty() {
+        percentage
+    } else {
+        format!("{percentage} {countdown}")
+    }
+}
+
 fn format_simplified_chinese_line(
     section: &UsageSection,
     display_remaining: bool,
@@ -1766,7 +2178,15 @@ fn format_countdown_from_secs(total_secs: u64, strings: Strings) -> String {
     let total_days = total_secs / 86400;
 
     if total_days >= 1 {
-        format!("{total_days}{}", strings.day_suffix)
+        let remaining_hours = (total_secs / 3600) % 24;
+        if remaining_hours == 0 {
+            format!("{total_days}{}", strings.day_suffix)
+        } else {
+            format!(
+                "{total_days}{}{}{}",
+                strings.day_suffix, remaining_hours, strings.hour_suffix
+            )
+        }
     } else if total_hours >= 1 {
         format!(
             "{total_hours}{}{:02}{}",
@@ -1781,15 +2201,28 @@ fn format_countdown_from_secs(total_secs: u64, strings: Strings) -> String {
     }
 }
 
+fn format_codex_countdown_from_secs(
+    total_secs: u64,
+    strings: Strings,
+    window: UsageWindowKind,
+) -> String {
+    let normal = format_countdown_from_secs(total_secs, strings);
+    let four_hours_fifty_nine = format_countdown_from_secs(4 * 3600 + 59 * 60, strings);
+    if window == UsageWindowKind::Session && normal == four_hours_fifty_nine {
+        format!("5{}", strings.hour_suffix)
+    } else {
+        normal
+    }
+}
+
 fn time_until_display_change_from_secs(total_secs: u64) -> Duration {
     let total_mins = total_secs / 60;
-    let total_hours = total_secs / 3600;
     let total_days = total_secs / 86400;
 
     let current_bucket_start = if total_days >= 1 {
-        total_days * 86400
-    } else if total_hours >= 1 {
-        total_hours * 3600
+        // Day displays now include whole hours, so the next visible change is
+        // the next hour boundary rather than the next day boundary.
+        total_secs - (total_secs % 3600)
     } else if total_mins >= 1 {
         total_mins * 60
     } else {
@@ -1817,6 +2250,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reserve_is_optional_on_every_successful_response() {
+        for present in [false, true, false, true] {
+            let mut response = serde_json::json!({
+                "rate_limit": {"primary_window": {"used_percent": 10, "reset_at": 2000000000, "limit_window_seconds": 18000}},
+                "credits": {"balance": 333.704065}
+            });
+            if present {
+                response["additional_rate_limits"] = serde_json::json!([{
+                    "limit_name": "gpt-reserve",
+                    "rate_limit": {"allowed": true, "primary_window": {"used_percent": 25, "reset_at": 2000000000}}
+                }]);
+            }
+            let data =
+                codex_usage_from_response(serde_json::from_value(response).unwrap()).unwrap();
+            assert_eq!(data.luna_reserve.is_some(), present);
+            assert_eq!(data.credits, Some(CreditBalance::Amount(333.704065)));
+            assert_eq!(data.session.percentage, 10.0);
+            if let Some(reserve) = data.luna_reserve {
+                assert_eq!(reserve.active, None);
+                assert_eq!(reserve.section.percentage, 25.0);
+            }
+        }
+    }
+
+    #[test]
     fn claude_credentials_path_honors_custom_config_directory() {
         assert_eq!(
             windows_credentials_path_from(
@@ -1831,11 +2289,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn claude_cli_resolution_includes_the_user_local_install_directory() {
+        let candidates = claude_user_install_candidates(std::path::Path::new(r"C:\Users\Test"));
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from(r"C:\Users\Test\.local\bin\claude.cmd"),
+                PathBuf::from(r"C:\Users\Test\.local\bin\claude.exe"),
+                PathBuf::from(r"C:\Users\Test\.local\bin\claude"),
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_model_refresh_is_deferred_for_initial_passive_recovery_polls() {
+        assert!(claude_passive_recovery_should_defer(1));
+        assert!(claude_passive_recovery_should_defer(2));
+        assert!(!claude_passive_recovery_should_defer(3));
+    }
+
     fn usage_with_session_percent(percentage: f64) -> UsageData {
         UsageData {
             session: UsageSection {
                 percentage,
                 resets_at: None,
+                available: true,
             },
             weekly: UsageSection::default(),
             ..UsageData::default()
@@ -1963,6 +2442,58 @@ mod tests {
     }
 
     #[test]
+    fn codex_gpt_reserve_is_parsed_without_claiming_activation_unless_explicit() {
+        let response: CodexUsageResponse = serde_json::from_str(
+            r#"{
+                "rate_limit": {
+                    "allowed": false,
+                    "primary_window": {"used_percent": 100, "limit_window_seconds": 300, "reset_at": 2000000100}
+                },
+                "rate_limit_upsell": {"banner_type": "luna_reserve"},
+                "additional_rate_limits": [{
+                    "limit_name": "gpt-reserve",
+                    "metered_feature": "base_model_inference",
+                    "rate_limit": {
+                        "allowed": true,
+                        "limit_reached": false,
+                        "primary_window": {"used_percent": 25, "limit_window_seconds": 604800, "reset_at": 2000000200}
+                    }
+                }]
+            }"#,
+        )
+        .unwrap();
+        let usage = codex_usage_from_response(response).unwrap();
+        let reserve = usage
+            .luna_reserve
+            .expect("reserve bucket should be retained");
+        assert!(reserve.available);
+        assert_eq!(reserve.section.percentage, 25.0);
+        assert_eq!(reserve.active, Some(true));
+    }
+
+    #[test]
+    fn codex_reserve_without_activation_evidence_remains_unknown_active_state() {
+        let response: CodexUsageResponse = serde_json::from_str(
+            r#"{
+                "rate_limit": {"allowed": true, "primary_window": {"used_percent": 1, "limit_window_seconds": 300, "reset_at": 2000000100}},
+                "additional_rate_limits": [{
+                    "limit_name": "gpt-reserve",
+                    "rate_limit": {"allowed": true, "primary_window": {"used_percent": 0, "limit_window_seconds": 604800, "reset_at": 2000000200}}
+                }]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            codex_usage_from_response(response)
+                .unwrap()
+                .luna_reserve
+                .unwrap()
+                .active,
+            None
+        );
+    }
+
+    #[test]
     fn classifies_http_failures_for_user_visible_recovery() {
         assert_eq!(classify_http_status(401), PollError::AuthRequired);
         assert_eq!(classify_http_status(403), PollError::AuthRequired);
@@ -1984,6 +2515,7 @@ mod tests {
         let section = UsageSection {
             percentage: 30.0,
             resets_at: None,
+            available: true,
         };
         assert_eq!(
             format_line(&section, strings, true, true, UsageWindowKind::Session),
@@ -2014,6 +2546,7 @@ mod tests {
         let section = UsageSection {
             percentage: 18.0,
             resets_at: None,
+            available: true,
         };
         let strings = crate::localization::LanguageId::English.strings();
 
@@ -2036,6 +2569,162 @@ mod tests {
         );
         assert_eq!(format_countdown_from_secs(3600 + 3 * 60, strings), "1h03m");
         assert_eq!(format_countdown_from_secs(47 * 60, strings), "47m");
+        assert_eq!(
+            format_countdown_from_secs(86400 + 23 * 3600, strings),
+            "1d23h"
+        );
+        assert_eq!(format_countdown_from_secs(2 * 86400, strings), "2d");
+    }
+
+    #[test]
+    fn hour_minute_countdown_schedules_local_minute_ticks() {
+        assert_eq!(
+            time_until_display_change_from_secs(4 * 3600 + 59 * 60 + 30),
+            Duration::from_secs(31)
+        );
+        assert_eq!(
+            time_until_display_change_from_secs(47 * 60 + 20),
+            Duration::from_secs(21)
+        );
+        assert_eq!(
+            time_until_display_change_from_secs(59),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            time_until_display_change_from_secs(2 * 86400),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            time_until_display_change_from_secs(2 * 86400 + 4 * 3600 + 12),
+            Duration::from_secs(13)
+        );
+    }
+
+    #[test]
+    fn codex_session_uses_reset_time_in_both_display_modes() {
+        let section = UsageSection {
+            percentage: 0.0,
+            resets_at: Some(SystemTime::now() + Duration::from_secs(3 * 3600)),
+            available: true,
+        };
+        let strings = crate::localization::LanguageId::English.strings();
+        assert_eq!(
+            format_codex_line(&section, strings, false, true, UsageWindowKind::Session),
+            "100% 2h59m"
+        );
+        assert_eq!(
+            format_codex_line(&section, strings, false, false, UsageWindowKind::Session),
+            "0% 2h59m"
+        );
+    }
+
+    #[test]
+    fn codex_session_compacts_4h59m_but_not_4h58m() {
+        let strings = crate::localization::LanguageId::English.strings();
+        assert_eq!(
+            format_codex_countdown_from_secs(4 * 3600 + 59 * 60, strings, UsageWindowKind::Session),
+            "5h"
+        );
+        assert_eq!(
+            format_codex_countdown_from_secs(4 * 3600 + 58 * 60, strings, UsageWindowKind::Session),
+            "4h58m"
+        );
+    }
+
+    #[test]
+    fn zero_usage_with_active_reset_is_not_pinned_to_five_hours() {
+        let section = UsageSection {
+            percentage: 0.0,
+            resets_at: Some(SystemTime::now() + Duration::from_secs(3 * 3600)),
+            available: true,
+        };
+        let line = format_codex_line(
+            &section,
+            crate::localization::LanguageId::English.strings(),
+            false,
+            true,
+            UsageWindowKind::Session,
+        );
+        assert!(line.ends_with("2h59m"));
+        assert!(!line.ends_with("5h"));
+    }
+
+    #[test]
+    fn weekly_countdown_keeps_normal_4h59m_formatting() {
+        assert_eq!(
+            format_codex_countdown_from_secs(
+                4 * 3600 + 59 * 60,
+                crate::localization::LanguageId::English.strings(),
+                UsageWindowKind::Weekly,
+            ),
+            "4h59m"
+        );
+    }
+
+    #[test]
+    fn simplified_chinese_codex_reset_display_remains_localized() {
+        let section = UsageSection {
+            percentage: 0.0,
+            resets_at: Some(SystemTime::now() + Duration::from_secs(3 * 3600)),
+            available: true,
+        };
+        let line = format_codex_line(
+            &section,
+            crate::localization::LanguageId::SimplifiedChinese.strings(),
+            true,
+            true,
+            UsageWindowKind::Session,
+        );
+        assert!(line.starts_with("剩余100% "));
+        assert!(line.contains("重置"));
+        assert!(!line.contains("5小时"));
+    }
+
+    #[test]
+    fn session_countdown_uses_reset_time_even_when_rounded_remaining_is_hundred() {
+        let section = UsageSection {
+            percentage: 0.4,
+            resets_at: Some(SystemTime::now() + Duration::from_secs(3 * 3600)),
+            available: true,
+        };
+        let text = format_codex_line(
+            &section,
+            crate::localization::LanguageId::English.strings(),
+            false,
+            true,
+            UsageWindowKind::Session,
+        );
+        assert!(text.starts_with("100% "));
+        assert!(text.ends_with("2h59m"));
+    }
+
+    #[test]
+    fn jwt_expiration_diagnostic_parser_never_needs_to_expose_token_contents() {
+        assert_eq!(
+            jwt_expiration_unix("header.eyJleHAiOjE3MDAwMDAwMDB9.signature"),
+            Some(1_700_000_000)
+        );
+        assert_eq!(jwt_expiration_unix("not-a-jwt"), None);
+        assert_eq!(jwt_expiration_unix("a.!!!!.b"), None);
+    }
+
+    #[test]
+    fn model_free_refresh_uses_official_app_server_account_read() {
+        let initialize = app_server_initialize_request();
+        assert_eq!(initialize["method"], "initialize");
+        assert_eq!(
+            initialize["params"]["clientInfo"]["name"],
+            "codex_usage_monitor"
+        );
+        assert_eq!(
+            app_server_initialized_notification()["method"],
+            "initialized"
+        );
+
+        let refresh = app_server_account_refresh_request();
+        assert_eq!(refresh["method"], "account/read");
+        assert_eq!(refresh["params"]["refreshToken"], true);
+        assert_eq!(refresh["id"], 2);
     }
 
     #[test]
@@ -2047,11 +2736,11 @@ mod tests {
             || Err(PollError::AuthRequired),
             || Ok(usage_with_session_percent(42.0)),
             || unreachable!("antigravity is disabled"),
-        )
-        .expect("codex data should keep the poll successful");
+        );
 
-        assert!(data.claude_code.is_none());
-        assert_eq!(data.codex.unwrap().session.percentage, 42.0);
+        assert!(data.has_success);
+        assert!(data.data.claude_code.is_none());
+        assert_eq!(data.data.codex.unwrap().session.percentage, 42.0);
     }
 
     #[test]
@@ -2063,26 +2752,28 @@ mod tests {
             || Ok(usage_with_session_percent(64.0)),
             || Err(PollError::RequestFailed),
             || unreachable!("antigravity is disabled"),
-        )
-        .expect("claude data should keep the poll successful");
+        );
 
-        assert_eq!(data.claude_code.unwrap().session.percentage, 64.0);
-        assert!(data.codex.is_none());
+        assert!(data.has_success);
+        assert_eq!(data.data.claude_code.unwrap().session.percentage, 64.0);
+        assert!(data.data.codex.is_none());
+        assert_eq!(data.codex_error, Some(PollError::RequestFailed));
     }
 
     #[test]
     fn returns_first_error_when_no_enabled_provider_succeeds() {
-        let error = poll_with(
+        let outcome = poll_with(
             true,
             true,
             true,
             || Err(PollError::AuthRequired),
             || Err(PollError::RequestFailed),
             || Err(PollError::NoCredentials),
-        )
-        .expect_err("all-provider failure should return an error");
+        );
 
-        assert_eq!(error, PollError::AuthRequired);
+        assert!(!outcome.has_success);
+        assert_eq!(outcome.first_error, Some(PollError::AuthRequired));
+        assert_eq!(outcome.codex_error, Some(PollError::RequestFailed));
     }
 
     #[test]
@@ -2094,11 +2785,11 @@ mod tests {
             || unreachable!("claude code is disabled"),
             || Ok(usage_with_session_percent(42.0)),
             || Err(PollError::NoCredentials),
-        )
-        .expect("codex data should keep the poll successful");
+        );
 
-        assert!(data.antigravity.is_none());
-        assert_eq!(data.codex.unwrap().session.percentage, 42.0);
+        assert!(data.has_success);
+        assert!(data.data.antigravity.is_none());
+        assert_eq!(data.data.codex.unwrap().session.percentage, 42.0);
     }
 
     #[test]

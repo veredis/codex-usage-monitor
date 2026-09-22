@@ -1,7 +1,5 @@
 use super::Strings;
 
-pub(super) const UPDATE_VIA_WINGET_LABEL: &str = "Update via WinGet";
-
 pub(super) const STRINGS: Strings = Strings {
     window_title: "Codex Usage",
     refresh: "Refresh",
@@ -10,6 +8,7 @@ pub(super) const STRINGS: Strings = Strings {
     five_minutes: "5 Minutes",
     fifteen_minutes: "15 Minutes",
     one_hour: "1 Hour",
+    adaptive: "Adaptive",
     models: "Monitored services",
     claude_code_model: "Claude Code",
     codex_model: "Codex",
@@ -17,9 +16,12 @@ pub(super) const STRINGS: Strings = Strings {
     settings: "Settings",
     start_with_windows: "Start with Windows",
     reset_position: "Reset Position",
+    show_drag_handle: "Show drag handle",
+    enable_codex_mcp: "Enable MCP integration",
     language: "Language",
     system_default: "System Default",
     check_for_updates: "Check for Updates",
+    open_log_file: "Open log file",
     checking_for_updates: "Checking for Updates...",
     updates: "Updates",
     update_in_progress: "An update check is already in progress.",
@@ -33,12 +35,13 @@ pub(super) const STRINGS: Strings = Strings {
     exit: "Exit",
     show_widget: "Show Widget",
     credits: "Credits",
-    credit_display: "Credit display",
+    credit_display: "Credits / Luna Reserve",
     credit_always: "Always",
     credit_when_needed: "When needed",
     credit_off: "Off",
     credit_left: "Left",
     credit_right: "Right",
+    credit_usd_estimate: "USD",
     session_window: "5h",
     weekly_window: "7d",
     now: "now",
@@ -46,7 +49,7 @@ pub(super) const STRINGS: Strings = Strings {
     hour_suffix: "h",
     minute_suffix: "m",
     token_expired_title: "Claude Code Auth Error",
-    token_expired_body: "Run 'claude' in a terminal, then use '/login' and follow the prompts. After that, refresh or restart this app.",
+    token_expired_body: "Claude Code CLI authentication is required; signing in to the Claude desktop app is not enough. Run 'claude' in a terminal, then use '/login' and follow the prompts. After that, refresh or restart this app.",
     codex_token_expired_title: "Codex Auth Error",
     codex_token_expired_body: "Run 'codex' in a terminal and follow the sign-in prompts. After that, refresh or restart this app.",
     antigravity_token_expired_title: "Antigravity Auth Error",
