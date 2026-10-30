@@ -32,6 +32,21 @@ struct PollingMetadata {
     effective_interval_seconds: u32,
 }
 
+impl PollingMetadata {
+    /// Claude's actual cadence: the shared cadence raised to the Claude
+    /// request spacing, so freshness is judged against Claude's own interval.
+    fn for_claude(&self) -> Self {
+        let interval_ms = self.effective_interval_seconds.saturating_mul(1000);
+        Self {
+            mode: self.mode,
+            effective_interval_seconds: crate::provider_schedule::provider_interval_ms(
+                crate::provider_schedule::CLAUDE,
+                interval_ms,
+            ) / 1000,
+        }
+    }
+}
+
 impl Default for PollingMetadata {
     fn default() -> Self {
         Self {
@@ -496,6 +511,11 @@ fn handle_rpc_at(request: &Value, now: SystemTime) -> Option<Value> {
                     )
                 })
                 .unwrap_or((None, PollingMetadata::default(), None));
+            let polling = if tool_name == Some("get_claude_usage") {
+                polling.for_claude()
+            } else {
+                polling
+            };
             let data = snapshot_with_health(snapshot.as_ref(), &polling, now, error);
             let text = serde_json::to_string(&data).unwrap_or_else(|_| "{}".to_string());
             json!({
@@ -650,6 +670,28 @@ fn lowest_remaining(data: &UsageData) -> (Option<f64>, Option<&'static str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_freshness_uses_claude_request_spacing_not_the_codex_cadence() {
+        let now = UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        let polling = PollingMetadata {
+            mode: "fixed",
+            effective_interval_seconds: 30,
+        };
+        let claude = cached(test_data(20.0, 40.0), Duration::from_secs(150));
+        let codex = cached(test_data(12.0, 34.0), Duration::from_secs(150));
+        let claude = snapshot_with_health(Some(&claude), &polling.for_claude(), now, None);
+        let codex = snapshot_with_health(Some(&codex), &polling, now, None);
+        assert_eq!(claude["effective_poll_interval_seconds"], 120);
+        assert_eq!(claude["status"], "ok");
+        assert_eq!(codex["effective_poll_interval_seconds"], 30);
+        assert_eq!(codex["status"], "stale");
+        let slow = PollingMetadata {
+            mode: "fixed",
+            effective_interval_seconds: 900,
+        };
+        assert_eq!(slow.for_claude().effective_interval_seconds, 900);
+    }
 
     #[test]
     fn auth_failure_is_stale_without_changing_success_time_and_other_provider_is_fresh() {

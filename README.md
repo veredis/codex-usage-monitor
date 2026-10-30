@@ -42,7 +42,7 @@ The release is portable: download `codex-usage.exe` and run it directly. No inst
 Important defaults and settings:
 
 - **Usage display:** Remaining. Used shows the portion already consumed.
-- **Update frequency:** Fixed choices are 30 seconds, 1 minute, 5 minutes, 15 minutes, and 1 hour. Adaptive uses 5 minutes above 30% remaining, 1 minute from above 10% through 30%, and 30 seconds at 10% or below. Countdown movement is local and does not create extra provider requests.
+- **Update frequency:** Fixed choices are 30 seconds, 1 minute, 5 minutes, 15 minutes, and 1 hour. Adaptive uses 5 minutes above 30% remaining, 1 minute from above 10% through 30%, and 30 seconds at 10% or below. Claude usage requests are spaced at least 2 minutes apart at every setting (a current design decision, see below). Countdown movement is local and does not create extra provider requests.
 - **Quota alerts:** Off by default. Select any combination of 2%, 5%, 10%, 20%, and 30% remaining. Each selected threshold alerts once per genuine quota window; an enabled window can also send one separate alert at 0% remaining.
 - **Credits / Luna Reserve:** Credits visibility is **Always** by default, with **Always**, **When needed**, and **Off** options. **When needed** shows the auxiliary area when an included Codex quota reaches 0%. The area can be placed **Left** or **Right**, independently of visibility. Choose **Credits** or **USD** value format. Finite Credits use the precise underlying balance for USD estimates and display whole Credits rounded to the nearest whole credit; known zero, unlimited, and unknown data remain distinct. Luna Reserve is shown only when supported data indicates it is the appropriate fallback. It is optional and may be absent for an account.
 - **Taskbar placement:** **Show drag handle** is off by default. Reset Position computes a safe default without forgetting a manually saved position.
@@ -50,7 +50,11 @@ Important defaults and settings:
 
 ## Polling and cached data
 
-Provider polling feeds one normalized monitor cache. The taskbar UI and MCP server read that cache; MCP requests do not trigger another usage request. During transient failures, the last successful percentages remain visible while reset countdowns continue from their known timestamps and freshness is reported honestly.
+Each provider is polled on its own schedule and its own worker, so one provider's slow response, rate limit or outage never delays another provider or marks it stale. Failures back off per provider, never faster than the selected frequency, and a server `Retry-After` deadline is honored even by **Refresh**.
+
+Claude's usage endpoint is shared with every Claude Code session's status line and rate-limits aggressively, so the monitor currently spaces Claude requests at least 120 seconds apart, even at the 30-second or Adaptive settings. **Refresh** may bypass this spacing but not a server deadline. This is the Build 6 design decision and may be revised.
+
+Provider results feed one normalized monitor cache. The taskbar UI and MCP server read that cache; MCP requests do not trigger another usage request. During transient failures, the last successful percentages remain visible with a leading `!` while reset countdowns continue from their known timestamps and freshness is reported honestly. A value is marked stale only when its own provider failed or has not succeeded within twice its own interval.
 
 ## Local MCP integration
 
@@ -83,11 +87,11 @@ For an agent using the tools, query usage at meaningful milestones rather than c
 
 Claude monitoring uses the Claude Code CLI's credentials and usage interface where available. Claude Code CLI authentication is required; being signed in to the Claude desktop app alone does not necessarily provide the credentials used by this monitor.
 
-Healthy monitoring is intended to be passive. If credentials expire, the monitor first attempts passive recovery. A heavily guarded emergency `claude -p .` refresh may still be used only after passive recovery fails, and is not part of ordinary polling.
+Monitoring is passive. If Claude credentials expire or are rejected, the monitor keeps the last values marked stale and waits for the Claude Code CLI to refresh its own credentials (for example the next time you use the CLI); it never runs a model request to force a refresh.
 
 ## Codex authentication
 
-Normal Codex usage polling is passive and reads quota data from the Codex usage endpoint. Authentication recovery prefers credential watching and the official model-free Codex app-server account refresh. A guarded `codex exec .` fallback is retained only as a last resort after passive recovery fails; it is rate-limited and limited to one attempt per recovery episode.
+Normal Codex usage polling is passive and reads quota data from the Codex usage endpoint. Authentication recovery uses credential watching and the official model-free Codex app-server account refresh. Automatic model-consuming recovery (`codex exec`) is disabled.
 
 ## Logging
 

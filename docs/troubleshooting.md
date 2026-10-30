@@ -8,28 +8,38 @@ Codex Usage keeps authentication failures separate from transient service failur
 |---|---|---|---|
 | `!` | `!` | Enabled service credentials are missing or expired | Sign in with the relevant CLI/app, then refresh Codex Usage. Claude Desktop login does not count as Claude Code CLI login. |
 | `网络` | `NET` | Network or TLS connection failed | Check connectivity, VPN, proxy, and firewall settings |
-| `限流` | `429` | Provider rate limit | Wait for the provider retry window; Codex Usage retries with backoff |
+| `限流` | `429` | Provider rate limit | Wait for the provider retry window; Codex Usage retries that provider with backoff and honors `Retry-After` |
 | `服务` | `5XX` | Provider service failure | Wait and retry; check provider status if it persists |
 | `错误` | `ERR` | Invalid or unsupported response | Enable diagnostics and inspect the log |
 
-Authentication failures pause provider polling until the credential source changes, preventing repeated login notifications. Transient failures use exponential backoff up to the configured refresh interval.
+A leading `!` before a percentage (for example `!88% 1h04m`) means that provider's last value is stale: its latest request failed, or it has not succeeded within twice its own polling interval. Other providers are unaffected; each provider has its own schedule and backoff.
+
+Rejected Claude credentials are not resent until the credential file changes, preventing repeated login notifications. Transient failures back off per provider (never faster than the selected frequency, up to 30 minutes) and honor any server `Retry-After` deadline, including on **Refresh**.
+
+### Claude shows `!` or `429` frequently
+
+Claude's usage endpoint is shared with every running Claude Code session's status line and rate-limits aggressively. In Build 6 the monitor spaces Claude requests at least 120 seconds apart regardless of the selected frequency; this is a current design decision and may be revised. Many concurrent Claude Code sessions can still exhaust the shared limit; the monitor then backs off Claude alone while Codex keeps updating.
 
 ## Diagnostic log
 
-Run:
+Operational logging is always on and is written to:
 
-```powershell
-codex-usage.exe --diagnose
+```text
+%LOCALAPPDATA%\CodexUsage\logs\codex-usage.log
 ```
 
-The log is written to `%TEMP%\codex-usage.log`. It includes:
+`codex-usage.exe --diagnose` adds extra-verbose records. The log includes:
 
-- application version and executable path
-- direct or WinGet install channel
-- provider failure category and retry delay
+- application version, build and executable path, and the process ID on every record
+- each provider request with elapsed time, failure category, HTTP status and `Retry-After`
+- each provider's schedule (time until ready, retry count, server wait)
 - window creation, taskbar placement, and relaunch events
 
 The log does not include access tokens, refresh tokens, credential file contents, or API response bodies.
+
+### The log seems not to update
+
+Tools that run inside an MSIX-packaged app (for example the Codex desktop app or an agent running in it) may see a private, virtualized copy at `%LOCALAPPDATA%\Packages\<package>\LocalCache\Local\CodexUsage\logs\` instead of the real file. That copy stops at whatever an earlier packaged launch wrote. Open the log with **Open log file** from the monitor's menu, or read it from a normal (unpackaged) PowerShell or Explorer window. Launch the monitor from Explorer, not from inside a packaged app, so its own writes are not redirected.
 
 ## Update failures
 

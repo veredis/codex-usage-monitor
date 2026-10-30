@@ -57,32 +57,30 @@ impl PollError {
     }
 }
 
-pub fn is_transient_error(error: PollError) -> bool {
-    matches!(
-        error,
-        PollError::NetworkUnavailable | PollError::RateLimited | PollError::ServerError
-    )
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CredentialWatchMode {
-    ActiveSource,
-    AllSources,
     Codex,
-    Antigravity,
 }
 
 pub type CredentialWatchSnapshot = Vec<String>;
 
-#[derive(Default)]
-pub struct PollOutcome {
-    pub data: AppUsageData,
-    pub claude_error: Option<PollError>,
-    pub codex_error: Option<PollError>,
-    pub antigravity_error: Option<PollError>,
-    pub first_error: Option<PollError>,
-    pub has_success: bool,
-    pub scopes: [Option<String>; 3],
+/// Result of one provider request, produced on that provider's own worker.
+#[derive(Debug, Default)]
+pub struct ProviderPoll {
+    pub data: Option<UsageData>,
+    pub error: Option<PollError>,
+    /// Server Retry-After deadline from a 429 response, in milliseconds.
+    pub retry_after_ms: Option<u32>,
+    /// Credential scope after the request; `None` when credentials are missing.
+    pub scope: Option<String>,
+}
+
+pub fn provider_name(id: usize) -> &'static str {
+    match id {
+        0 => "claude",
+        1 => "codex",
+        _ => "antigravity",
+    }
 }
 
 #[derive(Deserialize)]
@@ -252,55 +250,85 @@ extern "system" {
     fn CredFree(buffer: *mut c_void);
 }
 
-pub fn poll(show_claude_code: bool, show_codex: bool, show_antigravity: bool) -> PollOutcome {
+/// Request one provider. Runs on that provider's own worker thread so a slow
+/// or failing provider never blocks the others.
+pub fn poll_provider(id: usize) -> ProviderPoll {
     let started = std::time::Instant::now();
     diagnose::log(format!(
-        "usage poll started providers=claude:{show_claude_code},codex:{show_codex},antigravity:{show_antigravity}"
+        "provider request started provider={}",
+        provider_name(id)
     ));
-    let enabled = [show_claude_code, show_codex, show_antigravity];
-    let before = std::array::from_fn(|id| enabled[id].then(|| cache_scope(id)).flatten());
-    let mut outcome = poll_with(
-        show_claude_code,
-        show_codex,
-        show_antigravity,
-        poll_claude_code,
-        poll_codex,
-        poll_antigravity,
-    );
-    outcome.scopes = before;
-    let after: [Option<String>; 3] =
-        std::array::from_fn(|id| enabled[id].then(|| cache_scope(id)).flatten());
+    let before = cache_scope(id);
+    RETRY_AFTER_HINT.with(|cell| cell.set(None));
+    let result = match id {
+        0 => poll_claude_code(),
+        1 => poll_codex(),
+        _ => poll_antigravity(),
+    };
+    let retry_after_ms = RETRY_AFTER_HINT.with(|cell| cell.take());
+    let after = cache_scope(id);
+    let poll = finish_provider_poll(id, result, before, after, retry_after_ms);
+    diagnose::log(format!(
+        "provider request completed provider={} elapsed_ms={} error={:?} retry_after_ms={:?}",
+        provider_name(id),
+        started.elapsed().as_millis(),
+        poll.error,
+        poll.retry_after_ms
+    ));
+    poll
+}
+
+fn finish_provider_poll(
+    id: usize,
+    result: Result<UsageData, PollError>,
+    before: Option<String>,
+    after: Option<String>,
+    retry_after_ms: Option<u32>,
+) -> ProviderPoll {
     // Never publish a response from credentials that changed during the request.
-    for id in 0..3 {
-        if outcome.scopes[id] != after[id] {
-            match id {
-                0 => {
-                    outcome.data.claude_code = None;
-                    outcome.claude_error = Some(PollError::AuthRequired);
-                }
-                1 => {
-                    outcome.data.codex = None;
-                    outcome.codex_error = Some(PollError::AuthRequired);
-                }
-                _ => {
-                    outcome.data.antigravity = None;
-                    outcome.antigravity_error = Some(PollError::AuthRequired);
-                }
-            }
-            outcome.scopes[id] = after[id].clone();
+    let result = if before != after {
+        Err(PollError::AuthRequired)
+    } else {
+        result
+    };
+    let (data, error) = match result {
+        Ok(data) => (Some(data), None),
+        Err(error) => {
+            diagnose::log(format!(
+                "{} usage poll failed category={}",
+                match id {
+                    0 => "Claude Code",
+                    1 => "Codex",
+                    _ => "Antigravity",
+                },
+                error.category()
+            ));
+            (None, Some(error))
         }
+    };
+    if let Some(usage) = data.as_ref() {
+        log_provider_success(id, usage);
     }
-    outcome.has_success = outcome.data.claude_code.is_some()
-        || outcome.data.codex.is_some()
-        || outcome.data.antigravity.is_some();
-    diagnose::log(format!("provider round completed elapsed_ms={} claude_error={:?} codex_error={:?} antigravity_error={:?}", started.elapsed().as_millis(), outcome.claude_error, outcome.codex_error, outcome.antigravity_error));
-    if let Some(data) = &outcome.data.claude_code {
-        diagnose::log(format!(
+    ProviderPoll {
+        data,
+        error,
+        retry_after_ms: retry_after_ms.filter(|_| error == Some(PollError::RateLimited)),
+        scope: after,
+    }
+}
+
+fn log_provider_success(id: usize, usage: &UsageData) {
+    match id {
+        0 => diagnose::log(format!(
             "Claude usage poll succeeded session_used={:.2}% weekly_used={:.2}%",
-            data.session.percentage, data.weekly.percentage
-        ));
+            usage.session.percentage, usage.weekly.percentage
+        )),
+        1 => log_codex_success(usage),
+        _ => diagnose::log(format!(
+            "Antigravity usage poll succeeded session_used={:.2}% weekly_used={:.2}%",
+            usage.session.percentage, usage.weekly.percentage
+        )),
     }
-    outcome
 }
 
 // Conservative token-bound cache identity, adapted from upstream PR #30.
@@ -337,116 +365,35 @@ pub fn claude_code_credentials_available() -> bool {
     read_first_credentials().is_some()
 }
 
-fn poll_with(
-    show_claude_code: bool,
-    show_codex: bool,
-    show_antigravity: bool,
-    mut poll_claude_code: impl FnMut() -> Result<UsageData, PollError>,
-    mut poll_codex: impl FnMut() -> Result<UsageData, PollError>,
-    mut poll_antigravity: impl FnMut() -> Result<UsageData, PollError>,
-) -> PollOutcome {
-    let mut data = AppUsageData::default();
-    let mut first_error = None;
-    let mut claude_error = None;
-    let mut codex_error = None;
-    let mut antigravity_error = None;
-
-    if show_claude_code {
-        match poll_claude_code() {
-            Ok(claude_code) => data.claude_code = Some(claude_code),
-            Err(error) => {
-                claude_error = Some(error);
-                diagnose::log(format!(
-                    "Claude Code usage poll failed category={}",
-                    error.category()
-                ));
-                first_error.get_or_insert(error);
-            }
-        }
-    }
-
-    if show_codex {
-        match poll_codex() {
-            Ok(codex) => data.codex = Some(codex),
-            Err(error) => {
-                codex_error = Some(error);
-                diagnose::log(format!(
-                    "Codex usage poll failed category={}",
-                    error.category()
-                ));
-                first_error.get_or_insert(error);
-            }
-        }
-    }
-
-    if show_antigravity {
-        match poll_antigravity() {
-            Ok(antigravity) => data.antigravity = Some(antigravity),
-            Err(error) => {
-                antigravity_error = Some(error);
-                diagnose::log(format!(
-                    "Antigravity usage poll failed category={}",
-                    error.category()
-                ));
-                first_error.get_or_insert(error);
-            }
-        }
-    }
-
-    let has_success =
-        data.claude_code.is_some() || data.codex.is_some() || data.antigravity.is_some();
-    if let Some(codex) = data.codex.as_ref() {
-        let reset = |value: Option<SystemTime>| {
-            value
-                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                .map(|duration| duration.as_secs())
-        };
-        let credits_state = match codex.credits.as_ref() {
-            Some(CreditBalance::Amount(_)) => "amount",
-            Some(CreditBalance::Unlimited) => "unlimited",
-            None => "unknown",
-        };
-        diagnose::log(format!(
-            "Codex usage poll succeeded session_used={:.2}% session_remaining={:.2}% session_reset_unix={:?} weekly_used={:.2}% weekly_remaining={:.2}% weekly_reset_unix={:?} credits={credits_state}",
-            codex.session.percentage,
-            remaining_percentage(codex.session.percentage),
-            reset(codex.session.resets_at),
-            codex.weekly.percentage,
-            remaining_percentage(codex.weekly.percentage),
-            reset(codex.weekly.resets_at),
-        ));
-        if let Some(reserve) = codex.luna_reserve.as_ref() {
-            let reset = reserve
-                .section
-                .resets_at
-                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                .map(|duration| duration.as_secs());
-            diagnose::log(format!(
-                "Codex Luna Reserve available={} active={:?} used={:.2}% remaining={:.2}% reset_unix={reset:?}",
-                reserve.available,
-                reserve.active,
-                reserve.section.percentage,
-                remaining_percentage(reserve.section.percentage),
-            ));
-        }
-    }
+fn log_codex_success(codex: &UsageData) {
+    let reset = |value: Option<SystemTime>| {
+        value
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs())
+    };
+    let credits_state = match codex.credits.as_ref() {
+        Some(CreditBalance::Amount(_)) => "amount",
+        Some(CreditBalance::Unlimited) => "unlimited",
+        None => "unknown",
+    };
     diagnose::log(format!(
-        "usage poll completed status={} codex_error={:?}",
-        if has_success {
-            "partial_or_ok"
-        } else {
-            "failed"
-        },
-        codex_error
+        "Codex usage poll succeeded session_used={:.2}% session_remaining={:.2}% session_reset_unix={:?} weekly_used={:.2}% weekly_remaining={:.2}% weekly_reset_unix={:?} credits={credits_state}",
+        codex.session.percentage,
+        remaining_percentage(codex.session.percentage),
+        reset(codex.session.resets_at),
+        codex.weekly.percentage,
+        remaining_percentage(codex.weekly.percentage),
+        reset(codex.weekly.resets_at),
     ));
-    PollOutcome {
-        data,
-        claude_error,
-        codex_error,
-        antigravity_error,
-        first_error,
-        has_success,
-        scopes: Default::default(),
+    if let Some(reserve) = codex.luna_reserve.as_ref() {
+        diagnose::log(format!(
+            "Codex Luna Reserve available={} active={:?} used={:.2}% remaining={:.2}% reset_unix={:?}",
+            reserve.available,
+            reserve.active,
+            reserve.section.percentage,
+            remaining_percentage(reserve.section.percentage),
+            reset(reserve.section.resets_at),
+        ));
     }
 }
 
@@ -825,53 +772,40 @@ fn classify_http_status(status: u16) -> PollError {
 
 fn classify_ureq_error(error: &ureq::Error) -> PollError {
     match error {
-        ureq::Error::Status(status, _) => classify_http_status(*status),
+        ureq::Error::Status(status, response) => {
+            if *status == 429 {
+                record_retry_after(response);
+            }
+            classify_http_status(*status)
+        }
         ureq::Error::Transport(_) => PollError::NetworkUnavailable,
     }
 }
 
+thread_local! {
+    // Each provider request runs on its own worker thread, so the hint from a
+    // 429 response reaches poll_provider without widening the Copy PollError.
+    static RETRY_AFTER_HINT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+fn record_retry_after(response: &ureq::Response) {
+    let hint = response
+        .header("Retry-After")
+        .and_then(|value| crate::retry_after::delay_ms(value, SystemTime::now()));
+    RETRY_AFTER_HINT.with(|cell| cell.set(hint));
+}
+
 pub fn credential_watch_snapshot(mode: CredentialWatchMode) -> CredentialWatchSnapshot {
-    if mode == CredentialWatchMode::Antigravity {
-        return vec![antigravity_credential_watch_signature()];
+    match mode {
+        CredentialWatchMode::Codex => vec![codex_credential_watch_signature()],
     }
-    if mode == CredentialWatchMode::Codex {
-        return vec![codex_credential_watch_signature()];
-    }
-
-    let sources = match mode {
-        CredentialWatchMode::ActiveSource => read_first_credentials()
-            .map(|creds| vec![creds.source])
-            .unwrap_or_else(all_known_credential_sources),
-        CredentialWatchMode::AllSources => all_known_credential_sources(),
-        CredentialWatchMode::Codex => unreachable!(),
-        CredentialWatchMode::Antigravity => unreachable!(),
-    };
-
-    let mut snapshot: CredentialWatchSnapshot = sources
-        .into_iter()
-        .filter_map(|source| credential_watch_signature(&source))
-        .collect();
-    snapshot.sort();
-    snapshot.dedup();
-    snapshot
 }
 
-fn all_known_credential_sources() -> Vec<CredentialSource> {
-    let mut sources = Vec::new();
-    if let Some(source) = windows_credential_source() {
-        sources.push(source);
-    }
-    for distro in list_wsl_distros() {
-        sources.push(CredentialSource::Wsl { distro });
-    }
-    sources
-}
-
-fn windows_credential_source() -> Option<CredentialSource> {
-    Some(CredentialSource::Windows(windows_credentials_path_from(
+fn windows_credentials_path() -> Option<PathBuf> {
+    windows_credentials_path_from(
         std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from),
         dirs::home_dir(),
-    )?))
+    )
 }
 
 fn windows_credentials_path_from(
@@ -881,57 +815,6 @@ fn windows_credentials_path_from(
     let config_dir = config_dir.filter(|path| !path.as_os_str().is_empty());
     let directory = config_dir.or_else(|| home.map(|path| path.join(".claude")))?;
     Some(directory.join(".credentials.json"))
-}
-
-fn credential_watch_signature(source: &CredentialSource) -> Option<String> {
-    match source {
-        CredentialSource::Windows(path) => Some(windows_credential_watch_signature(path)),
-        CredentialSource::Wsl { distro } => wsl_credential_watch_signature(distro),
-    }
-}
-
-fn windows_credential_watch_signature(path: &PathBuf) -> String {
-    let key = format!("win:{}", path.display());
-    match std::fs::metadata(path) {
-        Ok(metadata) => {
-            let modified = metadata
-                .modified()
-                .ok()
-                .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-                .map(|value| value.as_secs())
-                .unwrap_or(0);
-            format!("{key}|present|{}|{modified}", metadata.len())
-        }
-        Err(_) => format!("{key}|missing"),
-    }
-}
-
-fn wsl_credential_watch_signature(distro: &str) -> Option<String> {
-    let output = run_with_timeout(
-        Command::new("wsl.exe")
-            .arg("-d")
-            .arg(distro)
-            .arg("--")
-            .arg("sh")
-            .arg("-lc")
-            .arg(
-                "if [ -f ~/.claude/.credentials.json ]; then \
-                 stat -c 'present|%s|%Y' ~/.claude/.credentials.json; \
-                 else echo missing; fi",
-            )
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null()),
-        Duration::from_secs(5),
-    )?;
-
-    let state = if output.status.success() {
-        decode_wsl_text(&output.stdout).trim().to_string()
-    } else {
-        format!("status-{}", output.status)
-    };
-
-    Some(format!("wsl:{distro}|{state}"))
 }
 
 fn fetch_usage_with_fallback(token: &str) -> Result<UsageData, PollError> {
@@ -957,8 +840,14 @@ fn try_usage_endpoint(token: &str) -> Result<UsageData, PollError> {
             ));
             return Err(PollError::AuthRequired);
         }
-        Err(ureq::Error::Status(code, _)) => {
-            diagnose::log(format!("Claude usage endpoint failed http_status={code}"));
+        Err(ureq::Error::Status(code, response)) => {
+            if code == 429 {
+                record_retry_after(&response);
+            }
+            diagnose::log(format!(
+                "Claude usage endpoint failed http_status={code} retry_after_ms={:?}",
+                RETRY_AFTER_HINT.with(|cell| cell.get())
+            ));
             return Err(classify_http_status(code));
         }
         Err(error) => return Err(classify_ureq_error(&error)),
@@ -1172,20 +1061,6 @@ fn codex_section_from_window(window: &CodexRateLimitWindow) -> UsageSection {
         resets_at: unix_to_system_time(Some(window.reset_at)),
         available: true,
     }
-}
-
-fn antigravity_credential_watch_signature() -> String {
-    let Some(content) = read_windows_generic_credential(ANTIGRAVITY_CREDENTIAL_TARGET) else {
-        return format!("{ANTIGRAVITY_CREDENTIAL_TARGET}|missing");
-    };
-
-    let mut hasher = DefaultHasher::new();
-    content.hash(&mut hasher);
-    format!(
-        "{ANTIGRAVITY_CREDENTIAL_TARGET}|present|{}|{}",
-        content.len(),
-        hasher.finish()
-    )
 }
 
 fn fetch_antigravity_usage(token: &str) -> Result<UsageData, PollError> {
@@ -1468,13 +1343,6 @@ fn unix_to_system_time(unix_secs: Option<i64>) -> Option<SystemTime> {
 struct Credentials {
     access_token: String,
     expires_at: Option<i64>,
-    source: CredentialSource,
-}
-
-#[derive(Clone, Debug)]
-enum CredentialSource {
-    Windows(PathBuf),
-    Wsl { distro: String },
 }
 
 fn read_first_credentials() -> Option<Credentials> {
@@ -1492,9 +1360,7 @@ fn read_first_credentials() -> Option<Credentials> {
 }
 
 fn read_windows_credentials() -> Option<Credentials> {
-    let CredentialSource::Windows(cred_path) = windows_credential_source()? else {
-        return None;
-    };
+    let cred_path = windows_credentials_path()?;
     let content = match std::fs::read_to_string(&cred_path) {
         Ok(content) => content,
         Err(error) => {
@@ -1510,7 +1376,7 @@ fn read_windows_credentials() -> Option<Credentials> {
             return None;
         }
     };
-    parse_credentials(&content, CredentialSource::Windows(cred_path))
+    parse_credentials(&content)
 }
 
 fn codex_auth_path() -> Option<PathBuf> {
@@ -1712,15 +1578,10 @@ fn read_wsl_credentials(distro: &str) -> Option<Credentials> {
     }
 
     let content = String::from_utf8(output.stdout).ok()?;
-    parse_credentials(
-        &content,
-        CredentialSource::Wsl {
-            distro: distro.to_string(),
-        },
-    )
+    parse_credentials(&content)
 }
 
-fn parse_credentials(content: &str, source: CredentialSource) -> Option<Credentials> {
+fn parse_credentials(content: &str) -> Option<Credentials> {
     let json: serde_json::Value = serde_json::from_str(content).ok()?;
 
     let oauth = json.get("claudeAiOauth")?;
@@ -1733,7 +1594,6 @@ fn parse_credentials(content: &str, source: CredentialSource) -> Option<Credenti
     Some(Credentials {
         access_token,
         expires_at,
-        source,
     })
 }
 
@@ -2115,7 +1975,6 @@ mod tests {
         Credentials {
             access_token: token.into(),
             expires_at,
-            source: CredentialSource::Windows(PathBuf::from("synthetic")),
         }
     }
 
@@ -2249,7 +2108,6 @@ mod tests {
         let creds = Credentials {
             access_token: "synthetic".into(),
             expires_at: Some(0),
-            source: CredentialSource::Windows(PathBuf::from("test")),
         };
         assert!(matches!(
             refresh_or_fallback(creds),
@@ -2677,68 +2535,57 @@ mod tests {
     }
 
     #[test]
-    fn claude_failure_does_not_block_codex_when_both_are_enabled() {
-        let data = poll_with(
-            true,
-            true,
-            false,
-            || Err(PollError::AuthRequired),
-            || Ok(usage_with_session_percent(42.0)),
-            || unreachable!("antigravity is disabled"),
+    fn provider_poll_carries_its_own_data_error_and_scope() {
+        let scope = Some("codex-scope".to_string());
+        let ok = finish_provider_poll(
+            1,
+            Ok(usage_with_session_percent(42.0)),
+            scope.clone(),
+            scope.clone(),
+            None,
         );
+        assert_eq!(ok.data.unwrap().session.percentage, 42.0);
+        assert_eq!(ok.error, None);
+        assert_eq!(ok.scope, scope);
 
-        assert!(data.has_success);
-        assert!(data.data.claude_code.is_none());
-        assert_eq!(data.data.codex.unwrap().session.percentage, 42.0);
+        let failed = finish_provider_poll(0, Err(PollError::RequestFailed), None, None, None);
+        assert!(failed.data.is_none());
+        assert_eq!(failed.error, Some(PollError::RequestFailed));
+        assert_eq!(failed.scope, None);
     }
 
     #[test]
-    fn codex_failure_does_not_block_claude_when_both_are_enabled() {
-        let data = poll_with(
-            true,
-            true,
-            false,
-            || Ok(usage_with_session_percent(64.0)),
-            || Err(PollError::RequestFailed),
-            || unreachable!("antigravity is disabled"),
+    fn provider_poll_rejects_responses_when_credentials_change_mid_request() {
+        let poll = finish_provider_poll(
+            0,
+            Ok(usage_with_session_percent(64.0)),
+            Some("old".into()),
+            Some("new".into()),
+            None,
         );
-
-        assert!(data.has_success);
-        assert_eq!(data.data.claude_code.unwrap().session.percentage, 64.0);
-        assert!(data.data.codex.is_none());
-        assert_eq!(data.codex_error, Some(PollError::RequestFailed));
+        assert!(poll.data.is_none());
+        assert_eq!(poll.error, Some(PollError::AuthRequired));
+        assert_eq!(poll.scope.as_deref(), Some("new"));
     }
 
     #[test]
-    fn returns_first_error_when_no_enabled_provider_succeeds() {
-        let outcome = poll_with(
-            true,
-            true,
-            true,
-            || Err(PollError::AuthRequired),
-            || Err(PollError::RequestFailed),
-            || Err(PollError::NoCredentials),
+    fn retry_after_hint_is_kept_only_for_rate_limits() {
+        let limited = finish_provider_poll(
+            0,
+            Err(PollError::RateLimited),
+            Some("a".into()),
+            Some("a".into()),
+            Some(471_000),
         );
-
-        assert!(!outcome.has_success);
-        assert_eq!(outcome.first_error, Some(PollError::AuthRequired));
-        assert_eq!(outcome.codex_error, Some(PollError::RequestFailed));
-    }
-
-    #[test]
-    fn antigravity_failure_does_not_block_codex_when_both_are_enabled() {
-        let data = poll_with(
-            false,
-            true,
-            true,
-            || unreachable!("claude code is disabled"),
-            || Ok(usage_with_session_percent(42.0)),
-            || Err(PollError::NoCredentials),
+        assert_eq!(limited.retry_after_ms, Some(471_000));
+        let other = finish_provider_poll(
+            0,
+            Err(PollError::ServerError),
+            Some("a".into()),
+            Some("a".into()),
+            Some(471_000),
         );
-
-        assert!(data.has_success);
-        assert!(data.data.antigravity.is_none());
-        assert_eq!(data.data.codex.unwrap().session.percentage, 42.0);
+        assert_eq!(other.retry_after_ms, None);
     }
 
     #[test]

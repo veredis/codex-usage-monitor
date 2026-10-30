@@ -28,6 +28,7 @@ use crate::native_interop::{
     TIMER_UPDATE_CHECK, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
 };
 use crate::poller;
+use crate::provider_schedule::{self, CLAUDE, CODEX};
 use crate::theme;
 use crate::tray_icon;
 use crate::updater::{self, ReleaseDescriptor, UpdateCheckResult};
@@ -102,15 +103,10 @@ struct AppState {
 
     poll_interval_ms: u32,
     adaptive_polling: bool,
-    poll_in_flight: bool,
-    poll_cadence_change_pending: bool,
-    retry_count: u32,
+    schedule: provider_schedule::ProviderSchedule,
     codex_auth: CodexAuthEpisode,
     last_codex_exec_refresh_unix: Option<u64>,
     force_notify_auth_error: bool,
-    auth_error_paused_polling: bool,
-    auth_watch_mode: poller::CredentialWatchMode,
-    auth_watch_snapshot: poller::CredentialWatchSnapshot,
     last_poll_ok: bool,
     update_status: UpdateStatus,
     last_update_check_unix: Option<u64>,
@@ -135,8 +131,6 @@ enum UpdateStatus {
     Available(ReleaseDescriptor),
 }
 
-const RETRY_BASE_MS: u32 = 30_000; // 30 seconds
-const RETRY_MAX_MS: u32 = 30 * 60 * 1000;
 const CODEX_AUTH_REFRESH_AFTER_FAILURES: u8 = 3;
 const CODEX_AUTH_EXEC_AFTER_FAILURES: u8 = 6;
 const CODEX_EXEC_REFRESH_COOLDOWN_SECS: u64 = 24 * 60 * 60;
@@ -200,6 +194,8 @@ const IDM_OPEN_LOG_FILE: u16 = 94;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
+/// Posted by provider workers so the UI thread re-arms TIMER_POLL.
+const WM_APP_REARM_POLL: u32 = WM_APP + 4;
 const TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS: u64 = 750;
 
 /// How often the watchdog thread polls for an explorer.exe restart (which
@@ -1528,8 +1524,9 @@ fn refresh_usage_texts(state: &mut AppState) {
             poller::UsageWindowKind::Weekly,
         );
     } else if state.show_claude_code {
-        state.session_text = "!".to_string();
-        state.weekly_text = "!".to_string();
+        let error = state.provider_health[CLAUDE].error;
+        state.session_text = missing_usage_text(&state.session_text, error, state.language);
+        state.weekly_text = missing_usage_text(&state.weekly_text, error, state.language);
     }
 
     if let Some(codex) = data.codex.as_ref() {
@@ -1553,9 +1550,12 @@ fn refresh_usage_texts(state: &mut AppState) {
             poller::UsageWindowKind::Weekly,
         );
     } else if state.show_codex {
+        let error = state.provider_health[CODEX].error;
         state.codex_credit_text.clear();
-        state.codex_session_text = "!".to_string();
-        state.codex_weekly_text = "!".to_string();
+        state.codex_session_text =
+            missing_usage_text(&state.codex_session_text, error, state.language);
+        state.codex_weekly_text =
+            missing_usage_text(&state.codex_weekly_text, error, state.language);
     }
 
     if let Some(antigravity) = data.antigravity.as_ref() {
@@ -1579,12 +1579,16 @@ fn refresh_usage_texts(state: &mut AppState) {
                 )
             };
     } else if state.show_antigravity {
-        state.antigravity_session_text = "!".to_string();
-        state.antigravity_weekly_text = "!".to_string();
+        let error = state.provider_health[2].error;
+        state.antigravity_session_text =
+            missing_usage_text(&state.antigravity_session_text, error, state.language);
+        state.antigravity_weekly_text =
+            missing_usage_text(&state.antigravity_weekly_text, error, state.language);
     }
     let now = std::time::SystemTime::now();
-    // Age against configured cadence, never against an escalating error delay.
-    let interval = effective_poll_interval_ms(state);
+    // Age against each provider's own cadence, never against an escalating
+    // error delay or another provider's backoff.
+    let base_interval = effective_poll_interval_ms(state);
     for (id, session, weekly) in [
         (0, &mut state.session_text, &mut state.weekly_text),
         (
@@ -1598,9 +1602,24 @@ fn refresh_usage_texts(state: &mut AppState) {
             &mut state.antigravity_weekly_text,
         ),
     ] {
+        let interval = provider_schedule::provider_interval_ms(id, base_interval);
         let stale = state.provider_health[id].stale(now, interval);
         *session = crate::provider_health::stale_text(session, stale);
         *weekly = crate::provider_health::stale_text(weekly, stale);
+    }
+}
+
+/// Text for an enabled provider without usable data: its error label once it
+/// has reported, otherwise the current placeholder (e.g. `...` while pending).
+fn missing_usage_text(
+    current: &str,
+    error: Option<poller::PollError>,
+    language: LanguageId,
+) -> String {
+    match error {
+        Some(error) => poll_error_display_label(error, language).to_string(),
+        None if current.contains('%') => "!".to_string(),
+        None => current.to_string(),
     }
 }
 
@@ -2786,15 +2805,10 @@ pub fn run() {
                 provider_generation: 0,
                 poll_interval_ms: settings.poll_interval_ms,
                 adaptive_polling: settings.adaptive_polling,
-                poll_in_flight: false,
-                poll_cadence_change_pending: false,
-                retry_count: 0,
+                schedule: Default::default(),
                 codex_auth: CodexAuthEpisode::default(),
                 last_codex_exec_refresh_unix: settings.last_codex_exec_refresh_unix,
                 force_notify_auth_error: false,
-                auth_error_paused_polling: false,
-                auth_watch_mode: poller::CredentialWatchMode::ActiveSource,
-                auth_watch_snapshot: Vec::new(),
                 last_poll_ok: false,
                 update_status: UpdateStatus::Idle,
                 last_update_check_unix: settings.last_update_check_unix,
@@ -2859,22 +2873,6 @@ pub fn run() {
         // Initial render via UpdateLayeredWindow (for embedded) or InvalidateRect (fallback)
         render_layered();
 
-        // Poll timer: use the persisted interval
-        let initial_poll_ms = {
-            let state = lock_state();
-            state
-                .as_ref()
-                .map(|s| {
-                    if s.adaptive_polling {
-                        adaptive_poll_interval(s.data.as_ref())
-                    } else {
-                        s.poll_interval_ms
-                    }
-                })
-                .unwrap_or(POLL_15_MIN)
-        };
-        SetTimer(hwnd, TIMER_POLL, initial_poll_ms, None);
-
         // Watch for explorer.exe restarts so we can re-embed and re-add the tray
         // icon (the shell discards tray registrations when it restarts). This
         // runs on a dedicated thread, NOT a window timer: once explorer destroys
@@ -2882,9 +2880,8 @@ pub fn run() {
         // (WM_TIMER included), so a timer would never fire again.
         spawn_taskbar_watchdog();
 
-        // Initial poll
-        let send_hwnd = SendHwnd::from_hwnd(hwnd);
-        spawn_poll(send_hwnd);
+        // Initial poll; each provider then re-arms TIMER_POLL from its own deadline.
+        spawn_poll(SendHwnd::from_hwnd(hwnd), PollTrigger::Scheduled);
 
         schedule_auto_update_check(hwnd);
         let should_check_updates = {
@@ -3458,34 +3455,6 @@ fn effective_poll_interval_ms(state: &AppState) -> u32 {
     }
 }
 
-fn transient_retry_delay_ms(retry_count: u32, base_interval_ms: u32) -> u32 {
-    let exponent = retry_count.saturating_sub(1).min(31);
-    let backoff = RETRY_BASE_MS.saturating_mul(1u32 << exponent);
-    backoff
-        .max(base_interval_ms)
-        .min(RETRY_MAX_MS.max(base_interval_ms))
-}
-
-fn next_poll_retry_count(current: u32, errors: [Option<poller::PollError>; 3]) -> u32 {
-    if errors
-        .into_iter()
-        .flatten()
-        .any(|error| poller::is_transient_error(error) || error == poller::PollError::RequestFailed)
-    {
-        current.saturating_add(1)
-    } else {
-        0
-    }
-}
-
-fn frequency_change_must_preserve_recovery_deadline(
-    retry_count: u32,
-    generic_auth_paused: bool,
-    codex_auth_active: bool,
-) -> bool {
-    retry_count > 0 || generic_auth_paused || codex_auth_active
-}
-
 fn is_codex_auth_error(error: Option<poller::PollError>) -> bool {
     matches!(
         error,
@@ -3506,50 +3475,153 @@ fn codex_exec_cooldown_elapsed(last_attempt: Option<u64>, now: u64) -> bool {
         .unwrap_or(true)
 }
 
-fn spawn_poll(send_hwnd: SendHwnd) {
-    let can_start = {
-        let mut state = lock_state();
-        state.as_mut().is_some_and(|state| {
-            if state.poll_in_flight {
-                return false;
-            }
-            state.poll_in_flight = true;
-            true
-        })
-    };
-    if !can_start {
-        diagnose::log("usage refresh request coalesced because a poll is already active");
-        return;
-    }
+/// What started a dispatch; decides which schedule gates a provider may bypass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PollTrigger {
+    /// TIMER_POLL: start providers whose own deadline has arrived.
+    Scheduled,
+    /// Explicit user refresh: bypass cadence, backoff and Claude spacing, but
+    /// never a server Retry-After deadline.
+    Manual,
+    /// Frequency or provider selection change: refresh idle providers promptly
+    /// while active backoff, spacing and server deadlines are preserved.
+    Reconfigure,
+    /// A displayed reset time has passed for that provider.
+    ResetBoundary,
+    /// Codex credentials changed during auth recovery.
+    CodexCredentialChange,
+}
 
-    std::thread::spawn(move || {
-        diagnose::log("usage poll worker started");
-        do_poll(send_hwnd);
-        let restart_timer = {
-            let mut state = lock_state();
-            state.as_mut().and_then(|state| {
-                state.poll_in_flight = false;
-                if !state.poll_cadence_change_pending
-                    || state.retry_count > 0
-                    || state.auth_error_paused_polling
-                    || state.codex_auth.active
-                {
-                    state.poll_cadence_change_pending = false;
-                    return None;
-                }
-                state.poll_cadence_change_pending = false;
-                Some(effective_poll_interval_ms(state))
-            })
+fn poll_request(
+    trigger: PollTrigger,
+    enabled: [bool; provider_schedule::PROVIDERS],
+    past_reset: [bool; provider_schedule::PROVIDERS],
+    codex_auth_active: bool,
+) -> provider_schedule::Request {
+    use provider_schedule::Request;
+    // Codex auth recovery runs its own retry ladder; only a scheduled tick,
+    // an explicit refresh or a credential change may start it early.
+    let outside_codex_recovery: [bool; provider_schedule::PROVIDERS] =
+        std::array::from_fn(|id| enabled[id] && !(id == CODEX && codex_auth_active));
+    match trigger {
+        PollTrigger::Scheduled => Request {
+            providers: enabled,
+            ..Default::default()
+        },
+        PollTrigger::Manual => Request {
+            providers: enabled,
+            ignore_due: true,
+            ignore_backoff: true,
+            ignore_spacing: true,
+        },
+        PollTrigger::Reconfigure => Request {
+            providers: outside_codex_recovery,
+            ignore_due: true,
+            ..Default::default()
+        },
+        PollTrigger::ResetBoundary => Request {
+            providers: std::array::from_fn(|id| outside_codex_recovery[id] && past_reset[id]),
+            ignore_due: true,
+            ..Default::default()
+        },
+        PollTrigger::CodexCredentialChange => Request {
+            providers: [false, enabled[CODEX], false],
+            ignore_due: true,
+            ignore_backoff: true,
+            ..Default::default()
+        },
+    }
+}
+
+fn enabled_providers(state: &AppState) -> [bool; provider_schedule::PROVIDERS] {
+    [
+        state.show_claude_code,
+        state.show_codex,
+        state.show_antigravity,
+    ]
+}
+
+/// Start every provider the trigger allows, each on its own worker thread, so
+/// a slow or failing provider can neither block nor delay the others.
+fn spawn_poll(send_hwnd: SendHwnd, trigger: PollTrigger) {
+    let started = {
+        let mut guard = lock_state();
+        let Some(state) = guard.as_mut() else {
+            return;
         };
-        if let Some(interval) = restart_timer {
-            unsafe {
-                SetTimer(send_hwnd.to_hwnd(), TIMER_POLL, interval, None);
-            }
+        let enabled = enabled_providers(state);
+        let past_reset = std::array::from_fn(|id| {
+            state
+                .data
+                .as_ref()
+                .and_then(|data| provider_usage(data, id))
+                .is_some_and(poller::is_past_reset)
+        });
+        let request = poll_request(trigger, enabled, past_reset, state.codex_auth.active);
+        let started = state.schedule.begin(Instant::now(), request);
+        if started.contains(&true) {
             diagnose::log(format!(
-                "poll cadence restarted after frequency change interval_ms={interval}"
+                "usage poll dispatch trigger={trigger:?} cadence_mode={} base_interval_ms={} started=claude:{},codex:{},antigravity:{}",
+                if state.adaptive_polling { "adaptive" } else { "fixed" },
+                effective_poll_interval_ms(state),
+                started[0],
+                started[1],
+                started[2]
             ));
         }
-    });
+        if trigger == PollTrigger::Manual {
+            for (id, start) in started.into_iter().enumerate() {
+                // Antigravity keeps its text, as before Build 6.
+                if start && id != 2 {
+                    set_provider_texts(state, id, "...".to_string());
+                }
+            }
+        }
+        let generation = state.provider_generation;
+        started.map(|start| start.then_some(generation))
+    };
+
+    for (id, generation) in started.into_iter().enumerate() {
+        let Some(generation) = generation else {
+            continue;
+        };
+        std::thread::spawn(move || {
+            if id == CODEX {
+                maybe_refresh_codex_auth();
+            }
+            let result = poller::poll_provider(id);
+            apply_provider_poll(send_hwnd.to_hwnd(), id, generation, result);
+            // The UI thread owns TIMER_POLL; ask it to re-arm.
+            unsafe {
+                let _ = PostMessageW(send_hwnd.to_hwnd(), WM_APP_REARM_POLL, WPARAM(0), LPARAM(0));
+            }
+        });
+    }
+    rearm_poll_timer(send_hwnd.to_hwnd());
+}
+
+/// Arm TIMER_POLL for the earliest idle provider deadline. With every enabled
+/// provider in flight, the finishing worker's WM_APP_REARM_POLL re-arms it.
+/// Called only on the UI thread that owns the window.
+fn rearm_poll_timer(hwnd: HWND) {
+    let delay = {
+        let state = lock_state();
+        state.as_ref().and_then(|state| {
+            state
+                .schedule
+                .next_delay_ms(Instant::now(), enabled_providers(state))
+        })
+    };
+    unsafe {
+        match delay {
+            Some(delay) => {
+                SetTimer(hwnd, TIMER_POLL, delay, None);
+            }
+            None => {
+                let _ = KillTimer(hwnd, TIMER_POLL);
+            }
+        }
+    }
 }
 
 fn should_attempt_codex_model_free_refresh(passive_failures: u8, attempted: bool) -> bool {
@@ -3657,10 +3729,8 @@ fn record_codex_auth_failure(
     state.codex_auth.passive_failures = state.codex_auth.passive_failures.saturating_add(1);
     state.codex_auth.credential_snapshot = snapshot;
     mark_model_free_refresh_ineffective_after_auth_rejection(&mut state.codex_auth);
-    state.auth_error_paused_polling = false;
-    state.retry_count = 0;
-    state.codex_session_text = "!".to_string();
-    state.codex_weekly_text = "!".to_string();
+    // Display text follows refresh_usage_texts: a retained same-credential
+    // snapshot shows stale (`!88% ...`), no snapshot shows `!`.
     let delay = codex_auth_retry_delay_ms(state.codex_auth.passive_failures);
     diagnose::log(format!(
         "Codex auth recovery {} passive_failure={} retry_ms={delay}",
@@ -3705,415 +3775,298 @@ fn mark_model_free_refresh_ineffective_after_auth_rejection(episode: &mut CodexA
     }
 }
 
-fn handle_codex_auth_failure(hwnd: HWND, has_other_success: bool) {
-    let snapshot = poller::credential_watch_snapshot(poller::CredentialWatchMode::Codex);
-    let (notify, delay) = {
-        let mut state = lock_state();
-        let Some(state) = state.as_mut() else {
-            return;
-        };
-        if !has_other_success {
-            state.last_poll_ok = false;
-        }
-        record_codex_auth_failure(state, snapshot)
-    };
-    unsafe {
-        if !has_other_success {
-            let _ = KillTimer(hwnd, TIMER_COUNTDOWN);
-            let _ = KillTimer(hwnd, TIMER_RESET_POLL);
-        }
-        SetTimer(hwnd, TIMER_POLL, delay, None);
-        SetTimer(hwnd, TIMER_CREDENTIAL_WATCH, CODEX_AUTH_WATCH_MS, None);
-    }
-    if notify {
-        let (title, message) = {
-            let state = lock_state();
-            state
-                .as_ref()
-                .map(|state| {
-                    (
-                        state.language.strings().codex_token_expired_title,
-                        state.language.strings().codex_token_expired_body,
-                    )
-                })
-                .unwrap_or(("Codex Auth Error", "Codex sign-in is required."))
-        };
-        tray_icon::notify_balloon(hwnd, tray_icon::TrayIconKind::Codex, title, message);
+fn provider_usage(data: &AppUsageData, id: usize) -> Option<&crate::models::UsageData> {
+    match id {
+        CLAUDE => data.claude_code.as_ref(),
+        CODEX => data.codex.as_ref(),
+        _ => data.antigravity.as_ref(),
     }
 }
 
-fn merge_transient_cached_provider_data(
+fn provider_usage_mut(data: &mut AppUsageData, id: usize) -> &mut Option<crate::models::UsageData> {
+    match id {
+        CLAUDE => &mut data.claude_code,
+        CODEX => &mut data.codex,
+        _ => &mut data.antigravity,
+    }
+}
+
+/// Apply one provider's result to the display data. A failure keeps that
+/// provider's credential-scoped cache (shown stale); an invalidated scope
+/// drops it. Other providers are never touched.
+fn merge_provider_result(
     data: &mut AppUsageData,
-    previous: Option<&AppUsageData>,
-    claude_error: Option<poller::PollError>,
-    codex_error: Option<poller::PollError>,
-    antigravity_error: Option<poller::PollError>,
-) -> bool {
-    let Some(previous) = previous else {
-        return false;
-    };
-    let mut merged = false;
-    if data.claude_code.is_none() && claude_error.is_some() && previous.claude_code.is_some() {
-        data.claude_code = previous.claude_code.clone();
-        merged = true;
+    id: usize,
+    fresh: Option<crate::models::UsageData>,
+    invalidate: bool,
+) {
+    let slot = provider_usage_mut(data, id);
+    if fresh.is_some() || invalidate {
+        *slot = fresh;
     }
-    if data.codex.is_none() && codex_error.is_some() && previous.codex.is_some() {
-        data.codex = previous.codex.clone();
-        merged = true;
-    }
-    if data.antigravity.is_none() && antigravity_error.is_some() && previous.antigravity.is_some() {
-        data.antigravity = previous.antigravity.clone();
-        merged = true;
-    }
-    merged
 }
 
-fn do_poll(send_hwnd: SendHwnd) {
-    let hwnd = send_hwnd.to_hwnd();
-    maybe_refresh_codex_auth();
-    {
-        let state = lock_state();
-        if let Some(state) = state.as_ref() {
-            diagnose::log(format!(
-                "usage poll cadence mode={} effective_interval_ms={}",
-                if state.adaptive_polling {
-                    "adaptive"
-                } else {
-                    "fixed"
-                },
-                effective_poll_interval_ms(state)
-            ));
-        }
+fn is_auth_wait_error(error: Option<poller::PollError>) -> bool {
+    matches!(
+        error,
+        Some(
+            poller::PollError::AuthRequired
+                | poller::PollError::TokenExpired
+                | poller::PollError::NoCredentials
+        )
+    )
+}
+
+/// How a finished request moves that provider's own schedule.
+fn schedule_outcome(
+    error: Option<poller::PollError>,
+    retry_after_ms: Option<u32>,
+    codex_auth_delay_ms: Option<u32>,
+    base_interval_ms: u32,
+) -> provider_schedule::Outcome {
+    use provider_schedule::Outcome;
+    match (error, codex_auth_delay_ms) {
+        (None, _) => Outcome::Success,
+        (Some(_), Some(delay_ms)) => Outcome::Wait { delay_ms },
+        (error, None) if is_auth_wait_error(error) => Outcome::Wait {
+            delay_ms: base_interval_ms,
+        },
+        (Some(_), None) => Outcome::Transient {
+            server_delay_ms: retry_after_ms,
+        },
     }
-    let widget_width_before_poll = total_widget_width();
-    let (show_claude_code, show_codex, show_antigravity, generation) = {
-        let state = lock_state();
-        state
-            .as_ref()
-            .map(|s| {
-                (
-                    s.show_claude_code,
-                    s.show_codex,
-                    s.show_antigravity,
-                    s.provider_generation,
-                )
-            })
-            .unwrap_or((false, false, false, 0))
+}
+
+fn set_provider_texts(state: &mut AppState, id: usize, text: String) {
+    let (session, weekly) = match id {
+        CLAUDE => (&mut state.session_text, &mut state.weekly_text),
+        CODEX => (&mut state.codex_session_text, &mut state.codex_weekly_text),
+        _ => (
+            &mut state.antigravity_session_text,
+            &mut state.antigravity_weekly_text,
+        ),
     };
-    let outcome = poller::poll(show_claude_code, show_codex, show_antigravity);
+    *session = text.clone();
+    *weekly = text;
+}
+
+fn auth_balloon(
+    state: &AppState,
+    id: usize,
+) -> (tray_icon::TrayIconKind, &'static str, &'static str) {
+    let strings = state.language.strings();
+    match id {
+        CLAUDE => (
+            tray_icon::TrayIconKind::Claude,
+            strings.token_expired_title,
+            strings.token_expired_body,
+        ),
+        CODEX => (
+            tray_icon::TrayIconKind::Codex,
+            strings.codex_token_expired_title,
+            strings.codex_token_expired_body,
+        ),
+        _ => (
+            tray_icon::TrayIconKind::Antigravity,
+            strings.antigravity_token_expired_title,
+            strings.antigravity_token_expired_body,
+        ),
+    }
+}
+
+/// Publish one provider's completed request. Runs on that provider's worker;
+/// every other provider's data, health and schedule are left untouched.
+fn apply_provider_poll(hwnd: HWND, id: usize, generation: u64, result: poller::ProviderPoll) {
+    let now = Instant::now();
+    let codex_auth_failed = id == CODEX && is_codex_auth_error(result.error);
+    let codex_snapshot = codex_auth_failed
+        .then(|| poller::credential_watch_snapshot(poller::CredentialWatchMode::Codex));
+    let fresh = result.data;
+    let mut quota_alerts = Vec::new();
+    let mut save_settings = false;
+    let reposition;
+    let mut balloon = None;
+    let mut codex_watch = None;
+    let polling_metadata;
+
     {
         let mut guard = lock_state();
         let Some(state) = guard.as_mut() else {
             return;
         };
-        if state.provider_generation != generation {
-            diagnose::log("discarding poll after provider selection changed");
-            unsafe {
-                SetTimer(hwnd, TIMER_POLL, 1_000, None);
-            }
+        let enabled = enabled_providers(state);
+        if state.provider_generation != generation || !enabled[id] {
+            state.schedule.discard(id, now, result.retry_after_ms);
+            diagnose::log(format!(
+                "discarding {} poll after provider selection changed",
+                poller::provider_name(id)
+            ));
             return;
         }
-        for (id, error) in [
-            outcome.claude_error,
-            outcome.codex_error,
-            outcome.antigravity_error,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let invalidate = state.provider_health[id].record(
-                outcome.scopes[id].clone(),
-                error,
-                std::time::SystemTime::now(),
-            );
-            if invalidate {
-                if let Some(data) = state.data.as_mut() {
-                    match id {
-                        0 => data.claude_code = None,
-                        1 => data.codex = None,
-                        _ => data.antigravity = None,
-                    }
-                }
-            }
-            codex_mcp::record_provider_health(id, invalidate, error);
-        }
-    }
-    let codex_auth_failed = is_codex_auth_error(outcome.codex_error);
+        let width_before = total_widget_width_for_state(state);
+        let extra_display_before =
+            codex_extra_usage_display(state.show_codex, state.credit_display, state.data.as_ref());
 
-    let claude_error = outcome.claude_error;
-    let codex_error = outcome.codex_error;
-    let antigravity_error = outcome.antigravity_error;
-    if !outcome.has_success {
-        let mut cached_display = false;
-        let mut retry_ms = RETRY_BASE_MS;
-        {
-            let mut state = lock_state();
-            if let Some(state) = state.as_mut() {
-                let mut display_data = AppUsageData::default();
-                if state.provider_generation != generation {
-                    return;
-                }
-                cached_display = merge_transient_cached_provider_data(
-                    &mut display_data,
-                    state.data.as_ref(),
-                    claude_error,
-                    codex_error,
-                    antigravity_error,
-                );
-                if cached_display {
-                    state.data = Some(display_data);
-                    state.last_poll_ok = true;
-                    state.retry_count = state.retry_count.saturating_add(1);
-                    retry_ms = transient_retry_delay_ms(
-                        state.retry_count,
-                        effective_poll_interval_ms(state),
-                    );
-                    refresh_usage_texts(state);
-                    diagnose::log(format!(
-                        "provider failures; retaining credential-scoped stale display retry={} retry_ms={retry_ms}",
-                        state.retry_count
-                    ));
-                }
+        let previous_error = state.provider_health[id].error;
+        let invalidate =
+            state.provider_health[id].record(result.scope.clone(), result.error, SystemTime::now());
+        codex_mcp::record_provider_health(id, invalidate, result.error);
+        merge_provider_result(
+            state.data.get_or_insert_with(Default::default),
+            id,
+            fresh.clone(),
+            invalidate,
+        );
+        let (session, weekly) = state
+            .data
+            .as_ref()
+            .and_then(|data| provider_usage(data, id))
+            .map(|usage| (usage.session.percentage, usage.weekly.percentage))
+            .unwrap_or((0.0, 0.0));
+        match id {
+            CLAUDE => (state.session_percent, state.weekly_percent) = (session, weekly),
+            CODEX => (state.codex_session_percent, state.codex_weekly_percent) = (session, weekly),
+            _ => {
+                (
+                    state.antigravity_session_percent,
+                    state.antigravity_weekly_percent,
+                ) = (session, weekly)
             }
         }
-        if cached_display {
-            if codex_auth_failed {
-                handle_codex_auth_failure(hwnd, true);
-            }
-            if !codex_auth_failed {
-                unsafe { SetTimer(hwnd, TIMER_POLL, retry_ms, None) };
-            }
-            update_cached_poll_metadata();
-            if widget_width_before_poll != total_widget_width() {
-                position_at_taskbar();
-            }
+
+        if fresh.is_some() && !state.data.as_ref().is_some_and(poller::app_is_past_reset) {
             unsafe {
-                let _ = PostMessageW(hwnd, WM_APP_USAGE_UPDATED, WPARAM(0), LPARAM(0));
+                let _ = KillTimer(hwnd, TIMER_RESET_POLL);
             }
-            return;
         }
-        if codex_auth_failed {
-            handle_codex_auth_failure(hwnd, false);
-        } else {
-            handle_poll_failure(
-                hwnd,
-                outcome
-                    .first_error
-                    .unwrap_or(poller::PollError::RequestFailed),
-                show_claude_code,
-                show_codex,
-                show_antigravity,
-            );
-        }
-        if widget_width_before_poll != total_widget_width() {
-            position_at_taskbar();
-        }
-        unsafe {
-            let _ = PostMessageW(hwnd, WM_APP_USAGE_UPDATED, WPARAM(0), LPARAM(0));
-        }
-        return;
-    }
-
-    let fresh_data = outcome.data;
-    let codex_success = fresh_data.codex.clone();
-    let snapshot_for_watch = if codex_auth_failed {
-        Some(poller::credential_watch_snapshot(
-            poller::CredentialWatchMode::Codex,
-        ))
-    } else {
-        None
-    };
-    let mut quota_alerts = Vec::new();
-    let mut quota_notification_state_changed = false;
-    let mut credit_panel_visibility_changed = false;
-    let mut widget_width_changed = false;
-    let mut codex_auth_retry_delay = None;
-    let mut clear_codex_watch = false;
-    let mut mcp_polling_metadata = None;
-    let mut claude_snapshot = None;
-
-    {
-        let mut state = lock_state();
-        if let Some(state) = state.as_mut() {
-            let widget_width_before = total_widget_width_for_state(state);
-            if state.provider_generation != generation {
-                return;
-            }
-            let extra_display_before = codex_extra_usage_display(
-                state.show_codex,
-                state.credit_display,
-                state.data.as_ref(),
-            );
-
-            let mut display_data = fresh_data.clone();
-            let claude_cached = display_data.claude_code.is_some()
-                || (claude_error.is_some()
-                    && state
-                        .data
-                        .as_ref()
-                        .and_then(|data| data.claude_code.as_ref())
-                        .is_some());
-            let codex_cached = display_data.codex.is_some()
-                || (codex_error.is_some()
-                    && state
-                        .data
-                        .as_ref()
-                        .and_then(|data| data.codex.as_ref())
-                        .is_some());
-            let antigravity_cached = display_data.antigravity.is_some()
-                || (antigravity_error.is_some()
-                    && state
-                        .data
-                        .as_ref()
-                        .and_then(|data| data.antigravity.as_ref())
-                        .is_some());
-            let _ = merge_transient_cached_provider_data(
-                &mut display_data,
-                state.data.as_ref(),
-                claude_error,
-                codex_error,
-                antigravity_error,
-            );
-
-            if let Some(usage) = display_data.claude_code.as_ref() {
-                state.session_percent = usage.session.percentage;
-                state.weekly_percent = usage.weekly.percentage;
-            } else if state.show_claude_code && !claude_cached {
-                state.session_percent = 0.0;
-                state.weekly_percent = 0.0;
-            }
-            if let Some(usage) = display_data.codex.as_ref() {
-                state.codex_session_percent = usage.session.percentage;
-                state.codex_weekly_percent = usage.weekly.percentage;
-            } else if state.show_codex && !codex_cached {
-                state.codex_credit_text.clear();
-                state.codex_session_text = "!".to_string();
-                state.codex_weekly_text = "!".to_string();
-            }
-            if let Some(usage) = display_data.antigravity.as_ref() {
-                state.antigravity_session_percent = usage.session.percentage;
-                state.antigravity_weekly_percent = usage.weekly.percentage;
-            } else if state.show_antigravity && !antigravity_cached {
-                state.antigravity_session_percent = 0.0;
-                state.antigravity_weekly_percent = 0.0;
-            }
-
-            if !poller::app_is_past_reset(&fresh_data) {
-                unsafe {
-                    let _ = KillTimer(hwnd, TIMER_RESET_POLL);
-                }
-            }
+        if let Some(usage) = fresh.as_ref() {
+            let mut only_this_provider = AppUsageData::default();
+            *provider_usage_mut(&mut only_this_provider, id) = Some(usage.clone());
             let notified_before = state.notified_quota_windows.clone();
-            quota_alerts = collect_low_quota_alerts(state, &fresh_data);
-            quota_notification_state_changed = state.notified_quota_windows != notified_before;
+            quota_alerts = collect_low_quota_alerts(state, &only_this_provider);
+            save_settings =
+                !quota_alerts.is_empty() || state.notified_quota_windows != notified_before;
+        }
 
-            claude_snapshot = fresh_data.claude_code.clone();
-            state.data = Some(display_data);
-            state.last_poll_ok = true;
-            refresh_usage_texts(state);
-
-            if codex_auth_failed {
-                let snapshot = snapshot_for_watch.clone().unwrap_or_default();
-                codex_auth_retry_delay = Some(record_codex_auth_failure(state, snapshot).1);
-            } else if codex_success.is_some() {
-                clear_codex_watch = finish_codex_auth_recovery(state);
-            } else if let Some(error) =
-                codex_error.filter(|error| !poller::is_transient_error(*error) && !codex_cached)
-            {
-                state.codex_session_text =
-                    poll_error_display_label(error, state.language).to_string();
-                state.codex_weekly_text =
-                    poll_error_display_label(error, state.language).to_string();
+        let mut codex_auth_delay_ms = None;
+        if codex_auth_failed {
+            let (notify, delay) =
+                record_codex_auth_failure(state, codex_snapshot.unwrap_or_default());
+            codex_auth_delay_ms = Some(delay);
+            codex_watch = Some(true);
+            if notify {
+                balloon = Some(auth_balloon(state, id));
             }
-
-            let extra_display_after = codex_extra_usage_display(
-                state.show_codex,
-                state.credit_display,
-                state.data.as_ref(),
-            );
-            credit_panel_visibility_changed = extra_display_before != extra_display_after;
-            if extra_display_before != extra_display_after {
-                diagnose::log(format!(
-                    "extra_usage_display changed from {:?} to {:?} reason={}",
-                    extra_display_before,
-                    extra_display_after,
-                    extra_usage_display_reason(
-                        state.show_codex,
-                        state.credit_display,
-                        state.data.as_ref(),
-                    )
-                ));
+        } else if id == CODEX && fresh.is_some() && finish_codex_auth_recovery(state) {
+            codex_watch = Some(false);
+        }
+        if id != CODEX && is_auth_wait_error(result.error) {
+            // Notify once per sign-in episode, and only when no other enabled
+            // provider is currently healthy (the pre-Build 6 all-failed rule).
+            let new_episode = !is_auth_wait_error(previous_error);
+            let others_failing = (0..provider_schedule::PROVIDERS)
+                .filter(|&other| other != id && enabled[other])
+                .all(|other| state.provider_health[other].error.is_some());
+            if (new_episode || state.force_notify_auth_error) && others_failing {
+                balloon = Some(auth_balloon(state, id));
             }
-            widget_width_changed = widget_width_before != total_widget_width_for_state(state);
-
-            if codex_success.is_some() {
-                if clear_codex_watch {
-                    unsafe {
-                        let _ = KillTimer(hwnd, TIMER_CREDENTIAL_WATCH);
-                    }
-                }
-                mcp_polling_metadata =
-                    Some((state.adaptive_polling, effective_poll_interval_ms(state)));
-            }
-            if !codex_auth_failed {
-                let was_retrying = state.retry_count > 0;
-                state.retry_count = next_poll_retry_count(
-                    state.retry_count,
-                    [claude_error, codex_error, antigravity_error],
-                );
-                if state.retry_count > 0 {
-                    let retry_ms = transient_retry_delay_ms(
-                        state.retry_count,
-                        effective_poll_interval_ms(state),
-                    );
-                    diagnose::log(format!(
-                        "partial usage poll failure retry={} retry_ms={retry_ms}",
-                        state.retry_count
-                    ));
-                    unsafe { SetTimer(hwnd, TIMER_POLL, retry_ms, None) };
-                } else if was_retrying || clear_codex_watch || state.adaptive_polling {
-                    let interval = effective_poll_interval_ms(state);
-                    unsafe { SetTimer(hwnd, TIMER_POLL, interval, None) };
-                }
-            }
-            state.auth_error_paused_polling = false;
-            state.auth_watch_mode = poller::CredentialWatchMode::ActiveSource;
-            state.auth_watch_snapshot.clear();
+            state.force_notify_auth_error = false;
+        } else if result.error.is_none() {
             state.force_notify_auth_error = false;
         }
+
+        let base_interval = effective_poll_interval_ms(state);
+        let outcome = schedule_outcome(
+            result.error,
+            result.retry_after_ms,
+            codex_auth_delay_ms,
+            base_interval,
+        );
+        state.schedule.finish(
+            id,
+            now,
+            outcome,
+            provider_schedule::provider_interval_ms(id, base_interval),
+        );
+        if let provider_schedule::Outcome::Transient { server_delay_ms } = outcome {
+            diagnose::log(format!(
+                "{} poll failure retry={} server_retry_after_ms={server_delay_ms:?}; other providers keep their own schedules",
+                poller::provider_name(id),
+                state.schedule.retry_count(id)
+            ));
+        }
+        diagnose::log(format!(
+            "provider schedule {}",
+            state.schedule.describe(Instant::now(), enabled)
+        ));
+
+        state.last_poll_ok = state.data.as_ref().is_some_and(|data| {
+            (0..provider_schedule::PROVIDERS).any(|other| provider_usage(data, other).is_some())
+        });
+        if state.last_poll_ok {
+            refresh_usage_texts(state);
+        } else if let Some(error) = result.error {
+            set_provider_texts(
+                state,
+                id,
+                poll_error_display_label(error, state.language).to_string(),
+            );
+        }
+
+        let extra_display_after =
+            codex_extra_usage_display(state.show_codex, state.credit_display, state.data.as_ref());
+        if extra_display_before != extra_display_after {
+            diagnose::log(format!(
+                "extra_usage_display changed from {:?} to {:?} reason={}",
+                extra_display_before,
+                extra_display_after,
+                extra_usage_display_reason(
+                    state.show_codex,
+                    state.credit_display,
+                    state.data.as_ref(),
+                )
+            ));
+        }
+        reposition = extra_display_before != extra_display_after
+            || width_before != total_widget_width_for_state(state);
+        polling_metadata = (state.adaptive_polling, base_interval);
     }
 
     // Serialize publication with selection changes, including disable/re-enable.
-    let publication_guard = lock_state();
-    if publication_guard
-        .as_ref()
-        .is_none_or(|s| s.provider_generation != generation)
     {
-        return;
-    }
-    if let Some(codex) = codex_success {
-        let (adaptive, interval) = mcp_polling_metadata.unwrap_or((false, POLL_15_MIN));
-        codex_mcp::publish_snapshot(codex, adaptive, interval);
-    } else {
-        if let Some(state) = publication_guard.as_ref() {
-            codex_mcp::update_polling_metadata(
-                state.adaptive_polling,
-                effective_poll_interval_ms(state),
-            );
+        let publication_guard = lock_state();
+        if publication_guard
+            .as_ref()
+            .is_none_or(|s| s.provider_generation != generation)
+        {
+            return;
+        }
+        let (adaptive, interval) = polling_metadata;
+        match (id, fresh) {
+            (CODEX, Some(codex)) => codex_mcp::publish_snapshot(codex, adaptive, interval),
+            (CLAUDE, Some(claude)) => {
+                codex_mcp::publish_claude_snapshot(claude);
+                codex_mcp::update_polling_metadata(adaptive, interval);
+            }
+            _ => codex_mcp::update_polling_metadata(adaptive, interval),
         }
     }
-    if let Some(claude) = claude_snapshot {
-        codex_mcp::publish_claude_snapshot(claude);
-    }
-    drop(publication_guard);
 
-    if let Some(delay) = codex_auth_retry_delay {
-        unsafe {
-            SetTimer(hwnd, TIMER_POLL, delay, None);
-            SetTimer(hwnd, TIMER_CREDENTIAL_WATCH, CODEX_AUTH_WATCH_MS, None);
+    unsafe {
+        match codex_watch {
+            Some(true) => {
+                SetTimer(hwnd, TIMER_CREDENTIAL_WATCH, CODEX_AUTH_WATCH_MS, None);
+            }
+            Some(false) => {
+                let _ = KillTimer(hwnd, TIMER_CREDENTIAL_WATCH);
+            }
+            None => {}
         }
     }
-    if credit_panel_visibility_changed || widget_width_changed {
+    if let Some((kind, title, message)) = balloon {
+        tray_icon::notify_balloon(hwnd, kind, title, message);
+    }
+    if reposition {
         position_at_taskbar();
     }
     for alert in &quota_alerts {
@@ -4123,132 +4076,11 @@ fn do_poll(send_hwnd: SendHwnd) {
             alert.title, alert.message
         ));
     }
-    if !quota_alerts.is_empty() || quota_notification_state_changed {
+    if save_settings {
         save_state_settings();
     }
     unsafe {
         let _ = PostMessageW(hwnd, WM_APP_USAGE_UPDATED, WPARAM(0), LPARAM(0));
-    }
-}
-
-fn update_cached_poll_metadata() {
-    // Keep the guard inside this helper: sizing and positioning re-lock STATE.
-    let state = lock_state();
-    if let Some(state) = state.as_ref() {
-        codex_mcp::update_polling_metadata(
-            state.adaptive_polling,
-            effective_poll_interval_ms(state),
-        );
-    }
-}
-
-fn handle_poll_failure(
-    hwnd: HWND,
-    error: poller::PollError,
-    show_claude_code: bool,
-    show_codex: bool,
-    show_antigravity: bool,
-) {
-    let auth_watch = match error {
-        poller::PollError::AuthRequired | poller::PollError::TokenExpired
-            if show_antigravity && !show_claude_code && !show_codex =>
-        {
-            Some((
-                poller::CredentialWatchMode::Antigravity,
-                poller::credential_watch_snapshot(poller::CredentialWatchMode::Antigravity),
-            ))
-        }
-        poller::PollError::AuthRequired | poller::PollError::TokenExpired => Some((
-            poller::CredentialWatchMode::ActiveSource,
-            poller::credential_watch_snapshot(poller::CredentialWatchMode::ActiveSource),
-        )),
-        poller::PollError::NoCredentials => Some((
-            poller::CredentialWatchMode::AllSources,
-            poller::credential_watch_snapshot(poller::CredentialWatchMode::AllSources),
-        )),
-        _ => None,
-    };
-
-    let notify_auth_error = {
-        let mut state = lock_state();
-        let mut notify = false;
-        if let Some(state) = state.as_mut() {
-            state.last_poll_ok = false;
-            if let Some((watch_mode, watch_snapshot)) = auth_watch {
-                notify = state.retry_count == 0 || state.force_notify_auth_error;
-                state.force_notify_auth_error = false;
-                state.auth_error_paused_polling = true;
-                state.auth_watch_mode = watch_mode;
-                state.auth_watch_snapshot = watch_snapshot;
-                state.session_text = "!".to_string();
-                state.weekly_text = "!".to_string();
-                state.codex_session_text = "!".to_string();
-                state.codex_weekly_text = "!".to_string();
-                state.antigravity_session_text = "!".to_string();
-                state.antigravity_weekly_text = "!".to_string();
-                state.retry_count = state.retry_count.saturating_add(1);
-                unsafe {
-                    let _ = KillTimer(hwnd, TIMER_POLL);
-                    let _ = KillTimer(hwnd, TIMER_RESET_POLL);
-                    let _ = KillTimer(hwnd, TIMER_COUNTDOWN);
-                    SetTimer(hwnd, TIMER_POLL, state.poll_interval_ms, None);
-                }
-            } else {
-                state.force_notify_auth_error = false;
-                state.auth_error_paused_polling = false;
-                state.auth_watch_mode = poller::CredentialWatchMode::ActiveSource;
-                state.auth_watch_snapshot.clear();
-                let label = poll_error_display_label(error, state.language).to_string();
-                state.session_text = label.clone();
-                state.weekly_text = label.clone();
-                state.codex_session_text = label.clone();
-                state.codex_weekly_text = label.clone();
-                state.antigravity_session_text = label;
-                state.retry_count = state.retry_count.saturating_add(1);
-                let retry_ms =
-                    transient_retry_delay_ms(state.retry_count, effective_poll_interval_ms(state));
-                diagnose::log(format!(
-                    "usage poll failed category={} retry={} retry_ms={retry_ms}",
-                    error.category(),
-                    state.retry_count
-                ));
-                unsafe {
-                    let _ = KillTimer(hwnd, TIMER_RESET_POLL);
-                    SetTimer(hwnd, TIMER_POLL, retry_ms, None);
-                }
-            }
-        }
-        notify
-    };
-
-    if notify_auth_error {
-        let balloon = {
-            let state = lock_state();
-            state.as_ref().map(|state| {
-                if state.show_claude_code {
-                    (
-                        tray_icon::TrayIconKind::Claude,
-                        state.language.strings().token_expired_title,
-                        state.language.strings().token_expired_body,
-                    )
-                } else if state.show_codex {
-                    (
-                        tray_icon::TrayIconKind::Codex,
-                        state.language.strings().codex_token_expired_title,
-                        state.language.strings().codex_token_expired_body,
-                    )
-                } else {
-                    (
-                        tray_icon::TrayIconKind::Antigravity,
-                        state.language.strings().antigravity_token_expired_title,
-                        state.language.strings().antigravity_token_expired_body,
-                    )
-                }
-            })
-        };
-        if let Some((kind, title, message)) = balloon {
-            tray_icon::notify_balloon(hwnd, kind, title, message);
-        }
     }
 }
 
@@ -4576,42 +4408,9 @@ unsafe extern "system" fn wnd_proc(
             let timer_id = wparam.0;
             match timer_id {
                 TIMER_POLL => {
-                    let auth_watch = {
-                        let state = lock_state();
-                        state.as_ref().map(|s| {
-                            (
-                                s.codex_auth.active,
-                                s.codex_auth.credential_snapshot.clone(),
-                                s.auth_error_paused_polling,
-                                s.auth_watch_mode,
-                                s.auth_watch_snapshot.clone(),
-                            )
-                        })
-                    };
-                    match auth_watch {
-                        Some((true, _, _, _, _)) => {
-                            spawn_poll(SendHwnd::from_hwnd(hwnd));
-                        }
-                        Some((false, _, true, watch_mode, previous_snapshot)) => {
-                            let current_snapshot = poller::credential_watch_snapshot(watch_mode);
-                            if credential_snapshot_changed(&previous_snapshot, &current_snapshot) {
-                                let mut state = lock_state();
-                                if let Some(s) = state.as_mut() {
-                                    if s.auth_error_paused_polling
-                                        && s.auth_watch_mode == watch_mode
-                                    {
-                                        s.auth_watch_snapshot = current_snapshot;
-                                    }
-                                }
-                                drop(state);
-                                spawn_poll(SendHwnd::from_hwnd(hwnd));
-                            }
-                        }
-                        Some((false, _, false, _, _)) => {
-                            spawn_poll(SendHwnd::from_hwnd(hwnd));
-                        }
-                        None => {}
-                    }
+                    // Claude passive auth recovery needs no pause here: the
+                    // poller resends no rejected token until credentials change.
+                    spawn_poll(SendHwnd::from_hwnd(hwnd), PollTrigger::Scheduled);
                 }
                 TIMER_CREDENTIAL_WATCH => {
                     let previous = {
@@ -4635,10 +4434,10 @@ unsafe extern "system" fn wnd_proc(
                                 }
                             }
                             diagnose::log("Codex credential change detected during auth recovery; retrying immediately");
-                            unsafe {
-                                let _ = KillTimer(hwnd, TIMER_POLL);
-                            }
-                            spawn_poll(SendHwnd::from_hwnd(hwnd));
+                            spawn_poll(
+                                SendHwnd::from_hwnd(hwnd),
+                                PollTrigger::CodexCredentialChange,
+                            );
                         }
                     }
                 }
@@ -4652,22 +4451,8 @@ unsafe extern "system" fn wnd_proc(
                     schedule_countdown_timer();
                 }
                 TIMER_RESET_POLL => {
-                    let should_poll = {
-                        let state = lock_state();
-                        state
-                            .as_ref()
-                            .map(|s| {
-                                !frequency_change_must_preserve_recovery_deadline(
-                                    s.retry_count,
-                                    s.auth_error_paused_polling,
-                                    s.codex_auth.active,
-                                )
-                            })
-                            .unwrap_or(false)
-                    };
-                    if should_poll {
-                        spawn_poll(SendHwnd::from_hwnd(hwnd));
-                    }
+                    // Only providers past their own reset and not backing off.
+                    spawn_poll(SendHwnd::from_hwnd(hwnd), PollTrigger::ResetBoundary);
                 }
                 TIMER_UPDATE_CHECK => {
                     begin_update_check(hwnd, false);
@@ -4689,6 +4474,10 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_APP_UPDATE_CHECK_COMPLETE => {
             schedule_auto_update_check(hwnd);
+            LRESULT(0)
+        }
+        WM_APP_REARM_POLL => {
+            rearm_poll_timer(hwnd);
             LRESULT(0)
         }
         WM_SETCURSOR => {
@@ -4891,15 +4680,13 @@ unsafe extern "system" fn wnd_proc(
                     {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
-                            s.session_text = "...".to_string();
-                            s.weekly_text = "...".to_string();
-                            s.codex_session_text = "...".to_string();
-                            s.codex_weekly_text = "...".to_string();
                             s.force_notify_auth_error = true;
                         }
                     }
+                    // Started providers show `...`; one under a server
+                    // Retry-After deadline keeps showing its stale value.
+                    spawn_poll(SendHwnd::from_hwnd(hwnd), PollTrigger::Manual);
                     render_layered();
-                    spawn_poll(SendHwnd::from_hwnd(hwnd));
                 }
                 IDM_VERSION_ACTION => {
                     let release = {
@@ -4984,37 +4771,26 @@ unsafe extern "system" fn wnd_proc(
                         IDM_FREQ_ADAPTIVE => POLL_5_MIN,
                         _ => POLL_15_MIN,
                     };
-                    let (timer_interval, defer_for_recovery) = {
+                    let timer_interval = {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
                             s.adaptive_polling = id == IDM_FREQ_ADAPTIVE;
                             if !s.adaptive_polling {
                                 s.poll_interval_ms = new_interval;
                             }
-                            let interval = if s.adaptive_polling {
-                                adaptive_poll_interval(s.data.as_ref())
-                            } else {
-                                s.poll_interval_ms
-                            };
-                            let defer = frequency_change_must_preserve_recovery_deadline(
-                                s.retry_count,
-                                s.auth_error_paused_polling,
-                                s.codex_auth.active,
-                            );
-                            s.poll_cadence_change_pending = !defer;
-                            (interval, defer)
+                            effective_poll_interval_ms(s)
                         } else {
-                            (new_interval, false)
+                            new_interval
                         }
                     };
                     save_state_settings();
                     codex_mcp::update_polling_metadata(id == IDM_FREQ_ADAPTIVE, timer_interval);
-                    if defer_for_recovery {
-                        diagnose::log("poll frequency changed during retry/auth recovery; existing recovery deadline preserved");
-                    } else {
-                        let _ = KillTimer(hwnd, TIMER_POLL);
-                        spawn_poll(SendHwnd::from_hwnd(hwnd));
-                    }
+                    // Idle providers refresh promptly; a provider in backoff,
+                    // auth recovery or under a server deadline keeps it.
+                    diagnose::log(format!(
+                        "poll frequency changed base_interval_ms={timer_interval}; providers in recovery keep their deadlines"
+                    ));
+                    spawn_poll(SendHwnd::from_hwnd(hwnd), PollTrigger::Reconfigure);
                 }
                 IDM_USAGE_DISPLAY_REMAINING | IDM_USAGE_DISPLAY_USED => {
                     {
@@ -5198,7 +4974,7 @@ unsafe extern "system" fn wnd_proc(
                     save_state_settings();
                 }
                 IDM_MODEL_CLAUDE_CODE | IDM_MODEL_CODEX | IDM_MODEL_ANTIGRAVITY => {
-                    let codex_disabled_interval = {
+                    let codex_disabled = {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
                             match id {
@@ -5223,23 +4999,19 @@ unsafe extern "system" fn wnd_proc(
                                 }
                                 _ => {}
                             }
-                            let disabled_interval = if id == IDM_MODEL_CODEX && !s.show_codex {
+                            let codex_disabled = id == IDM_MODEL_CODEX && !s.show_codex;
+                            if codex_disabled {
                                 let _ = finish_codex_auth_episode(&mut s.codex_auth);
-                                Some(effective_poll_interval_ms(s))
-                            } else {
-                                None
-                            };
+                            }
                             s.provider_generation = s.provider_generation.wrapping_add(1);
-                            let enabled = [s.show_claude_code, s.show_codex, s.show_antigravity];
+                            let enabled = enabled_providers(s);
                             for (id, enabled) in enabled.into_iter().enumerate() {
                                 if !enabled {
                                     s.provider_health[id] = Default::default();
+                                    // Keeps any server Retry-After deadline.
+                                    s.schedule.disable(id);
                                     if let Some(data) = s.data.as_mut() {
-                                        match id {
-                                            0 => data.claude_code = None,
-                                            1 => data.codex = None,
-                                            _ => data.antigravity = None,
-                                        }
+                                        *provider_usage_mut(data, id) = None;
                                     }
                                 }
                             }
@@ -5250,14 +5022,16 @@ unsafe extern "system" fn wnd_proc(
                             s.codex_weekly_text = "...".to_string();
                             s.antigravity_session_text = "...".to_string();
                             s.antigravity_weekly_text = "...".to_string();
-                            disabled_interval
+                            // Providers with retained data keep showing it; a
+                            // provider that is not re-polled yet stays `...`.
+                            refresh_usage_texts(s);
+                            codex_disabled
                         } else {
-                            None
+                            false
                         }
                     };
-                    if let Some(interval) = codex_disabled_interval {
+                    if codex_disabled {
                         let _ = KillTimer(hwnd, TIMER_CREDENTIAL_WATCH);
-                        SetTimer(hwnd, TIMER_POLL, interval, None);
                         diagnose::log(
                             "Codex auth recovery ended because Codex polling was disabled",
                         );
@@ -5266,7 +5040,7 @@ unsafe extern "system" fn wnd_proc(
                     position_at_taskbar();
                     render_layered();
                     sync_tray_icons(hwnd);
-                    spawn_poll(SendHwnd::from_hwnd(hwnd));
+                    spawn_poll(SendHwnd::from_hwnd(hwnd), PollTrigger::Reconfigure);
                 }
                 IDM_LANG_SYSTEM
                 | IDM_LANG_ENGLISH
@@ -6578,49 +6352,143 @@ mod tests {
 
     #[test]
     fn claude_auth_failure_retains_only_credential_scoped_data() {
-        let mut old = AppUsageData::default();
+        let mut data = AppUsageData::default();
         let mut usage = crate::models::UsageData::default();
         usage.session.percentage = 12.0;
-        old.claude_code = Some(usage);
-        let mut fresh = AppUsageData::default();
-        fresh.codex = Some(crate::models::UsageData::default());
-        assert!(merge_transient_cached_provider_data(
-            &mut fresh,
-            Some(&old),
-            Some(poller::PollError::AuthRequired),
-            None,
-            None
-        ));
-        assert_eq!(fresh.claude_code.as_ref().unwrap().session.percentage, 12.0);
-        assert!(fresh.codex.is_some());
+        data.claude_code = Some(usage);
+        data.codex = Some(crate::models::UsageData::default());
+        // Same-credential auth failure: keep Claude's snapshot (shown stale).
+        merge_provider_result(&mut data, CLAUDE, None, false);
+        assert_eq!(data.claude_code.as_ref().unwrap().session.percentage, 12.0);
+        assert!(data.codex.is_some());
         // Invalidating a changed scope removes the only source of cached data.
-        old.claude_code = None;
-        fresh.claude_code = None;
-        assert!(!merge_transient_cached_provider_data(
-            &mut fresh,
-            Some(&old),
-            Some(poller::PollError::AuthRequired),
-            None,
-            None
-        ));
-        assert!(fresh.claude_code.is_none());
+        merge_provider_result(&mut data, CLAUDE, None, true);
+        assert!(data.claude_code.is_none());
+        assert!(data.codex.is_some());
     }
 
     #[test]
-    fn partial_provider_errors_keep_backoff_and_block_reset_polling() {
-        for provider in 0..3 {
-            let mut errors = [None; 3];
-            errors[provider] = Some(poller::PollError::RateLimited);
-            let count = next_poll_retry_count(2, errors);
-            assert_eq!(count, 3);
-            assert!(frequency_change_must_preserve_recovery_deadline(
-                count, false, false
-            ));
+    fn provider_failures_back_off_only_that_provider_and_block_its_reset_polling() {
+        use poller::PollError;
+        use provider_schedule::Outcome;
+        assert_eq!(
+            schedule_outcome(
+                Some(PollError::RateLimited),
+                Some(471_000),
+                None,
+                POLL_30_SEC
+            ),
+            Outcome::Transient {
+                server_delay_ms: Some(471_000)
+            }
+        );
+        for error in [
+            PollError::NetworkUnavailable,
+            PollError::ServerError,
+            PollError::RequestFailed,
+        ] {
+            assert_eq!(
+                schedule_outcome(Some(error), None, None, POLL_30_SEC),
+                Outcome::Transient {
+                    server_delay_ms: None
+                }
+            );
         }
-        assert_eq!(next_poll_retry_count(3, [None; 3]), 0);
-        assert!(!frequency_change_must_preserve_recovery_deadline(
-            0, false, false
-        ));
+        for error in [
+            PollError::AuthRequired,
+            PollError::TokenExpired,
+            PollError::NoCredentials,
+        ] {
+            assert_eq!(
+                schedule_outcome(Some(error), None, None, POLL_30_SEC),
+                Outcome::Wait {
+                    delay_ms: POLL_30_SEC
+                }
+            );
+        }
+        assert_eq!(
+            schedule_outcome(
+                Some(PollError::AuthRequired),
+                None,
+                Some(120_000),
+                POLL_30_SEC
+            ),
+            Outcome::Wait { delay_ms: 120_000 }
+        );
+        assert_eq!(
+            schedule_outcome(None, None, None, POLL_30_SEC),
+            Outcome::Success
+        );
+
+        // A reset boundary refreshes only the provider past its reset, and never
+        // one that is backing off.
+        let enabled = [true, true, false];
+        let request = poll_request(
+            PollTrigger::ResetBoundary,
+            enabled,
+            [false, true, false],
+            false,
+        );
+        assert_eq!(request.providers, [false, true, false]);
+        assert!(!request.ignore_backoff && !request.ignore_spacing);
+        let now = Instant::now();
+        let mut schedule = provider_schedule::ProviderSchedule::default();
+        schedule.begin(
+            now,
+            poll_request(PollTrigger::Scheduled, enabled, [false; 3], false),
+        );
+        schedule.finish(
+            CODEX,
+            now,
+            Outcome::Transient {
+                server_delay_ms: None,
+            },
+            POLL_30_SEC,
+        );
+        assert!(!schedule.begin(now + Duration::from_secs(5), request)[CODEX]);
+    }
+
+    #[test]
+    fn manual_refresh_bypasses_cadence_and_spacing_but_not_server_deadlines() {
+        let request = poll_request(PollTrigger::Manual, [true, true, false], [false; 3], false);
+        assert_eq!(request.providers, [true, true, false]);
+        assert!(request.ignore_due && request.ignore_backoff && request.ignore_spacing);
+        let now = Instant::now();
+        let mut schedule = provider_schedule::ProviderSchedule::default();
+        schedule.begin(now, request);
+        schedule.finish(
+            CLAUDE,
+            now,
+            provider_schedule::Outcome::Transient {
+                server_delay_ms: Some(300_000),
+            },
+            provider_schedule::CLAUDE_MIN_POLL_MS,
+        );
+        schedule.finish(CODEX, now, provider_schedule::Outcome::Success, POLL_30_SEC);
+        let soon = now + Duration::from_secs(10);
+        assert_eq!(schedule.begin(soon, request), [false, true, false]);
+    }
+
+    #[test]
+    fn missing_data_shows_pending_until_reported_then_the_error_label() {
+        use poller::PollError;
+        assert_eq!(missing_usage_text("...", None, LanguageId::English), "...");
+        assert_eq!(
+            missing_usage_text("...", Some(PollError::RateLimited), LanguageId::English),
+            "429"
+        );
+        assert_eq!(
+            missing_usage_text(
+                "!88% 1h04m",
+                Some(PollError::AuthRequired),
+                LanguageId::English
+            ),
+            "!"
+        );
+        assert_eq!(
+            missing_usage_text("88% 1h04m", None, LanguageId::English),
+            "!"
+        );
     }
 
     #[test]
@@ -6668,11 +6536,11 @@ mod tests {
     }
 
     #[test]
-    fn cached_poll_metadata_releases_state_before_layout() {
-        update_cached_poll_metadata();
+    fn poll_timer_rearm_releases_state_before_layout() {
+        rearm_poll_timer(HWND::default());
         assert!(
             STATE.try_lock().is_ok(),
-            "cached retry must release STATE before sizing"
+            "timer re-arm must release STATE before sizing"
         );
         let _ = total_widget_width();
     }
@@ -6723,18 +6591,7 @@ mod tests {
                     active: Some(true),
                 });
             }
-            let mut next = AppUsageData {
-                codex: Some(fresh),
-                ..Default::default()
-            };
-            assert!(!merge_transient_cached_provider_data(
-                &mut next,
-                Some(&data),
-                None,
-                None,
-                None
-            ));
-            data = next;
+            merge_provider_result(&mut data, CODEX, Some(fresh), false);
             assert_eq!(
                 codex_extra_usage_display(true, CreditDisplayMode::Always, Some(&data)),
                 Some(if present {
@@ -7355,29 +7212,43 @@ mod tests {
     }
 
     #[test]
-    fn transient_retry_wait_is_never_shorter_than_current_poll_cadence() {
-        assert_eq!(transient_retry_delay_ms(1, POLL_5_MIN), POLL_5_MIN);
-        assert_eq!(transient_retry_delay_ms(2, POLL_5_MIN), POLL_5_MIN);
-        assert_eq!(transient_retry_delay_ms(4, POLL_5_MIN), POLL_5_MIN);
-        assert_eq!(transient_retry_delay_ms(5, POLL_5_MIN), 8 * 60_000);
-        assert_eq!(transient_retry_delay_ms(10, POLL_5_MIN), RETRY_MAX_MS);
-        assert_eq!(transient_retry_delay_ms(1, POLL_1_HOUR), POLL_1_HOUR);
-    }
+    fn frequency_change_refreshes_idle_providers_and_preserves_each_recovery() {
+        use provider_schedule::{Outcome, ProviderSchedule};
+        let enabled = [true, true, false];
+        let now = Instant::now();
+        let mut schedule = ProviderSchedule::default();
+        schedule.begin(
+            now,
+            poll_request(PollTrigger::Scheduled, enabled, [false; 3], false),
+        );
+        schedule.finish(
+            CLAUDE,
+            now,
+            Outcome::Transient {
+                server_delay_ms: None,
+            },
+            provider_schedule::CLAUDE_MIN_POLL_MS,
+        );
+        schedule.finish(CODEX, now, Outcome::Success, POLL_5_MIN);
 
-    #[test]
-    fn frequency_change_refreshes_immediately_except_during_active_recovery() {
-        assert!(!frequency_change_must_preserve_recovery_deadline(
-            0, false, false
-        ));
-        assert!(frequency_change_must_preserve_recovery_deadline(
-            1, false, false
-        ));
-        assert!(frequency_change_must_preserve_recovery_deadline(
-            0, true, false
-        ));
-        assert!(frequency_change_must_preserve_recovery_deadline(
-            0, false, true
-        ));
+        // Claude keeps its backoff; idle Codex refreshes immediately.
+        let soon = now + Duration::from_secs(5);
+        let request = poll_request(PollTrigger::Reconfigure, enabled, [false; 3], false);
+        assert_eq!(schedule.begin(soon, request), [false, true, false]);
+
+        // Codex auth recovery keeps its own retry ladder across a frequency change.
+        let request = poll_request(PollTrigger::Reconfigure, enabled, [false; 3], true);
+        assert!(!request.providers[CODEX]);
+        assert!(poll_request(PollTrigger::Scheduled, enabled, [false; 3], true).providers[CODEX]);
+        assert!(
+            poll_request(
+                PollTrigger::CodexCredentialChange,
+                enabled,
+                [false; 3],
+                true
+            )
+            .providers[CODEX]
+        );
     }
 
     #[test]
@@ -8004,28 +7875,28 @@ mod tests {
             },
             ..Default::default()
         });
-        let mut current = AppUsageData {
-            claude_code: previous.claude_code.clone(),
-            ..AppUsageData::default()
-        };
-        assert!(merge_transient_cached_provider_data(
-            &mut current,
-            Some(&previous),
-            None,
-            Some(poller::PollError::ServerError),
-            Some(poller::PollError::NetworkUnavailable),
-        ));
+        // A same-credential Codex failure keeps Codex's cache and never touches Claude.
+        let mut current = previous.clone();
+        merge_provider_result(&mut current, CODEX, None, false);
         assert_eq!(current.codex.as_ref().unwrap().session.percentage, 26.0);
+        assert_eq!(
+            current.claude_code.as_ref().unwrap().session.percentage,
+            20.0
+        );
         assert!(current.antigravity.is_none());
 
+        // A Claude success replaces only Claude.
+        let mut claude = previous.claude_code.clone().unwrap();
+        claude.session.percentage = 33.0;
+        merge_provider_result(&mut current, CLAUDE, Some(claude), false);
+        assert_eq!(
+            current.claude_code.as_ref().unwrap().session.percentage,
+            33.0
+        );
+        assert_eq!(current.codex.as_ref().unwrap().session.percentage, 26.0);
+
         let mut no_cache = AppUsageData::default();
-        assert!(!merge_transient_cached_provider_data(
-            &mut no_cache,
-            None,
-            None,
-            Some(poller::PollError::ServerError),
-            None,
-        ));
+        merge_provider_result(&mut no_cache, CODEX, None, false);
         assert!(no_cache.codex.is_none());
     }
 
