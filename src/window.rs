@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -25,11 +25,12 @@ use crate::localization::{self, LanguageId, Strings};
 use crate::models::{AppUsageData, CreditBalance};
 use crate::native_interop::{
     self, Color, TIMER_COUNTDOWN, TIMER_CREDENTIAL_WATCH, TIMER_LAYOUT_RECONCILE, TIMER_POLL,
-    TIMER_RESET_POLL, TIMER_UPDATE_CHECK, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
+    TIMER_RESET_POLL, TIMER_RESUME_RECOVERY, TIMER_UPDATE_CHECK, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
 };
 use crate::poller;
 use crate::provider_schedule::{self, CLAUDE, CODEX};
 use crate::quota_cache;
+use crate::recovery_events;
 use crate::taskbar_layout::{self, LayoutAction, LayoutEventGate};
 use crate::theme;
 use crate::tray_icon;
@@ -96,6 +97,7 @@ struct AppState {
     credit_value_mode: CreditValueMode,
     codex_credit_text: String,
     bar_color: Option<String>,
+    appearance: Appearance,
     alert_thresholds_percent: Vec<u8>,
     notified_quota_windows: BTreeSet<String>,
 
@@ -107,6 +109,11 @@ struct AppState {
     /// Last snapshot written to (or restored from) disk, to limit rewrites.
     persisted: [Option<quota_cache::Snapshot>; 3],
     claude_desktop_sign_in: bool,
+    recovery_gate: recovery_events::RecoveryGate,
+    recovery_watch: Option<recovery_events::Watch>,
+    /// Text cells from the last paint, for the reset-time popup.
+    hover_regions: Vec<HoverRegion>,
+    hovered_region: Option<usize>,
 
     poll_interval_ms: u32,
     adaptive_polling: bool,
@@ -119,6 +126,8 @@ struct AppState {
     last_update_check_unix: Option<u64>,
 
     taskbar_index: usize,
+    /// Display device of the preferred taskbar; see `SettingsFile::monitor_device`.
+    monitor_device: Option<String>,
     tray_offset: i32,
     manual_position: bool,
     dragging: bool,
@@ -199,11 +208,32 @@ const IDM_CREDIT_VALUE_CREDITS: u16 = 91;
 const IDM_CREDIT_VALUE_USD: u16 = 92;
 const IDM_ENABLE_CODEX_MCP: u16 = 93;
 const IDM_OPEN_LOG_FILE: u16 = 94;
+// Appearance (upstream #7 layout) and colours (this fork).
+const IDM_APPEARANCE_RECOMMENDED: u16 = 100;
+const IDM_APPEARANCE_RESET: u16 = 101;
+const IDM_PALETTE_SYSTEM: u16 = 102;
+const IDM_PALETTE_DARK: u16 = 103;
+const IDM_PALETTE_LIGHT: u16 = 104;
+const IDM_BAR_CONTINUOUS: u16 = 105;
+const IDM_BAR_SEGMENTED: u16 = 106;
+const IDM_BAR_STANDARD: u16 = 107;
+const IDM_BAR_SLIM: u16 = 108;
+const IDM_FONT_STANDARD: u16 = 109;
+const IDM_FONT_LARGE: u16 = 110;
+const IDM_COLORS_DEFAULT: u16 = 111;
+const IDM_COLOR_CLAUDE: u16 = 112;
+const IDM_COLOR_CODEX: u16 = 113;
+const IDM_COLOR_ANTIGRAVITY: u16 = 114;
+const IDM_CLAUDE_DESKTOP_SIGN_IN: u16 = 115;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
+/// `WM_MOUSELEAVE`, requested with `TrackMouseEvent` for the hover popup.
+const WM_MOUSELEAVE_MSG: u32 = 0x02A3;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
 /// Posted by provider workers so the UI thread re-arms TIMER_POLL.
 const WM_APP_REARM_POLL: u32 = WM_APP + 4;
+/// From the watchdog: the preferred taskbar is present but not in use.
+const WM_APP_TASKBARS_CHANGED: u32 = WM_APP + 6;
 const TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS: u64 = 750;
 
 /// How often the watchdog thread polls for an explorer.exe restart (which
@@ -336,6 +366,27 @@ fn spawn_taskbar_watchdog() {
                 old.0, new.0
             ));
             relaunch_self();
+        } else if widget_alive {
+            // Our taskbar still exists, but the preferred one may have come
+            // back (display reconnected) while we stood in on another.
+            let (hwnd, device, legacy_index) = {
+                let state = lock_state();
+                let Some(s) = state.as_ref() else {
+                    continue;
+                };
+                (s.hwnd, s.monitor_device.clone(), s.taskbar_index)
+            };
+            let (index, preferred) = preferred_taskbar(&taskbars, device.as_deref(), legacy_index);
+            if preferred && taskbars[index].hwnd != old {
+                unsafe {
+                    let _ = PostMessageW(
+                        hwnd.to_hwnd(),
+                        WM_APP_TASKBARS_CHANGED,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
+            }
         }
     });
 }
@@ -416,6 +467,10 @@ struct SettingsFile {
     manual_position: Option<bool>,
     #[serde(default)]
     taskbar_index: usize,
+    /// Display device of the chosen taskbar (`\\.\DISPLAYn`); preferred over
+    /// `taskbar_index`, which can change when taskbars enumerate differently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    monitor_device: Option<String>,
     #[serde(default = "default_poll_interval")]
     poll_interval_ms: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -451,6 +506,8 @@ struct SettingsFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     bar_color: Option<String>,
     #[serde(default)]
+    appearance: Appearance,
+    #[serde(default)]
     alert_threshold_percent: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     alert_thresholds_percent: Option<Vec<u8>>,
@@ -459,13 +516,15 @@ struct SettingsFile {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     notified_quota_windows: Vec<String>,
     /// Read-only fallback to the Claude Desktop app's own sign-in when the
-    /// Claude Code CLI sign-in has expired. Settings-file only.
+    /// Claude Code CLI sign-in has expired. Opt-in (Settings menu).
     #[serde(default = "default_claude_desktop_sign_in")]
     use_claude_desktop_sign_in: bool,
 }
 
+/// Off unless chosen: new installations never read Claude Desktop's credential
+/// store without an explicit opt-in. An explicitly saved `true` is kept.
 fn default_claude_desktop_sign_in() -> bool {
-    true
+    false
 }
 
 impl Default for SettingsFile {
@@ -474,6 +533,7 @@ impl Default for SettingsFile {
             tray_offset: 0,
             manual_position: None,
             taskbar_index: 0,
+            monitor_device: None,
             poll_interval_ms: default_poll_interval(),
             language: None,
             last_update_check_unix: None,
@@ -491,6 +551,7 @@ impl Default for SettingsFile {
             credit_position: default_credit_position(),
             credit_value_mode: default_credit_value_mode(),
             bar_color: None,
+            appearance: Appearance::default(),
             alert_threshold_percent: 0,
             alert_thresholds_percent: None,
             adaptive_polling: false,
@@ -524,6 +585,277 @@ fn default_credit_position() -> String {
 
 fn default_credit_value_mode() -> String {
     "credits".to_string()
+}
+
+// Appearance model from upstream PR #7 (upstream-ray, merged in v1.10.0):
+// palette, bar style, bar thickness and text size, saved under `appearance`.
+// Provider colours are this fork's addition. Colour precedence, highest first:
+//   1. `appearance.provider_colors.<provider>`: an explicit per-provider colour;
+//   2. top-level `bar_color`: the older one-colour-for-all-bars choice, a hex
+//      value or `windows-accent` (kept where Builds <=12 read it);
+//   3. the factory provider accent (upstream's Claude orange, Codex green,
+//      Antigravity blue).
+// Palettes never override an explicit colour; "Restore default colours"
+// clears 1 and 2.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Palette {
+    #[default]
+    System,
+    HighContrastDark,
+    HighContrastLight,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BarStyle {
+    #[default]
+    Continuous,
+    Segmented,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BarThickness {
+    #[default]
+    Standard,
+    Slim,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FontSize {
+    #[default]
+    Standard,
+    Large,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+struct ProviderColors {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claude: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    codex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    antigravity: Option<String>,
+}
+
+impl ProviderColors {
+    fn get(&self, provider: crate::provider_icons::Provider) -> Option<&str> {
+        use crate::provider_icons::Provider;
+        match provider {
+            Provider::Claude => self.claude.as_deref(),
+            Provider::Codex => self.codex.as_deref(),
+            Provider::Antigravity => self.antigravity.as_deref(),
+        }
+    }
+
+    fn set(&mut self, provider: crate::provider_icons::Provider, value: Option<String>) {
+        use crate::provider_icons::Provider;
+        *match provider {
+            Provider::Claude => &mut self.claude,
+            Provider::Codex => &mut self.codex,
+            Provider::Antigravity => &mut self.antigravity,
+        } = value;
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+struct Appearance {
+    palette: Palette,
+    bar_style: BarStyle,
+    bar_thickness: BarThickness,
+    font_size: FontSize,
+    #[serde(skip_serializing_if = "provider_colors_are_default")]
+    provider_colors: ProviderColors,
+}
+
+fn provider_colors_are_default(colors: &ProviderColors) -> bool {
+    *colors == ProviderColors::default()
+}
+
+/// Sentinel `bar_color` for "Windows accent for all bars". Builds <=12 fail to
+/// parse it as a hex colour and fall back to the accent, so it stays compatible.
+const BAR_COLOR_WINDOWS_ACCENT: &str = "windows-accent";
+
+impl Appearance {
+    /// Upstream's preset for translucent dark taskbars; colours are untouched.
+    fn with_translucent_dark_preset(&self) -> Self {
+        Self {
+            palette: Palette::HighContrastDark,
+            bar_style: BarStyle::Continuous,
+            bar_thickness: BarThickness::Slim,
+            font_size: FontSize::Large,
+            provider_colors: self.provider_colors.clone(),
+        }
+    }
+
+    fn is_translucent_dark_preset(&self) -> bool {
+        self.palette == Palette::HighContrastDark
+            && self.bar_style == BarStyle::Continuous
+            && self.bar_thickness == BarThickness::Slim
+            && self.font_size == FontSize::Large
+    }
+
+    /// Layout and palette back to factory; explicit colours are kept.
+    fn layout_reset(&self) -> Self {
+        Self {
+            provider_colors: self.provider_colors.clone(),
+            ..Self::default()
+        }
+    }
+
+    fn is_dark(&self, system_is_dark: bool) -> bool {
+        match self.palette {
+            Palette::System => system_is_dark,
+            Palette::HighContrastDark => true,
+            Palette::HighContrastLight => false,
+        }
+    }
+
+    fn high_contrast(&self) -> bool {
+        self.palette != Palette::System
+    }
+
+    fn font_px(&self) -> i32 {
+        match self.font_size {
+            FontSize::Standard => 12,
+            FontSize::Large => 13,
+        }
+    }
+
+    fn font_weight(&self) -> i32 {
+        if self.high_contrast() {
+            FW_BOLD.0 as i32
+        } else {
+            FW_SEMIBOLD.0 as i32
+        }
+    }
+
+    /// Physical row height; larger text needs one more pixel.
+    fn row_height(&self) -> i32 {
+        sc(match self.font_size {
+            FontSize::Standard => SEGMENT_H,
+            FontSize::Large => SEGMENT_H + 1,
+        })
+    }
+
+    fn bar_height(&self) -> i32 {
+        sc(match self.bar_thickness {
+            BarThickness::Standard => SEGMENT_H,
+            BarThickness::Slim => 8,
+        })
+    }
+}
+
+/// Palette background key, label text and bar track colours (upstream #7).
+/// The key is drawn and then made transparent (System) or kept as a solid,
+/// legible backdrop (high contrast).
+fn appearance_colors(appearance: &Appearance, system_is_dark: bool) -> (Color, Color, Color) {
+    match appearance.palette {
+        Palette::System if system_is_dark => (
+            Color::from_hex("#1C1C1C"),
+            Color::from_hex("#888888"),
+            Color::from_hex("#444444"),
+        ),
+        Palette::System => (
+            Color::from_hex("#F3F3F3"),
+            Color::from_hex("#404040"),
+            Color::from_hex("#AAAAAA"),
+        ),
+        Palette::HighContrastDark => (
+            Color::from_hex("#1C1C1C"),
+            Color::from_hex("#FFFFFF"),
+            Color::from_hex("#30343B"),
+        ),
+        Palette::HighContrastLight => (
+            Color::from_hex("#F3F3F3"),
+            Color::from_hex("#101820"),
+            Color::from_hex("#A0A8B2"),
+        ),
+    }
+}
+
+/// Countdowns stay quieter than percentages (upstream #7).
+fn reset_text_color(appearance: &Appearance, is_dark: bool) -> Color {
+    Color::from_hex(match appearance.palette {
+        Palette::System if is_dark => "#B5B5B5",
+        Palette::System => "#666666",
+        Palette::HighContrastDark => "#D8D8D8",
+        Palette::HighContrastLight => "#38424C",
+    })
+}
+
+/// Factory bar accent for a provider (upstream defaults).
+fn factory_accent(provider: crate::provider_icons::Provider, is_dark: bool) -> Color {
+    use crate::provider_icons::Provider;
+    match provider {
+        Provider::Claude => Color::from_hex("#D97757"),
+        Provider::Codex => Color::from_hex(if is_dark { "#34D399" } else { "#0F8F70" }),
+        Provider::Antigravity => Color::from_hex("#4285F4"),
+    }
+}
+
+/// An explicitly chosen bar colour for `provider`, by precedence 1 and 2.
+fn explicit_bar_color(
+    appearance: &Appearance,
+    legacy_bar_color: Option<&str>,
+    provider: crate::provider_icons::Provider,
+) -> Option<Color> {
+    if let Some(color) = appearance
+        .provider_colors
+        .get(provider)
+        .and_then(parse_hex_color)
+    {
+        return Some(color);
+    }
+    match legacy_bar_color {
+        Some(BAR_COLOR_WINDOWS_ACCENT) => Some(native_interop::windows_accent_color()),
+        Some(value) => parse_hex_color(value),
+        None => None,
+    }
+}
+
+fn provider_bar_color(
+    appearance: &Appearance,
+    legacy_bar_color: Option<&str>,
+    provider: crate::provider_icons::Provider,
+    is_dark: bool,
+) -> Color {
+    explicit_bar_color(appearance, legacy_bar_color, provider)
+        .unwrap_or_else(|| factory_accent(provider, is_dark))
+}
+
+/// Percentage colour. High-contrast palettes use their text colour for
+/// legibility; otherwise an explicit per-provider colour, else the factory
+/// per-provider text colour (Codex always, Claude and Antigravity when more
+/// than one provider shares the widget, as upstream does).
+fn provider_value_color(
+    appearance: &Appearance,
+    provider: crate::provider_icons::Provider,
+    is_dark: bool,
+    label_color: &Color,
+    multiple_providers: bool,
+) -> Color {
+    use crate::provider_icons::Provider;
+    if appearance.high_contrast() {
+        return *label_color;
+    }
+    if let Some(color) = appearance
+        .provider_colors
+        .get(provider)
+        .and_then(parse_hex_color)
+    {
+        return color;
+    }
+    match provider {
+        Provider::Codex => factory_accent(Provider::Codex, is_dark),
+        Provider::Claude if multiple_providers => claude_usage_text_color(is_dark),
+        Provider::Antigravity if multiple_providers => antigravity_usage_text_color(is_dark),
+        _ => *label_color,
+    }
 }
 
 /// Presentation only: quota text and bars. Alerts, adaptive
@@ -674,6 +1006,16 @@ fn parse_hex_color(value: &str) -> Option<Color> {
 
 fn canonical_hex_color(color: Color) -> String {
     format!("#{:02X}{:02X}{:02X}", color.r, color.g, color.b)
+}
+
+/// A saved `bar_color`: a canonical hex colour, the Windows-accent sentinel,
+/// or nothing (factory provider colours).
+fn normalize_bar_color(value: Option<&str>) -> Option<String> {
+    match value {
+        Some(BAR_COLOR_WINDOWS_ACCENT) => Some(BAR_COLOR_WINDOWS_ACCENT.to_string()),
+        Some(value) => parse_hex_color(value).map(canonical_hex_color),
+        None => None,
+    }
 }
 
 fn default_widget_visible() -> bool {
@@ -838,11 +1180,23 @@ fn normalize_settings(mut settings: SettingsFile) -> SettingsFile {
     settings.credit_value_mode = CreditValueMode::from_setting(&settings.credit_value_mode)
         .as_setting()
         .to_string();
-    settings.bar_color = settings
-        .bar_color
-        .as_deref()
-        .and_then(parse_hex_color)
-        .map(canonical_hex_color);
+    settings.bar_color = normalize_bar_color(settings.bar_color.as_deref());
+    for provider in [
+        crate::provider_icons::Provider::Claude,
+        crate::provider_icons::Provider::Codex,
+        crate::provider_icons::Provider::Antigravity,
+    ] {
+        let normalized = settings
+            .appearance
+            .provider_colors
+            .get(provider)
+            .and_then(parse_hex_color)
+            .map(canonical_hex_color);
+        settings
+            .appearance
+            .provider_colors
+            .set(provider, normalized);
+    }
     settings.notified_quota_windows.sort();
     settings.notified_quota_windows.dedup();
     settings
@@ -865,6 +1219,7 @@ fn save_state_settings() {
             tray_offset: s.tray_offset,
             manual_position: Some(s.manual_position),
             taskbar_index: s.taskbar_index,
+            monitor_device: s.monitor_device.clone(),
             poll_interval_ms: s.poll_interval_ms,
             language: s
                 .language_override
@@ -884,6 +1239,7 @@ fn save_state_settings() {
             credit_position: s.credit_position.as_setting().to_string(),
             credit_value_mode: s.credit_value_mode.as_setting().to_string(),
             bar_color: s.bar_color.clone(),
+            appearance: s.appearance.clone(),
             alert_threshold_percent: s.alert_thresholds_percent.first().copied().unwrap_or(0),
             alert_thresholds_percent: Some(s.alert_thresholds_percent.clone()),
             adaptive_polling: s.adaptive_polling,
@@ -1110,7 +1466,8 @@ fn append_quota_alerts(
     window_label: &str,
     section: &crate::models::UsageSection,
 ) {
-    if thresholds.is_empty() {
+    // A window the provider did not report has no remaining quota to warn about.
+    if thresholds.is_empty() || !section.available {
         return;
     }
 
@@ -1386,12 +1743,105 @@ fn toggle_widget_visibility(hwnd: HWND) {
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             render_layered();
         } else {
+            dismiss_hover_popup();
             let _ = ShowWindow(hwnd, SW_HIDE);
         }
     }
 }
 
-fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
+/// The taskbar to use, and whether it is the preferred one. The preference is
+/// the saved display device, else (older settings) the saved index; when it
+/// is absent the primary taskbar stands in without replacing the preference.
+/// Device selection follows upstream main's `preferred_taskbar_index`
+/// (upstream-ray); keeping the preference across a temporary fallback
+/// follows SoKeiKei's PR #30.
+fn preferred_taskbar_device_index(
+    taskbars: &[(Option<String>, bool)],
+    monitor_device: Option<&str>,
+    legacy_index: usize,
+) -> (usize, bool) {
+    let primary = || {
+        taskbars
+            .iter()
+            .position(|(_, primary)| *primary)
+            .unwrap_or(0)
+    };
+    match monitor_device {
+        Some(device) => taskbars
+            .iter()
+            .position(|(name, _)| name.as_deref() == Some(device))
+            .map_or_else(|| (primary(), false), |index| (index, true)),
+        None if legacy_index < taskbars.len() => (legacy_index, true),
+        None => (primary(), false),
+    }
+}
+
+fn preferred_taskbar(
+    taskbars: &[native_interop::TaskbarWindow],
+    monitor_device: Option<&str>,
+    legacy_index: usize,
+) -> (usize, bool) {
+    let devices: Vec<_> = taskbars
+        .iter()
+        .map(|taskbar| {
+            (
+                native_interop::taskbar_monitor_device(taskbar),
+                taskbar.is_primary,
+            )
+        })
+        .collect();
+    preferred_taskbar_device_index(&devices, monitor_device, legacy_index)
+}
+
+/// Attach to the preferred taskbar (see `preferred_taskbar`).
+fn attach_to_preferred_taskbar(hwnd: HWND) -> bool {
+    let taskbars = native_interop::find_taskbars();
+    let (device, legacy_index) = {
+        let state = lock_state();
+        let Some(s) = state.as_ref() else {
+            return false;
+        };
+        (s.monitor_device.clone(), s.taskbar_index)
+    };
+    let (index, preferred) = preferred_taskbar(&taskbars, device.as_deref(), legacy_index);
+    if !preferred && !taskbars.is_empty() {
+        diagnose::log("preferred taskbar unavailable; using the primary taskbar until it returns");
+    }
+    attach_to_taskbar(hwnd, index, preferred)
+}
+
+/// Reattach when the preferred taskbar has (re)appeared and is not the one in
+/// use, e.g. after its display reconnects. Display broadcasts do not reliably
+/// reach an embedded child, so the watchdog also requests this.
+fn refresh_taskbar_selection(hwnd: HWND) -> bool {
+    let taskbars = native_interop::find_taskbars();
+    let (device, legacy_index, current, dragging) = {
+        let state = lock_state();
+        let Some(s) = state.as_ref() else {
+            return false;
+        };
+        (
+            s.monitor_device.clone(),
+            s.taskbar_index,
+            s.taskbar_hwnd,
+            s.dragging,
+        )
+    };
+    if taskbars.is_empty() || dragging {
+        return false;
+    }
+    let (index, preferred) = preferred_taskbar(&taskbars, device.as_deref(), legacy_index);
+    if !preferred || current == Some(taskbars[index].hwnd) {
+        return false;
+    }
+    diagnose::log("preferred taskbar available again; reattaching widget");
+    attach_to_taskbar(hwnd, index, true)
+}
+
+/// Attach to taskbar `requested_index`. `remember` records it as the
+/// preference (an explicit choice, or the preferred taskbar itself); a
+/// stand-in taskbar never replaces the saved preference.
+fn attach_to_taskbar(hwnd: HWND, requested_index: usize, remember: bool) -> bool {
     let taskbars = native_interop::find_taskbars();
     if taskbars.is_empty() {
         diagnose::log("taskbar not found; using fallback popup window");
@@ -1438,12 +1888,20 @@ fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
         diagnose::log("tray event hook could not be installed");
     }
 
+    let device = remember
+        .then(|| native_interop::taskbar_monitor_device(&taskbar))
+        .flatten();
     let mut state = lock_state();
     if let Some(s) = state.as_mut() {
         s.taskbar_hwnd = Some(taskbar.hwnd);
         s.tray_notify_hwnd = tray_notify;
         s.win_event_hook = hook;
-        s.taskbar_index = index;
+        if remember {
+            s.taskbar_index = index;
+            if device.is_some() {
+                s.monitor_device = device;
+            }
+        }
         s.embedded = true;
     }
     true
@@ -1500,8 +1958,8 @@ fn offset_for_drop_point(
     let tray_left = tray_left_for_taskbar(taskbar_hwnd, taskbar_rect);
     let width = total_widget_width();
     let offset = taskbar_layout::offset_for_left(tray_left, width, pt.x - drag_start_client_x);
-    taskbar_layout::compute_placement(taskbar_rect, tray_left, width, sc(WIDGET_HEIGHT), offset)
-        .offset
+    let height = widget_height_for(taskbar_rect);
+    taskbar_layout::compute_placement(taskbar_rect, tray_left, width, height, offset).offset
 }
 
 fn now_unix_secs() -> u64 {
@@ -1677,8 +2135,10 @@ fn refresh_usage_texts(state: &mut AppState) {
     }
 }
 
-/// Bar values follow the shown data; a window whose reset passed after the
-/// observation is unknown (NaN draws an empty track in either direction).
+/// Bar values follow the shown data. A window the provider did not report,
+/// or whose reset passed after the observation, is unknown: NaN draws an
+/// empty track in either direction and the text shows `--`, never a 0%-used
+/// (or 100%-remaining) value the provider did not send.
 fn sync_provider_percents(state: &mut AppState, now: SystemTime) {
     for id in 0..provider_schedule::PROVIDERS {
         let updated = state.provider_health[id].updated_at();
@@ -1688,7 +2148,13 @@ fn sync_provider_percents(state: &mut AppState, now: SystemTime) {
             .and_then(|data| provider_usage(data, id))
             .map(|usage| {
                 [&usage.session, &usage.weekly].map(|section| {
-                    if crate::provider_health::window_reset_since(section.resets_at, updated, now) {
+                    if !section.available
+                        || crate::provider_health::window_reset_since(
+                            section.resets_at,
+                            updated,
+                            now,
+                        )
+                    {
                         f64::NAN
                     } else {
                         section.percentage
@@ -2034,15 +2500,92 @@ const STARTUP_REGISTRY_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\
 const STARTUP_REGISTRY_KEY: &str = "CodexUsage";
 const LEGACY_STARTUP_REGISTRY_KEY: &str = "ClaudeCodeUsageMonitor";
 
-/// Returns true only if the startup registry value points to this executable.
+/// The stable per-user installation used by `scripts\install.ps1`. Startup
+/// registers this path whenever it exists, so Windows keeps launching the
+/// installed copy across in-place updates instead of whichever development
+/// build last toggled "Start with Windows".
+fn installed_exe_path() -> Option<PathBuf> {
+    let local = std::env::var_os("LOCALAPPDATA")?;
+    Some(
+        PathBuf::from(local)
+            .join("Programs")
+            .join("CodexUsage")
+            .join("codex-usage.exe"),
+    )
+}
+
+/// The executable a Run value launches: the quoted or unquoted path, without
+/// arguments.
+fn startup_value_path(value: &str) -> &str {
+    let value = value.trim();
+    match value.strip_prefix('"') {
+        Some(rest) => rest.split('"').next().unwrap_or(rest),
+        None => value,
+    }
+}
+
+fn same_path(a: &str, b: &str) -> bool {
+    a.trim_end_matches('\\')
+        .eq_ignore_ascii_case(b.trim_end_matches('\\'))
+}
+
+/// What "Start with Windows" should launch: the installed copy when present,
+/// otherwise this executable.
+fn startup_target(installed: Option<&str>, current: &str) -> String {
+    installed.unwrap_or(current).to_string()
+}
+
+/// The Run value for `path`, quoted because paths may contain spaces.
+fn startup_command(path: &str) -> String {
+    format!("\"{path}\"")
+}
+
+fn installed_exe_string() -> Option<String> {
+    installed_exe_path()
+        .filter(|path| path.is_file())
+        .map(|path| path.display().to_string())
+}
+
+/// On when the Run value launches this executable or the installed copy.
 fn is_startup_enabled() -> bool {
     let Some(reg_value) = read_startup_value(STARTUP_REGISTRY_KEY) else {
         return false;
     };
-    let Some(current_exe) = current_exe_path_string() else {
+    let registered = startup_value_path(&reg_value);
+    current_exe_path_string().is_some_and(|current| same_path(registered, &current))
+        || installed_exe_string().is_some_and(|installed| same_path(registered, &installed))
+}
+
+/// Whether an existing Run value should be pointed at the installed copy: only
+/// when this process *is* the installed copy and the value launches some other
+/// `codex-usage.exe` (a stale development build or old location) or is
+/// unquoted. Values for other programs are never touched.
+fn startup_repair_needed(registered_value: &str, current: &str, installed: &str) -> bool {
+    if !same_path(current, installed) {
         return false;
+    }
+    let registered = startup_value_path(registered_value);
+    let ours = registered
+        .rsplit(['\\', '/'])
+        .next()
+        .is_some_and(|name| name.eq_ignore_ascii_case("codex-usage.exe"));
+    ours && (!same_path(registered, installed) || !registered_value.trim().starts_with('"'))
+}
+
+/// Run by the installed copy at startup: repairs a Run value left pointing at
+/// another of our executables (the cause of an old build launching at sign-in).
+fn repair_startup_registration() {
+    let (Some(value), Some(current), Some(installed)) = (
+        read_startup_value(STARTUP_REGISTRY_KEY),
+        current_exe_path_string(),
+        installed_exe_string(),
+    ) else {
+        return;
     };
-    reg_value.eq_ignore_ascii_case(&current_exe)
+    if startup_repair_needed(&value, &current, &installed) {
+        set_startup_enabled(true);
+        diagnose::log("startup registration repaired to launch the installed copy");
+    }
 }
 
 fn current_exe_path_string() -> Option<String> {
@@ -2171,19 +2714,18 @@ fn set_startup_enabled(enable: bool) {
         let key_name = native_interop::wide_str(STARTUP_REGISTRY_KEY);
 
         if enable {
-            let mut exe_buf = [0u16; 260];
-            let len = GetModuleFileNameW(None, &mut exe_buf) as usize;
-            if len > 0 {
-                // Write the wide string including null terminator
-                let byte_len = ((len + 1) * 2) as u32;
+            if let Some(current) = current_exe_path_string() {
+                let target = startup_target(installed_exe_string().as_deref(), &current);
+                // Quoted wide string including the null terminator.
+                let command = native_interop::wide_str(&startup_command(&target));
                 let _ = RegSetValueExW(
                     hkey,
                     PCWSTR::from_raw(key_name.as_ptr()),
                     0,
                     REG_SZ,
                     Some(std::slice::from_raw_parts(
-                        exe_buf.as_ptr() as *const u8,
-                        byte_len as usize,
+                        command.as_ptr() as *const u8,
+                        command.len() * 2,
                     )),
                 );
             }
@@ -2217,6 +2759,27 @@ const CREDIT_TEXT_FALLBACK_WIDTH: i32 = 60;
 const CREDIT_VERTICAL_GAP: i32 = 2;
 const WIDGET_HEIGHT: i32 = 46;
 
+/// Physical height of the taskbar the widget is placed on, 0 until placed.
+static TASKBAR_HEIGHT_PX: AtomicI32 = AtomicI32::new(0);
+
+/// The widget fits its taskbar: 46 logical pixels, or less on a shorter
+/// taskbar so rows are never clipped (upstream #7 height fitting).
+fn widget_height_for(taskbar_rect: RECT) -> i32 {
+    let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
+    if taskbar_height > 0 {
+        sc(WIDGET_HEIGHT).min(taskbar_height)
+    } else {
+        sc(WIDGET_HEIGHT)
+    }
+}
+
+fn current_widget_height() -> i32 {
+    match TASKBAR_HEIGHT_PX.load(Ordering::Relaxed) {
+        0 => sc(WIDGET_HEIGHT),
+        height => sc(WIDGET_HEIGHT).min(height),
+    }
+}
+
 fn drag_handle_reserved_width(show_drag_handle: bool) -> i32 {
     if show_drag_handle {
         sc(DRAG_HANDLE_HIT_W)
@@ -2230,7 +2793,7 @@ fn is_drag_handle_point(show_drag_handle: bool, client_x: i32, client_y: i32) ->
         return false;
     }
     let divider_h = sc(25);
-    let divider_top = (sc(WIDGET_HEIGHT) - divider_h) / 2;
+    let divider_top = (current_widget_height() - divider_h) / 2;
     client_x >= 0
         && client_x < sc(DRAG_HANDLE_HIT_W)
         && client_y >= divider_top
@@ -2270,23 +2833,7 @@ fn measure_text_width(text: &str) -> Option<i32> {
             return None;
         }
 
-        let font_name = native_interop::wide_str("Segoe UI");
-        let font = CreateFontW(
-            sc(-12),
-            0,
-            0,
-            0,
-            FW_MEDIUM.0 as i32,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET.0 as u32,
-            OUT_TT_PRECIS.0 as u32,
-            CLIP_DEFAULT_PRECIS.0 as u32,
-            CLEARTYPE_QUALITY.0 as u32,
-            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
-            PCWSTR::from_raw(font_name.as_ptr()),
-        );
+        let font = create_widget_font();
         if font.is_invalid() {
             ReleaseDC(HWND::default(), hdc);
             return None;
@@ -2303,6 +2850,40 @@ fn measure_text_width(text: &str) -> Option<i32> {
         measured
             .then(|| logical_width_from_physical(size.cx, CURRENT_DPI.load(Ordering::Relaxed)))?
     }
+}
+
+/// Widget font size and weight from the current appearance, packed as
+/// `px << 16 | weight`; measurement and drawing both read it so widths match.
+static WIDGET_FONT_SPEC: AtomicU32 = AtomicU32::new((12 << 16) | 600);
+
+fn set_widget_font(appearance: &Appearance) {
+    WIDGET_FONT_SPEC.store(
+        ((appearance.font_px() as u32) << 16) | appearance.font_weight() as u32,
+        Ordering::Relaxed,
+    );
+}
+
+/// The widget font: Segoe UI at the appearance's size and weight (upstream
+/// #7 uses semibold, bold in high contrast). Caller deletes it.
+unsafe fn create_widget_font() -> HFONT {
+    let spec = WIDGET_FONT_SPEC.load(Ordering::Relaxed);
+    let font_name = native_interop::wide_str("Segoe UI");
+    CreateFontW(
+        -sc((spec >> 16) as i32),
+        0,
+        0,
+        0,
+        (spec & 0xFFFF) as i32,
+        0,
+        0,
+        0,
+        DEFAULT_CHARSET.0 as u32,
+        OUT_TT_PRECIS.0 as u32,
+        CLIP_DEFAULT_PRECIS.0 as u32,
+        CLEARTYPE_QUALITY.0 as u32,
+        (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+        PCWSTR::from_raw(font_name.as_ptr()),
+    )
 }
 
 fn logical_width_from_physical(physical_width: i32, dpi: u32) -> Option<i32> {
@@ -2329,6 +2910,24 @@ fn quota_text_width_fallback(language: LanguageId) -> i32 {
     }
 }
 
+/// Gap between the percentage column and its countdown, logical pixels.
+const QUOTA_COLUMN_GAP: i32 = 4;
+
+/// Width of the right-aligned percentage column (e.g. `!100%`), logical.
+fn quota_percent_column_width(texts: &[&str]) -> i32 {
+    let widest_digit = widest_measured_quota_digit();
+    let values: Vec<String> = texts
+        .iter()
+        .filter(|text| !quota_text_parts(text).1.is_empty())
+        .map(|text| {
+            let value = normalize_quota_text_shape(quota_text_parts(text).0, Some(widest_digit));
+            format!("!{}", value.trim_start_matches('!'))
+        })
+        .collect();
+    let refs: Vec<&str> = values.iter().map(String::as_str).collect();
+    measured_column_width(&refs, 0)
+}
+
 fn quota_text_width_for(language: LanguageId, texts: &[&str]) -> i32 {
     let widest_digit = texts
         .iter()
@@ -2346,7 +2945,20 @@ fn quota_text_width_for(language: LanguageId, texts: &[&str]) -> i32 {
         })
         .collect();
     let stable_shape_refs: Vec<&str> = stable_shapes.iter().map(String::as_str).collect();
-    measured_column_width(&stable_shape_refs, quota_text_width_fallback(language)) + 1
+    let whole = measured_column_width(&stable_shape_refs, quota_text_width_fallback(language));
+    // Column layout: percentage column, gap, widest countdown.
+    let resets: Vec<String> = texts
+        .iter()
+        .map(|text| normalize_quota_text_shape(quota_text_parts(text).1, widest_digit))
+        .filter(|reset| !reset.is_empty())
+        .collect();
+    let columns = if resets.is_empty() {
+        0
+    } else {
+        let refs: Vec<&str> = resets.iter().map(String::as_str).collect();
+        quota_percent_column_width(texts) + QUOTA_COLUMN_GAP + measured_column_width(&refs, 0)
+    };
+    whole.max(columns) + 1
 }
 
 fn widest_measured_quota_digit() -> char {
@@ -2446,9 +3058,7 @@ fn credit_panel_y_positions(height: i32) -> (i32, i32) {
 fn quota_area_width_for(active_models: i32, language: LanguageId, text_width: i32) -> i32 {
     let bar_segments = row_bar_segment_count(active_models);
     let label_width = usage_label_width(language);
-    let model_width = (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * bar_segments - sc(SEGMENT_GAP)
-        + sc(HORIZONTAL_GUTTER)
-        + sc(text_width);
+    let model_width = model_usage_width(bar_segments, text_width);
 
     sc(label_width)
         + sc(HORIZONTAL_GUTTER)
@@ -2720,10 +3330,97 @@ fn adaptive_poll_interval(data: Option<&AppUsageData>) -> u32 {
     }
 }
 
-fn selected_bar_color(setting: Option<&str>) -> Color {
-    setting
-        .and_then(parse_hex_color)
-        .unwrap_or_else(native_interop::windows_accent_color)
+/// Explain the Claude Desktop sign-in before it is enabled; returns consent.
+fn confirm_claude_desktop_sign_in(hwnd: HWND, language: LanguageId) -> bool {
+    let (title, body) = if language == LanguageId::SimplifiedChinese {
+        (
+            "使用 Claude 桌面版登录",
+            "当 Claude Code CLI 登录过期时，Codex Usage 可以改用 Claude 桌面应用自己的登录来读取用量。
+
+\n读取内容：使用当前 Windows 用户的 DPAPI 密钥，只读地解密 Claude 桌面版保存在本机的登录缓存，并只选用与 CLI 相同账号和组织的条目。
+
+\n发出的请求：每 2 分钟最多一次，只读 GET 请求 Anthropic 用量接口（与 Claude Code /usage 相同的数据）。不发送任何提示，不消耗模型用量。
+
+\n不会修改、刷新、轮换或保存任何凭据；令牌只在内存中使用，从不写入日志。
+
+\n随时可在“设置”菜单中关闭此选项。
+
+是否启用？",
+        )
+    } else {
+        (
+            "Use Claude Desktop sign-in",
+            "When the Claude Code CLI sign-in has expired, Codex Usage can read your usage with the Claude desktop app's own sign-in instead.
+
+\nWhat it accesses: Claude Desktop's local sign-in cache, decrypted read-only with the current Windows user's DPAPI key. Only an entry for the same account and organization as the CLI is used.
+
+\nWhat it sends: at most one read-only GET to Anthropic's usage endpoint every 2 minutes (the same data as Claude Code's /usage). No prompt is sent and no model usage is consumed.
+
+\nNothing is modified, refreshed, rotated or saved; the token stays in memory and is never logged.
+
+\nYou can turn this off at any time in the Settings menu.
+
+Enable it?",
+        )
+    };
+    let title = native_interop::wide_str(title);
+    let body = native_interop::wide_str(body);
+    unsafe {
+        MessageBoxW(
+            hwnd,
+            PCWSTR::from_raw(body.as_ptr()),
+            PCWSTR::from_raw(title.as_ptr()),
+            MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON2 | MB_SETFOREGROUND,
+        ) == IDYES
+    }
+}
+
+/// Apply an Appearance menu command. Layout commands never touch explicit
+/// colours; "Default provider colors" clears every explicit colour.
+fn apply_appearance_command(state: &mut AppState, id: u16) {
+    let appearance = &mut state.appearance;
+    match id {
+        IDM_APPEARANCE_RECOMMENDED => *appearance = appearance.with_translucent_dark_preset(),
+        IDM_APPEARANCE_RESET => *appearance = appearance.layout_reset(),
+        IDM_PALETTE_SYSTEM => appearance.palette = Palette::System,
+        IDM_PALETTE_DARK => appearance.palette = Palette::HighContrastDark,
+        IDM_PALETTE_LIGHT => appearance.palette = Palette::HighContrastLight,
+        IDM_BAR_CONTINUOUS => appearance.bar_style = BarStyle::Continuous,
+        IDM_BAR_SEGMENTED => appearance.bar_style = BarStyle::Segmented,
+        IDM_BAR_STANDARD => appearance.bar_thickness = BarThickness::Standard,
+        IDM_BAR_SLIM => appearance.bar_thickness = BarThickness::Slim,
+        IDM_FONT_STANDARD => appearance.font_size = FontSize::Standard,
+        IDM_FONT_LARGE => appearance.font_size = FontSize::Large,
+        IDM_COLORS_DEFAULT => {
+            appearance.provider_colors = ProviderColors::default();
+            state.bar_color = None;
+        }
+        IDM_BAR_COLOR_WINDOWS_ACCENT => {
+            appearance.provider_colors = ProviderColors::default();
+            state.bar_color = Some(BAR_COLOR_WINDOWS_ACCENT.to_string());
+        }
+        _ => {}
+    }
+}
+
+unsafe fn append_menu_choice(menu: HMENU, id: u16, checked: bool, label: &str) {
+    let label = native_interop::wide_str(label);
+    let flags = if checked {
+        MF_CHECKED
+    } else {
+        MENU_ITEM_FLAGS(0)
+    };
+    let _ = AppendMenuW(menu, flags, id as usize, PCWSTR::from_raw(label.as_ptr()));
+}
+
+unsafe fn append_submenu(parent: HMENU, child: HMENU, label: &str) {
+    let label = native_interop::wide_str(label);
+    let _ = AppendMenuW(
+        parent,
+        MF_POPUP,
+        child.0 as usize,
+        PCWSTR::from_raw(label.as_ptr()),
+    );
 }
 
 fn claude_usage_text_color(is_dark: bool) -> Color {
@@ -2731,14 +3428,6 @@ fn claude_usage_text_color(is_dark: bool) -> Color {
         Color::from_hex("#F09A7A")
     } else {
         Color::from_hex("#A94F32")
-    }
-}
-
-fn codex_usage_text_color(is_dark: bool) -> Color {
-    if is_dark {
-        Color::from_hex("#F5F5F5")
-    } else {
-        Color::from_hex("#1F1F1F")
     }
 }
 
@@ -2795,6 +3484,7 @@ pub fn run() {
     };
 
     migrate_legacy_startup_entry();
+    repair_startup_registration();
 
     let class_name = native_interop::wide_str("CodexUsage");
 
@@ -2823,6 +3513,7 @@ pub fn run() {
         let claude_code_available = poller::claude_code_credentials_available();
         let settings = load_settings(claude_code_available);
         poller::set_claude_desktop_sign_in(settings.use_claude_desktop_sign_in);
+        set_widget_font(&settings.appearance);
         diagnose::log(format!(
             "Claude Desktop sign-in fallback enabled={}",
             settings.use_claude_desktop_sign_in
@@ -2923,6 +3614,7 @@ pub fn run() {
                 enable_codex_mcp: settings.enable_codex_mcp,
                 usage_display,
                 bar_color: settings.bar_color.clone(),
+                appearance: settings.appearance.clone(),
                 credit_value_mode: CreditValueMode::from_setting(&settings.credit_value_mode),
                 alert_thresholds_percent: settings.alert_thresholds_percent.unwrap_or_default(),
                 notified_quota_windows: settings.notified_quota_windows.into_iter().collect(),
@@ -2932,6 +3624,10 @@ pub fn run() {
                 data_sources: Default::default(),
                 persisted: Default::default(),
                 claude_desktop_sign_in: settings.use_claude_desktop_sign_in,
+                recovery_gate: Default::default(),
+                recovery_watch: None,
+                hover_regions: Vec::new(),
+                hovered_region: None,
                 poll_interval_ms: settings.poll_interval_ms,
                 adaptive_polling: settings.adaptive_polling,
                 schedule: Default::default(),
@@ -2942,6 +3638,7 @@ pub fn run() {
                 update_status: UpdateStatus::Idle,
                 last_update_check_unix: settings.last_update_check_unix,
                 taskbar_index: settings.taskbar_index,
+                monitor_device: settings.monitor_device.clone(),
                 tray_offset: settings.tray_offset,
                 manual_position,
                 dragging: false,
@@ -2953,7 +3650,7 @@ pub fn run() {
         }
 
         // Try to embed in taskbar
-        if attach_to_taskbar(hwnd, settings.taskbar_index) {
+        if attach_to_preferred_taskbar(hwnd) {
             embedded = true;
         }
 
@@ -3008,6 +3705,12 @@ pub fn run() {
         // the taskbar, our embedded child window stops receiving all messages
         // (WM_TIMER included), so a timer would never fire again.
         spawn_taskbar_watchdog();
+
+        // Resume and network-return notifications post to this window.
+        let watch = recovery_events::Watch::register(hwnd);
+        if let Some(s) = lock_state().as_mut() {
+            s.recovery_watch = Some(watch);
+        }
 
         // Last known values first (marked stale), then the initial poll; each
         // provider then re-arms TIMER_POLL from its own deadline.
@@ -3076,6 +3779,7 @@ fn render_layered() {
         credit_value_mode,
         codex_credit_text,
         bar_color_setting,
+        appearance,
     ) = {
         let state = lock_state();
         match state.as_ref() {
@@ -3109,6 +3813,7 @@ fn render_layered() {
                 s.credit_value_mode,
                 s.codex_credit_text.clone(),
                 s.bar_color.clone(),
+                s.appearance.clone(),
             ),
             None => return,
         }
@@ -3160,24 +3865,10 @@ fn render_layered() {
         // its position untouched when the destination point is null.
         position_at_taskbar_with_width(width);
     }
-    let height = sc(WIDGET_HEIGHT);
+    let height = current_widget_height();
 
-    let bar_color = selected_bar_color(bar_color_setting.as_deref());
-    let track = if is_dark {
-        Color::from_hex("#444444")
-    } else {
-        Color::from_hex("#AAAAAA")
-    };
-    let text_color = if is_dark {
-        Color::from_hex("#888888")
-    } else {
-        Color::from_hex("#404040")
-    };
-    let bg_color = if is_dark {
-        Color::from_hex("#1C1C1C")
-    } else {
-        Color::from_hex("#F3F3F3")
-    };
+    let (bg_color, text_color, track) = appearance_colors(&appearance, is_dark);
+    let mut hover = Vec::new();
 
     unsafe {
         let screen_dc = GetDC(hwnd);
@@ -3219,7 +3910,8 @@ fn render_layered() {
             is_dark,
             &bg_color,
             &text_color,
-            &bar_color,
+            &appearance,
+            bar_color_setting.as_deref(),
             &track,
             language,
             strings,
@@ -3246,7 +3938,9 @@ fn render_layered() {
             credit_position,
             credit_value_mode,
             &codex_credit_text,
+            &mut hover,
         );
+        store_hover_regions(hover);
 
         // Background pixels → alpha 1 (nearly invisible but still hittable for right-click).
         // Content pixels → fully opaque (preserves ClearType sub-pixel rendering).
@@ -3255,7 +3949,13 @@ fn render_layered() {
         for px in pixel_data.iter_mut() {
             let rgb = *px & 0x00FFFFFF;
             if rgb == bg_bgr {
-                *px = 0x01000000;
+                // High-contrast palettes keep a solid backdrop so text stays
+                // legible over translucent taskbars (upstream #7).
+                *px = if appearance.high_contrast() {
+                    rgb | 0xFF000000
+                } else {
+                    0x01000000
+                };
             } else {
                 *px = rgb | 0xFF000000;
             }
@@ -3302,7 +4002,8 @@ fn paint_content(
     is_dark: bool,
     bg: &Color,
     text_color: &Color,
-    bar_color: &Color,
+    appearance: &Appearance,
+    legacy_bar_color: Option<&str>,
     track: &Color,
     language: LanguageId,
     strings: Strings,
@@ -3329,6 +4030,7 @@ fn paint_content(
     credit_position: CreditPosition,
     credit_value_mode: CreditValueMode,
     credit_text: &str,
+    hover: &mut Vec<HoverRegion>,
 ) {
     unsafe {
         let session_pct = usage_percent_for_display(directions.claude, session_pct);
@@ -3353,6 +4055,7 @@ fn paint_content(
             antigravity_weekly_text,
         );
         let (label_width, text_width) = usage_layout_widths(language, &quota_texts);
+        let percent_width = quota_percent_column_width(&quota_texts);
         let layout_credit_text = if credit_panel_visible {
             credit_text
         } else {
@@ -3418,30 +4121,20 @@ fn paint_content(
             layout_credit_text,
             text_width,
         );
-        let row2_y = height - sc(5) - sc(SEGMENT_H);
-        let row1_y = row2_y - sc(10) - sc(SEGMENT_H);
-        let single_row_y = (height - sc(SEGMENT_H)) / 2;
+        let row_height = appearance.row_height();
+        let row_gap = if height < sc(WIDGET_HEIGHT) {
+            sc(2)
+        } else {
+            sc(10)
+        };
+        let row1_y = (height - 2 * row_height - row_gap).max(0) / 2;
+        let row2_y = row1_y + row_height + row_gap;
+        let single_row_y = (height - row_height) / 2;
 
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
 
-        let font_name = native_interop::wide_str("Segoe UI");
-        let font = CreateFontW(
-            sc(-12),
-            0,
-            0,
-            0,
-            FW_MEDIUM.0 as i32,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET.0 as u32,
-            OUT_TT_PRECIS.0 as u32,
-            CLIP_DEFAULT_PRECIS.0 as u32,
-            CLEARTYPE_QUALITY.0 as u32,
-            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
-            PCWSTR::from_raw(font_name.as_ptr()),
-        );
+        let font = create_widget_font();
         let old_font = SelectObject(hdc, font);
 
         if let Some(credit_x) = credit_x {
@@ -3460,6 +4153,69 @@ fn paint_content(
             );
         }
 
+        // One provider mark per column, centred across the visible rows
+        // (upstream's layout), then each row's bars and text.
+        use crate::provider_icons::Provider;
+        let palette_dark = appearance.is_dark(is_dark);
+        let shown: Vec<Provider> = [
+            (Provider::Claude, show_claude_code),
+            (Provider::Codex, show_codex),
+            (Provider::Antigravity, show_antigravity),
+        ]
+        .into_iter()
+        .filter_map(|(provider, shown)| shown.then_some(provider))
+        .collect();
+        let segment_count = row_bar_segment_count(active_models);
+        let column_width = model_usage_width(segment_count, text_width) + sc(HORIZONTAL_GUTTER);
+        let icon_size = sc(crate::provider_icons::SIZE);
+        let icon_y = if show_session_window && show_weekly_window {
+            (row1_y + row2_y + row_height - icon_size) / 2
+        } else {
+            single_row_y + (row_height - icon_size) / 2
+        };
+        let mut icon_x = content_x + sc(label_width) + sc(HORIZONTAL_GUTTER);
+        for provider in &shown {
+            crate::provider_icons::draw(hdc, icon_x, icon_y, icon_size, *provider);
+            icon_x += column_width;
+        }
+        let cells_for = |session: bool| {
+            shown
+                .iter()
+                .map(|&provider| {
+                    let (percent, text) = match (provider, session) {
+                        (Provider::Claude, true) => (session_pct, session_text),
+                        (Provider::Claude, false) => (weekly_pct, weekly_text),
+                        (Provider::Codex, true) => (codex_session_pct, codex_session_text),
+                        (Provider::Codex, false) => (codex_weekly_pct, codex_weekly_text),
+                        (Provider::Antigravity, true) => {
+                            (antigravity_session_pct, antigravity_session_text)
+                        }
+                        (Provider::Antigravity, false) => {
+                            (antigravity_weekly_pct, antigravity_weekly_text)
+                        }
+                    };
+                    RowCell {
+                        provider,
+                        percent,
+                        text,
+                        accent: provider_bar_color(
+                            appearance,
+                            legacy_bar_color,
+                            provider,
+                            palette_dark,
+                        ),
+                        value_color: provider_value_color(
+                            appearance,
+                            provider,
+                            palette_dark,
+                            text_color,
+                            shown.len() > 1,
+                        ),
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+
         if show_session_window {
             draw_row(
                 hdc,
@@ -3469,22 +4225,17 @@ fn paint_content(
                 } else {
                     single_row_y
                 },
-                is_dark,
+                appearance,
+                palette_dark,
                 text_color,
                 strings.session_window,
-                session_pct,
-                session_text,
-                codex_session_pct,
-                codex_session_text,
-                antigravity_session_pct,
-                antigravity_session_text,
-                show_claude_code,
-                show_codex,
-                show_antigravity,
-                bar_color,
+                &cells_for(true),
+                poller::UsageWindowKind::Session,
                 track,
                 label_width,
                 text_width,
+                percent_width,
+                hover,
             );
         }
         if show_weekly_window {
@@ -3496,22 +4247,17 @@ fn paint_content(
                 } else {
                     single_row_y
                 },
-                is_dark,
+                appearance,
+                palette_dark,
                 text_color,
                 strings.weekly_window,
-                weekly_pct,
-                weekly_text,
-                codex_weekly_pct,
-                codex_weekly_text,
-                antigravity_weekly_pct,
-                antigravity_weekly_text,
-                show_claude_code,
-                show_codex,
-                show_antigravity,
-                bar_color,
+                &cells_for(false),
+                poller::UsageWindowKind::Weekly,
                 track,
                 label_width,
                 text_width,
+                percent_width,
+                hover,
             );
         }
 
@@ -3599,14 +4345,21 @@ enum PollTrigger {
     ResetBoundary,
     /// Codex credentials changed during auth recovery.
     CodexCredentialChange,
+    /// Shortly after the system resumed from sleep or hibernation.
+    Resume,
+    /// Internet access returned after being lost.
+    NetworkRestored,
 }
 
+/// `targeted` is the per-provider subset a trigger applies to: providers
+/// past a reset (ResetBoundary) or needing recovery (Resume, NetworkRestored).
 fn poll_request(
     trigger: PollTrigger,
     enabled: [bool; provider_schedule::PROVIDERS],
-    past_reset: [bool; provider_schedule::PROVIDERS],
+    targeted: [bool; provider_schedule::PROVIDERS],
     codex_auth_active: bool,
 ) -> provider_schedule::Request {
+    let past_reset = targeted;
     use provider_schedule::Request;
     // Codex auth recovery runs its own retry ladder; only a scheduled tick,
     // an explicit refresh or a credential change may start it early.
@@ -3639,7 +4392,36 @@ fn poll_request(
             ignore_backoff: true,
             ..Default::default()
         },
+        // Backoff accumulated while offline or asleep no longer applies, but
+        // Claude's request spacing, server Retry-After deadlines, in-flight
+        // requests and Codex's auth-recovery ladder still do.
+        PollTrigger::Resume | PollTrigger::NetworkRestored => Request {
+            providers: std::array::from_fn(|id| outside_codex_recovery[id] && targeted[id]),
+            ignore_due: true,
+            ignore_backoff: true,
+            ..Default::default()
+        },
     }
+}
+
+/// Providers a recovery refresh applies to: every enabled provider after a
+/// resume; after a network return, only those failing or stale (a provider
+/// that just succeeded is not refreshed again).
+fn recovery_targets(
+    state: &AppState,
+    trigger: PollTrigger,
+) -> [bool; provider_schedule::PROVIDERS] {
+    let now = SystemTime::now();
+    let base_interval = effective_poll_interval_ms(state);
+    std::array::from_fn(|id| match trigger {
+        PollTrigger::Resume => true,
+        PollTrigger::NetworkRestored => {
+            let interval = provider_schedule::provider_interval_ms(id, base_interval);
+            state.provider_health[id].error.is_some()
+                || state.provider_health[id].stale(now, interval)
+        }
+        _ => false,
+    })
 }
 
 fn enabled_providers(state: &AppState) -> [bool; provider_schedule::PROVIDERS] {
@@ -3659,8 +4441,11 @@ fn spawn_poll(send_hwnd: SendHwnd, trigger: PollTrigger) {
             return;
         };
         let enabled = enabled_providers(state);
-        let past_reset = reset_poll_pending(state, SystemTime::now());
-        let request = poll_request(trigger, enabled, past_reset, state.codex_auth.active);
+        let targeted = match trigger {
+            PollTrigger::Resume | PollTrigger::NetworkRestored => recovery_targets(state, trigger),
+            _ => reset_poll_pending(state, SystemTime::now()),
+        };
+        let request = poll_request(trigger, enabled, targeted, state.codex_auth.active);
         let started = state.schedule.begin(Instant::now(), request);
         if started.contains(&true) {
             diagnose::log(format!(
@@ -4414,7 +5199,8 @@ fn position_at_taskbar_with_width(widget_width: i32) -> Option<(RECT, RECT)> {
     let tray_left = tray_left_for_taskbar(taskbar_hwnd, taskbar_rect);
     let occupied = native_interop::visible_child_window_rects(taskbar_hwnd, Some(hwnd));
     let anchor = position_anchor_left(taskbar_rect, tray_left, &occupied, manual_position);
-    let widget_height = sc(WIDGET_HEIGHT);
+    let widget_height = widget_height_for(taskbar_rect);
+    TASKBAR_HEIGHT_PX.store(taskbar_rect.bottom - taskbar_rect.top, Ordering::Relaxed);
     // The saved offset stays the user's preference; only the applied offset
     // is clamped, so a temporarily narrower taskbar cannot erase it.
     let placement = taskbar_layout::compute_placement(
@@ -4447,6 +5233,7 @@ fn position_at_taskbar_with_width(widget_width: i32) -> Option<(RECT, RECT)> {
         ));
     } else {
         // Topmost popup: screen coordinates
+        dismiss_hover_popup();
         native_interop::move_window(hwnd, target.left, target.top, widget_width, widget_height);
         diagnose::log(format!(
             "positioned fallback widget at x={} y={} w={widget_width} h={widget_height} boundary={tray_left} offset={}",
@@ -4532,6 +5319,44 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
+        WM_POWERBROADCAST
+            if wparam.0 == PBT_APMRESUMEAUTOMATIC as usize
+                || wparam.0 == PBT_APMRESUMESUSPEND as usize =>
+        {
+            let arm = lock_state()
+                .as_mut()
+                .is_some_and(|s| s.recovery_gate.on_resume(Instant::now()));
+            if arm {
+                diagnose::log(format!(
+                    "system resumed: refreshing providers in {} ms unless the network returns first",
+                    recovery_events::RESUME_REFRESH_DELAY_MS
+                ));
+                SetTimer(
+                    hwnd,
+                    TIMER_RESUME_RECOVERY,
+                    recovery_events::RESUME_REFRESH_DELAY_MS,
+                    None,
+                );
+            }
+            LRESULT(1)
+        }
+        WM_APP_TASKBARS_CHANGED => {
+            if refresh_taskbar_selection(hwnd) {
+                position_at_taskbar();
+                render_layered();
+            }
+            LRESULT(0)
+        }
+        _ if msg == recovery_events::NETWORK_RESTORED => {
+            let accept = lock_state()
+                .as_mut()
+                .is_some_and(|s| s.recovery_gate.on_network_restored(Instant::now()));
+            if accept {
+                diagnose::log("network restored: refreshing failing or stale providers");
+                spawn_poll(SendHwnd::from_hwnd(hwnd), PollTrigger::NetworkRestored);
+            }
+            LRESULT(0)
+        }
         WM_DISPLAYCHANGE | WM_DPICHANGED_MSG | WM_SETTINGCHANGE => {
             if msg == WM_DPICHANGED_MSG {
                 let new_dpi = (wparam.0 & 0xFFFF) as u32;
@@ -4540,6 +5365,9 @@ unsafe extern "system" fn wnd_proc(
             if msg == WM_SETTINGCHANGE {
                 check_theme_change();
                 check_language_change();
+            }
+            if msg == WM_DISPLAYCHANGE {
+                refresh_taskbar_selection(hwnd);
             }
             refresh_dpi();
             position_at_taskbar();
@@ -4595,6 +5423,16 @@ unsafe extern "system" fn wnd_proc(
                     render_layered();
                     schedule_countdown_timer();
                 }
+                TIMER_RESUME_RECOVERY => {
+                    let _ = KillTimer(hwnd, TIMER_RESUME_RECOVERY);
+                    let run = lock_state()
+                        .as_mut()
+                        .is_some_and(|s| s.recovery_gate.on_resume_timer());
+                    if run {
+                        diagnose::log("resume refresh starting");
+                        spawn_poll(SendHwnd::from_hwnd(hwnd), PollTrigger::Resume);
+                    }
+                }
                 TIMER_RESET_POLL => {
                     // Only providers past their own reset and not backing off.
                     spawn_poll(SendHwnd::from_hwnd(hwnd), PollTrigger::ResetBoundary);
@@ -4644,7 +5482,12 @@ unsafe extern "system" fn wnd_proc(
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
+        _ if msg == WM_MOUSELEAVE_MSG => {
+            dismiss_hover_popup();
+            LRESULT(0)
+        }
         WM_LBUTTONDOWN => {
+            dismiss_hover_popup();
             let client_x = (lparam.0 & 0xFFFF) as i16 as i32;
             let client_y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             let show_drag_handle = {
@@ -4683,6 +5526,13 @@ unsafe extern "system" fn wnd_proc(
                 let state = lock_state();
                 state.as_ref().map(|s| s.dragging).unwrap_or(false)
             };
+            if !is_dragging {
+                let point = POINT {
+                    x: (lparam.0 & 0xFFFF) as u16 as i16 as i32,
+                    y: ((lparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32,
+                };
+                update_hover_popup(hwnd, point);
+            }
             if is_dragging {
                 let mut pt = POINT::default();
                 let _ = GetCursorPos(&mut pt);
@@ -4712,7 +5562,7 @@ unsafe extern "system" fn wnd_proc(
                                 taskbar_rect,
                                 tray_left,
                                 widget_width,
-                                sc(WIDGET_HEIGHT),
+                                widget_height_for(taskbar_rect),
                                 requested_offset,
                             ),
                         ))
@@ -4757,7 +5607,7 @@ unsafe extern "system" fn wnd_proc(
                 if let Some(s) = state.as_mut() {
                     if s.dragging {
                         s.dragging = false;
-                        Some((s.taskbar_index, s.drag_start_client_x))
+                        Some((s.taskbar_hwnd, s.drag_start_client_x))
                     } else {
                         None
                     }
@@ -4765,10 +5615,10 @@ unsafe extern "system" fn wnd_proc(
                     None
                 }
             };
-            if let Some((current_taskbar_index, drag_start_client_x)) = drag_result {
+            if let Some((current_taskbar, drag_start_client_x)) = drag_result {
                 let _ = ReleaseCapture();
                 if let Some((target_index, target_taskbar)) = taskbar_at_point(pt) {
-                    if target_index != current_taskbar_index {
+                    if current_taskbar != Some(target_taskbar.hwnd) {
                         let new_offset = offset_for_drop_point(
                             target_taskbar.hwnd,
                             target_taskbar.rect,
@@ -4781,7 +5631,7 @@ unsafe extern "system" fn wnd_proc(
                                 s.tray_offset = new_offset;
                             }
                         }
-                        if attach_to_taskbar(hwnd, target_index) {
+                        if attach_to_taskbar(hwnd, target_index, true) {
                             position_at_taskbar();
                             render_layered();
                         }
@@ -4792,6 +5642,7 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_RBUTTONUP => {
+            dismiss_hover_popup();
             show_context_menu(hwnd);
             LRESULT(0)
         }
@@ -4995,30 +5846,89 @@ unsafe extern "system" fn wnd_proc(
                     position_at_taskbar();
                     render_layered();
                 }
-                IDM_BAR_COLOR_WINDOWS_ACCENT => {
-                    {
-                        let mut state = lock_state();
-                        if let Some(s) = state.as_mut() {
-                            s.bar_color = None;
+                IDM_CLAUDE_DESKTOP_SIGN_IN => {
+                    let (enabled, language) = lock_state()
+                        .as_ref()
+                        .map(|s| (s.claude_desktop_sign_in, s.language))
+                        .unwrap_or((false, LanguageId::English));
+                    let enable = !enabled && confirm_claude_desktop_sign_in(hwnd, language);
+                    if enabled || enable {
+                        if let Some(s) = lock_state().as_mut() {
+                            s.claude_desktop_sign_in = enable;
                         }
+                        poller::set_claude_desktop_sign_in(enable);
+                        diagnose::log(format!(
+                            "Claude Desktop sign-in fallback enabled={enable} (menu)"
+                        ));
+                        save_state_settings();
+                    }
+                }
+                IDM_APPEARANCE_RECOMMENDED
+                | IDM_APPEARANCE_RESET
+                | IDM_PALETTE_SYSTEM
+                | IDM_PALETTE_DARK
+                | IDM_PALETTE_LIGHT
+                | IDM_BAR_CONTINUOUS
+                | IDM_BAR_SEGMENTED
+                | IDM_BAR_STANDARD
+                | IDM_BAR_SLIM
+                | IDM_FONT_STANDARD
+                | IDM_FONT_LARGE
+                | IDM_COLORS_DEFAULT
+                | IDM_BAR_COLOR_WINDOWS_ACCENT => {
+                    if let Some(s) = lock_state().as_mut() {
+                        apply_appearance_command(s, id);
+                        set_widget_font(&s.appearance);
                     }
                     save_state_settings();
                     position_at_taskbar();
                     render_layered();
                 }
-                IDM_BAR_COLOR_CUSTOM => {
-                    let initial = {
-                        let state = lock_state();
-                        state
-                            .as_ref()
-                            .map(|s| selected_bar_color(s.bar_color.as_deref()))
-                            .unwrap_or_else(native_interop::windows_accent_color)
+                IDM_COLOR_CLAUDE | IDM_COLOR_CODEX | IDM_COLOR_ANTIGRAVITY => {
+                    use crate::provider_icons::Provider;
+                    let provider = match id {
+                        IDM_COLOR_CLAUDE => Provider::Claude,
+                        IDM_COLOR_CODEX => Provider::Codex,
+                        _ => Provider::Antigravity,
                     };
+                    let initial = lock_state()
+                        .as_ref()
+                        .map(|s| {
+                            provider_bar_color(
+                                &s.appearance,
+                                s.bar_color.as_deref(),
+                                provider,
+                                s.appearance.is_dark(s.is_dark),
+                            )
+                        })
+                        .unwrap_or_else(|| factory_accent(provider, true));
+                    if let Some(color) = native_interop::choose_custom_color(hwnd, initial) {
+                        if let Some(s) = lock_state().as_mut() {
+                            s.appearance
+                                .provider_colors
+                                .set(provider, Some(canonical_hex_color(color)));
+                        }
+                        save_state_settings();
+                        render_layered();
+                    }
+                }
+                IDM_BAR_COLOR_CUSTOM => {
+                    let initial = lock_state()
+                        .as_ref()
+                        .and_then(|s| {
+                            explicit_bar_color(
+                                &s.appearance,
+                                s.bar_color.as_deref(),
+                                crate::provider_icons::Provider::Claude,
+                            )
+                        })
+                        .unwrap_or_else(native_interop::windows_accent_color);
                     if let Some(color) = native_interop::choose_custom_color(hwnd, initial) {
                         {
                             let mut state = lock_state();
                             if let Some(s) = state.as_mut() {
                                 s.bar_color = Some(canonical_hex_color(color));
+                                s.appearance.provider_colors = ProviderColors::default();
                             }
                         }
                         save_state_settings();
@@ -5353,6 +6263,8 @@ fn show_context_menu(hwnd: HWND) {
             bar_color,
             alert_thresholds_percent,
             enable_codex_mcp,
+            appearance,
+            claude_desktop_sign_in,
         ) = {
             let state = lock_state();
             match state.as_ref() {
@@ -5378,6 +6290,8 @@ fn show_context_menu(hwnd: HWND) {
                     s.bar_color.clone(),
                     s.alert_thresholds_percent.clone(),
                     s.enable_codex_mcp,
+                    s.appearance.clone(),
+                    s.claude_desktop_sign_in,
                 ),
                 None => (
                     POLL_15_MIN,
@@ -5400,6 +6314,8 @@ fn show_context_menu(hwnd: HWND) {
                     CreditValueMode::Credits,
                     None,
                     Vec::new(),
+                    false,
+                    Appearance::default(),
                     false,
                 ),
             }
@@ -5814,53 +6730,221 @@ fn show_context_menu(hwnd: HWND) {
             IDM_ENABLE_CODEX_MCP as usize,
             PCWSTR::from_raw(codex_mcp_label.as_ptr()),
         );
+        if show_claude_code {
+            append_menu_choice(
+                settings_menu,
+                IDM_CLAUDE_DESKTOP_SIGN_IN,
+                claude_desktop_sign_in,
+                if language == LanguageId::SimplifiedChinese {
+                    "使用 Claude 桌面版登录（只读）"
+                } else {
+                    "Use Claude Desktop sign-in (read-only)"
+                },
+            );
+        }
 
-        let bar_color_menu = CreatePopupMenu().unwrap();
-        let windows_accent_label =
-            native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
-                "Windows 强调色"
+        // Appearance (upstream #7 menu layout) with this fork's colour choices.
+        let chinese = language == LanguageId::SimplifiedChinese;
+        let appearance_menu = CreatePopupMenu().unwrap();
+        append_menu_choice(
+            appearance_menu,
+            IDM_APPEARANCE_RECOMMENDED,
+            appearance.is_translucent_dark_preset(),
+            if chinese {
+                "推荐：半透明深色任务栏"
             } else {
-                "Windows accent"
-            });
-        let windows_accent_flags = if bar_color.is_none() {
-            MF_CHECKED
-        } else {
-            MENU_ITEM_FLAGS(0)
-        };
-        let _ = AppendMenuW(
-            bar_color_menu,
-            windows_accent_flags,
-            IDM_BAR_COLOR_WINDOWS_ACCENT as usize,
-            PCWSTR::from_raw(windows_accent_label.as_ptr()),
+                "Recommended: translucent dark taskbar"
+            },
         );
-        let custom_color_label =
-            native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
-                "自定义..."
+        append_menu_choice(
+            appearance_menu,
+            IDM_APPEARANCE_RESET,
+            appearance.layout_reset() == appearance,
+            if chinese {
+                "恢复默认外观"
             } else {
-                "Custom..."
-            });
-        let custom_color_flags = if bar_color.is_some() {
-            MF_CHECKED
-        } else {
-            MENU_ITEM_FLAGS(0)
-        };
-        let _ = AppendMenuW(
-            bar_color_menu,
-            custom_color_flags,
-            IDM_BAR_COLOR_CUSTOM as usize,
-            PCWSTR::from_raw(custom_color_label.as_ptr()),
+                "Reset appearance"
+            },
         );
-        let bar_color_label =
-            native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
-                "进度条颜色"
+        let _ = AppendMenuW(appearance_menu, MF_SEPARATOR, 0, PCWSTR::null());
+
+        let palette_menu = CreatePopupMenu().unwrap();
+        for (id, palette, english, simplified) in [
+            (
+                IDM_PALETTE_SYSTEM,
+                Palette::System,
+                "Follow system",
+                "跟随系统",
+            ),
+            (
+                IDM_PALETTE_DARK,
+                Palette::HighContrastDark,
+                "High contrast dark",
+                "高对比深色",
+            ),
+            (
+                IDM_PALETTE_LIGHT,
+                Palette::HighContrastLight,
+                "High contrast light",
+                "高对比浅色",
+            ),
+        ] {
+            append_menu_choice(
+                palette_menu,
+                id,
+                appearance.palette == palette,
+                if chinese { simplified } else { english },
+            );
+        }
+        append_submenu(
+            appearance_menu,
+            palette_menu,
+            if chinese {
+                "文字与背景"
             } else {
-                "Bar color"
-            });
-        let _ = AppendMenuW(
+                "Contrast"
+            },
+        );
+
+        let style_menu = CreatePopupMenu().unwrap();
+        append_menu_choice(
+            style_menu,
+            IDM_BAR_CONTINUOUS,
+            appearance.bar_style == BarStyle::Continuous,
+            if chinese {
+                "连续圆角"
+            } else {
+                "Continuous rounded"
+            },
+        );
+        append_menu_choice(
+            style_menu,
+            IDM_BAR_SEGMENTED,
+            appearance.bar_style == BarStyle::Segmented,
+            if chinese { "分段" } else { "Segmented" },
+        );
+        let _ = AppendMenuW(style_menu, MF_SEPARATOR, 0, PCWSTR::null());
+        append_menu_choice(
+            style_menu,
+            IDM_BAR_STANDARD,
+            appearance.bar_thickness == BarThickness::Standard,
+            if chinese {
+                "标准粗细"
+            } else {
+                "Standard thickness"
+            },
+        );
+        append_menu_choice(
+            style_menu,
+            IDM_BAR_SLIM,
+            appearance.bar_thickness == BarThickness::Slim,
+            if chinese { "细" } else { "Slim" },
+        );
+        append_submenu(
+            appearance_menu,
+            style_menu,
+            if chinese { "进度条" } else { "Bars" },
+        );
+
+        let font_menu = CreatePopupMenu().unwrap();
+        append_menu_choice(
+            font_menu,
+            IDM_FONT_STANDARD,
+            appearance.font_size == FontSize::Standard,
+            if chinese { "标准" } else { "Standard" },
+        );
+        append_menu_choice(
+            font_menu,
+            IDM_FONT_LARGE,
+            appearance.font_size == FontSize::Large,
+            if chinese { "较大" } else { "Larger" },
+        );
+        append_submenu(
+            appearance_menu,
+            font_menu,
+            if chinese { "文字大小" } else { "Text size" },
+        );
+
+        let colors_menu = CreatePopupMenu().unwrap();
+        let no_explicit_colors =
+            bar_color.is_none() && provider_colors_are_default(&appearance.provider_colors);
+        append_menu_choice(
+            colors_menu,
+            IDM_COLORS_DEFAULT,
+            no_explicit_colors,
+            if chinese {
+                "默认颜色（按服务区分）"
+            } else {
+                "Default provider colors"
+            },
+        );
+        append_menu_choice(
+            colors_menu,
+            IDM_BAR_COLOR_WINDOWS_ACCENT,
+            bar_color.as_deref() == Some(BAR_COLOR_WINDOWS_ACCENT),
+            if chinese {
+                "全部使用 Windows 强调色"
+            } else {
+                "Windows accent for all bars"
+            },
+        );
+        append_menu_choice(
+            colors_menu,
+            IDM_BAR_COLOR_CUSTOM,
+            bar_color
+                .as_deref()
+                .is_some_and(|value| value != BAR_COLOR_WINDOWS_ACCENT),
+            if chinese {
+                "全部使用自定义颜色..."
+            } else {
+                "One custom color for all bars..."
+            },
+        );
+        let _ = AppendMenuW(colors_menu, MF_SEPARATOR, 0, PCWSTR::null());
+        for (id, provider, shown, name) in [
+            (
+                IDM_COLOR_CLAUDE,
+                crate::provider_icons::Provider::Claude,
+                show_claude_code,
+                strings.claude_code_model,
+            ),
+            (
+                IDM_COLOR_CODEX,
+                crate::provider_icons::Provider::Codex,
+                show_codex,
+                strings.codex_model,
+            ),
+            (
+                IDM_COLOR_ANTIGRAVITY,
+                crate::provider_icons::Provider::Antigravity,
+                show_antigravity,
+                strings.antigravity_model,
+            ),
+        ] {
+            if !shown {
+                continue;
+            }
+            let label = if chinese {
+                format!("{name} 颜色...")
+            } else {
+                format!("{name} color...")
+            };
+            append_menu_choice(
+                colors_menu,
+                id,
+                appearance.provider_colors.get(provider).is_some(),
+                &label,
+            );
+        }
+        append_submenu(
+            appearance_menu,
+            colors_menu,
+            if chinese { "颜色" } else { "Colors" },
+        );
+        append_submenu(
             settings_menu,
-            MF_POPUP,
-            bar_color_menu.0 as usize,
-            PCWSTR::from_raw(bar_color_label.as_ptr()),
+            appearance_menu,
+            if chinese { "外观" } else { "Appearance" },
         );
 
         let language_menu = CreatePopupMenu().unwrap();
@@ -6017,6 +7101,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
         credit_value_mode,
         codex_credit_text,
         bar_color_setting,
+        appearance,
     ) = {
         let state = lock_state();
         match state.as_ref() {
@@ -6048,27 +7133,14 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.credit_value_mode,
                 s.codex_credit_text.clone(),
                 s.bar_color.clone(),
+                s.appearance.clone(),
             ),
             None => return,
         }
     };
 
-    let bar_color = selected_bar_color(bar_color_setting.as_deref());
-    let track = if is_dark {
-        Color::from_hex("#444444")
-    } else {
-        Color::from_hex("#AAAAAA")
-    };
-    let text_color = if is_dark {
-        Color::from_hex("#888888")
-    } else {
-        Color::from_hex("#404040")
-    };
-    let bg_color = if is_dark {
-        Color::from_hex("#1C1C1C")
-    } else {
-        Color::from_hex("#F3F3F3")
-    };
+    let (bg_color, text_color, track) = appearance_colors(&appearance, is_dark);
+    let mut hover = Vec::new();
 
     unsafe {
         let mut client_rect = RECT::default();
@@ -6091,7 +7163,8 @@ fn paint(hdc: HDC, hwnd: HWND) {
             is_dark,
             &bg_color,
             &text_color,
-            &bar_color,
+            &appearance,
+            bar_color_setting.as_deref(),
             &track,
             language,
             strings,
@@ -6118,7 +7191,9 @@ fn paint(hdc: HDC, hwnd: HWND) {
             credit_position,
             credit_value_mode,
             &codex_credit_text,
+            &mut hover,
         );
+        store_hover_regions(hover);
 
         let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
 
@@ -6164,46 +7239,214 @@ fn draw_credit_panel(
     }
 }
 
+/// Keep the text cells of the latest paint; a layout change dismisses an
+/// open popup, which reopens on the next pointer move.
+fn store_hover_regions(regions: Vec<HoverRegion>) {
+    let changed = {
+        let mut state = lock_state();
+        let Some(s) = state.as_mut() else {
+            return;
+        };
+        let changed = s.hover_regions != regions;
+        if changed {
+            s.hovered_region = None;
+        }
+        s.hover_regions = regions;
+        changed
+    };
+    if changed {
+        crate::quota_popup::hide();
+    }
+}
+
+/// Popup text for a hovered quota cell: the exact local reset time, or what
+/// `--` and `!--` mean. Reset times come only from the provider; none is
+/// invented when it is unavailable.
+fn hover_text(state: &AppState, region: &HoverRegion, now: SystemTime) -> Option<String> {
+    let chinese = state.language == LanguageId::SimplifiedChinese;
+    let strings = state.language.strings();
+    let name = match region.provider {
+        CLAUDE => strings.claude_code_model,
+        CODEX => strings.codex_model,
+        _ => strings.antigravity_model,
+    };
+    let window = match region.window {
+        poller::UsageWindowKind::Session => strings.session_window,
+        poller::UsageWindowKind::Weekly => strings.weekly_window,
+    };
+    let health = &state.provider_health[region.provider];
+    let section = state
+        .data
+        .as_ref()
+        .and_then(|data| provider_usage(data, region.provider))
+        .map(|usage| match region.window {
+            poller::UsageWindowKind::Session => &usage.session,
+            poller::UsageWindowKind::Weekly => &usage.weekly,
+        })?;
+    if !section.available {
+        return Some(if chinese {
+            format!("{name} {window}：账号未提供此限额。\n-- 表示无数据，并非已用 0% 或剩余 100%。")
+        } else {
+            format!(
+                "{name} {window}: not reported for this account.\n-- means unavailable, not 0% used or 100% remaining."
+            )
+        });
+    }
+    let updated = health.updated_at();
+    let reset_text = section
+        .resets_at
+        .and_then(native_interop::format_local_datetime);
+    if crate::provider_health::window_reset_since(section.resets_at, updated, now) {
+        let at = reset_text.unwrap_or_default();
+        return Some(if chinese {
+            format!("{name} {window}：已于 {at} 重置。\n!-- 表示新数值未知，下次成功刷新后显示。")
+        } else {
+            format!(
+                "{name} {window}: reset at {at}.\n!-- means the new value is unknown until the next successful refresh."
+            )
+        });
+    }
+    let interval =
+        provider_schedule::provider_interval_ms(region.provider, effective_poll_interval_ms(state));
+    let stale = health.stale(now, interval);
+    let mut text = match reset_text {
+        Some(at) if chinese => format!("{name} {window}：重置于 {at}"),
+        Some(at) => format!("{name} {window} resets {at}"),
+        None if chinese => format!("{name} {window}：未提供重置时间"),
+        None => format!("{name} {window}: reset time not reported"),
+    };
+    if stale {
+        let confirmed = updated
+            .and_then(native_interop::format_local_datetime)
+            .unwrap_or_else(|| "—".to_string());
+        text.push_str(&if chinese {
+            format!("\n! 表示数据可能过期（最后确认 {confirmed}）。")
+        } else {
+            format!("\n! means this may be out of date (last confirmed {confirmed}).")
+        });
+    }
+    Some(text)
+}
+
+/// Show or move the popup for the cell under the pointer (client point).
+fn update_hover_popup(hwnd: HWND, point: POINT) {
+    let target = {
+        let mut state = lock_state();
+        let Some(s) = state.as_mut() else {
+            return;
+        };
+        if s.dragging || !s.widget_visible {
+            None
+        } else {
+            let index = s.hover_regions.iter().position(|region| {
+                point.x >= region.rect.left
+                    && point.x < region.rect.right
+                    && point.y >= region.rect.top
+                    && point.y < region.rect.bottom
+            });
+            let unchanged = index.is_some() && index == s.hovered_region;
+            s.hovered_region = index;
+            match index {
+                Some(_) if unchanged => return,
+                Some(index) => {
+                    let region = s.hover_regions[index];
+                    hover_text(s, &region, SystemTime::now()).map(|text| {
+                        let taskbar = s
+                            .taskbar_hwnd
+                            .and_then(native_interop::get_taskbar_rect)
+                            .or_else(|| native_interop::get_window_rect_safe(hwnd));
+                        (text, region.rect, taskbar)
+                    })
+                }
+                None => None,
+            }
+        }
+    };
+    match target {
+        Some((text, rect, Some(taskbar))) => unsafe {
+            let mut top_left = POINT {
+                x: rect.left,
+                y: rect.top,
+            };
+            let mut bottom_right = POINT {
+                x: rect.right,
+                y: rect.bottom,
+            };
+            let _ = ClientToScreen(hwnd, &mut top_left);
+            let _ = ClientToScreen(hwnd, &mut bottom_right);
+            let anchor = RECT {
+                left: top_left.x,
+                top: top_left.y,
+                right: bottom_right.x,
+                bottom: bottom_right.y,
+            };
+            crate::quota_popup::show(
+                hwnd,
+                &text,
+                anchor,
+                taskbar,
+                sc(crate::quota_popup::TASKBAR_GAP),
+            );
+            let mut track = windows::Win32::UI::Input::KeyboardAndMouse::TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<
+                    windows::Win32::UI::Input::KeyboardAndMouse::TRACKMOUSEEVENT,
+                >() as u32,
+                dwFlags: windows::Win32::UI::Input::KeyboardAndMouse::TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::TrackMouseEvent(&mut track);
+        },
+        _ => crate::quota_popup::hide(),
+    }
+}
+
+fn dismiss_hover_popup() {
+    if let Some(s) = lock_state().as_mut() {
+        s.hovered_region = None;
+    }
+    crate::quota_popup::hide();
+}
+
+/// One provider's column within a row: its percentage (display direction
+/// applied), text and colours.
+struct RowCell<'a> {
+    provider: crate::provider_icons::Provider,
+    percent: f64,
+    text: &'a str,
+    accent: Color,
+    value_color: Color,
+}
+
+/// Hover target for the reset-time and unavailable-window tooltip, in widget
+/// client coordinates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HoverRegion {
+    rect: RECT,
+    provider: usize,
+    window: poller::UsageWindowKind,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn draw_row(
     hdc: HDC,
     x: i32,
     y: i32,
+    appearance: &Appearance,
     is_dark: bool,
     text_color: &Color,
     label: &str,
-    claude_percent: f64,
-    claude_text: &str,
-    codex_percent: f64,
-    codex_text: &str,
-    antigravity_percent: f64,
-    antigravity_text: &str,
-    show_claude_code: bool,
-    show_codex: bool,
-    show_antigravity: bool,
-    bar_color: &Color,
+    cells: &[RowCell<'_>],
+    window: poller::UsageWindowKind,
     track: &Color,
     label_width: i32,
     text_width: i32,
+    percent_width: i32,
+    hover: &mut Vec<HoverRegion>,
 ) {
-    let seg_h = sc(SEGMENT_H);
-    let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
-    let segment_count = row_bar_segment_count(active_models);
-    let use_model_text_colors = active_models > 1;
-    let claude_value_color = if use_model_text_colors {
-        claude_usage_text_color(is_dark)
-    } else {
-        *text_color
-    };
-    let codex_value_color = if use_model_text_colors {
-        codex_usage_text_color(is_dark)
-    } else {
-        *text_color
-    };
-    let antigravity_value_color = if use_model_text_colors {
-        antigravity_usage_text_color(is_dark)
-    } else {
-        *text_color
-    };
+    let segment_count = row_bar_segment_count(cells.len().max(1) as i32);
+    let row_height = appearance.row_height();
+    let reset_color = reset_text_color(appearance, is_dark);
 
     unsafe {
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
@@ -6212,154 +7455,158 @@ fn draw_row(
             left: x,
             top: y,
             right: x + sc(label_width),
-            bottom: y + seg_h,
+            bottom: y + row_height,
         };
         let _ = DrawTextW(
             hdc,
             &mut label_wide,
             &mut label_rect,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
         );
+    }
 
-        let mut model_x = x + sc(label_width) + sc(HORIZONTAL_GUTTER);
-        if show_claude_code {
-            draw_usage_bar(
-                hdc,
-                model_x,
-                y,
-                segment_count,
-                claude_percent,
-                claude_text,
-                bar_color,
-                track,
-                &claude_value_color,
-                text_width,
-            );
-            model_x += model_usage_width(segment_count, text_width) + sc(HORIZONTAL_GUTTER);
-        }
-        if show_codex {
-            draw_usage_bar(
-                hdc,
-                model_x,
-                y,
-                segment_count,
-                codex_percent,
-                codex_text,
-                bar_color,
-                track,
-                &codex_value_color,
-                text_width,
-            );
-            model_x += model_usage_width(segment_count, text_width) + sc(HORIZONTAL_GUTTER);
-        }
-        if show_antigravity {
-            draw_usage_bar(
-                hdc,
-                model_x,
-                y,
-                segment_count,
-                antigravity_percent,
-                antigravity_text,
-                bar_color,
-                track,
-                &antigravity_value_color,
-                text_width,
-            );
-        }
+    let mut model_x = x + sc(label_width) + sc(HORIZONTAL_GUTTER);
+    for cell in cells {
+        // The provider mark sits left of the bars, centred across both rows
+        // (drawn once per column by paint_content).
+        let bar_x = model_x + sc(crate::provider_icons::SIZE + crate::provider_icons::RIGHT_MARGIN);
+        let text_rect = draw_usage_bar(
+            hdc,
+            bar_x,
+            y,
+            row_height,
+            segment_count,
+            cell.percent,
+            cell.text,
+            appearance,
+            &cell.accent,
+            track,
+            &cell.value_color,
+            &reset_color,
+            text_width,
+            percent_width,
+        );
+        hover.push(HoverRegion {
+            rect: text_rect,
+            provider: cell.provider as usize,
+            window,
+        });
+        model_x += model_usage_width(segment_count, text_width) + sc(HORIZONTAL_GUTTER);
     }
 }
 
+/// Logical-free physical width of one provider column: mark, bars and text.
 fn model_usage_width(segment_count: i32, text_width: i32) -> i32 {
-    (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * segment_count - sc(SEGMENT_GAP)
+    sc(crate::provider_icons::SIZE + crate::provider_icons::RIGHT_MARGIN)
+        + (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * segment_count
+        - sc(SEGMENT_GAP)
         + sc(HORIZONTAL_GUTTER)
         + sc(text_width)
 }
 
+/// Split `!37% 2h04m` into the percentage and its countdown, so the countdown
+/// column starts at the same x on every row (upstream's fixed-column
+/// typography, `quota_text.rs`). Text without a space stays whole.
+fn quota_text_parts(text: &str) -> (&str, &str) {
+    match text.split_once(' ') {
+        Some((value, reset)) if value.contains('%') => (value, reset.trim_start()),
+        _ => (text, ""),
+    }
+}
+
+/// Draws the bar and its text; returns the text cell for hover tooltips.
+#[allow(clippy::too_many_arguments)]
 fn draw_usage_bar(
     hdc: HDC,
     bar_x: i32,
     y: i32,
+    row_height: i32,
     segment_count: i32,
     percent: f64,
     text: &str,
-    bar_color: &Color,
+    appearance: &Appearance,
+    accent: &Color,
     track: &Color,
-    text_color: &Color,
+    value_color: &Color,
+    reset_color: &Color,
     text_width: i32,
-) {
+    percent_width: i32,
+) -> RECT {
     let seg_w = sc(SEGMENT_W);
-    let seg_h = sc(SEGMENT_H);
     let seg_gap = sc(SEGMENT_GAP);
     let bar_width = segment_count * (seg_w + seg_gap) - seg_gap;
-    let corner_r = seg_h / 2;
-
-    unsafe {
-        let percent_clamped = percent.clamp(0.0, 100.0);
-        let bar_rect = RECT {
-            left: bar_x,
-            top: y,
-            right: bar_x + bar_width,
-            bottom: y + seg_h,
-        };
-        draw_rounded_rect(hdc, &bar_rect, track, corner_r);
-
-        let fill_width = (bar_width as f64 * percent_clamped / 100.0).round() as i32;
-        if fill_width > 0 {
-            let fill_rect = RECT {
-                left: bar_x,
-                top: y,
-                right: bar_x + fill_width,
-                bottom: y + seg_h,
+    let bar_height = appearance.bar_height();
+    let bar_y = y + (row_height - bar_height) / 2;
+    // NaN (unknown) and out-of-range values draw an empty track.
+    let fill = if percent.is_finite() {
+        percent.clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+    if appearance.bar_style == BarStyle::Segmented {
+        for i in 0..segment_count {
+            let left = bar_x + i * (seg_w + seg_gap);
+            let rect = RECT {
+                left,
+                top: bar_y,
+                right: left + seg_w,
+                bottom: bar_y + bar_height,
             };
-            let rgn = CreateRoundRectRgn(
-                bar_rect.left,
-                bar_rect.top,
-                bar_rect.right + 1,
-                bar_rect.bottom + 1,
-                corner_r * 2,
-                corner_r * 2,
-            );
-            let _ = SelectClipRgn(hdc, rgn);
-            let brush = CreateSolidBrush(COLORREF(bar_color.to_colorref()));
-            FillRect(hdc, &fill_rect, brush);
-            let _ = DeleteObject(brush);
-            let _ = SelectClipRgn(hdc, HRGN::default());
-            let _ = DeleteObject(rgn);
+            let fraction = (fill * segment_count as f64 / 100.0 - i as f64).clamp(0.0, 1.0);
+            crate::rounded_bars::draw(hdc, rect, fraction, track, accent);
         }
-
-        let text_x = bar_x + bar_width + sc(HORIZONTAL_GUTTER);
-        let mut text_wide: Vec<u16> = text.encode_utf16().collect();
-        let mut text_rect = RECT {
-            left: text_x,
-            top: y,
-            right: text_x + sc(text_width),
-            bottom: y + seg_h,
+    } else {
+        let rect = RECT {
+            left: bar_x,
+            top: bar_y,
+            right: bar_x + bar_width,
+            bottom: bar_y + bar_height,
         };
-        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
+        crate::rounded_bars::draw(hdc, rect, fill / 100.0, track, accent);
+    }
+
+    let text_x = bar_x + bar_width + sc(HORIZONTAL_GUTTER);
+    let cell = RECT {
+        left: text_x,
+        top: y,
+        right: text_x + sc(text_width),
+        bottom: y + row_height,
+    };
+    let (value, reset) = quota_text_parts(text);
+    unsafe {
+        let _ = SetTextColor(hdc, COLORREF(value_color.to_colorref()));
+        let mut value_wide: Vec<u16> = value.encode_utf16().collect();
+        let mut value_rect = RECT {
+            right: if reset.is_empty() {
+                cell.right
+            } else {
+                text_x + sc(percent_width)
+            },
+            ..cell
+        };
+        let flags = if reset.is_empty() { DT_LEFT } else { DT_RIGHT };
         let _ = DrawTextW(
             hdc,
-            &mut text_wide,
-            &mut text_rect,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+            &mut value_wide,
+            &mut value_rect,
+            flags | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
         );
+        if !reset.is_empty() {
+            let _ = SetTextColor(hdc, COLORREF(reset_color.to_colorref()));
+            let mut reset_wide: Vec<u16> = reset.encode_utf16().collect();
+            let mut reset_rect = RECT {
+                left: text_x + sc(percent_width + QUOTA_COLUMN_GAP),
+                ..cell
+            };
+            let _ = DrawTextW(
+                hdc,
+                &mut reset_wide,
+                &mut reset_rect,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+        }
     }
-}
-
-fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
-    unsafe {
-        let brush = CreateSolidBrush(COLORREF(color.to_colorref()));
-        let rgn = CreateRoundRectRgn(
-            rect.left,
-            rect.top,
-            rect.right + 1,
-            rect.bottom + 1,
-            radius * 2,
-            radius * 2,
-        );
-        let _ = FillRgn(hdc, rgn, brush);
-        let _ = DeleteObject(rgn);
-        let _ = DeleteObject(brush);
-    }
+    cell
 }
 
 #[cfg(test)]
@@ -6842,6 +8089,53 @@ mod tests {
         assert_eq!(source, SettingsSource::Current);
         assert_eq!(settings.language.as_deref(), Some("en"));
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn startup_values_are_quoted_and_target_the_installed_copy() {
+        let installed = r"C:\Users\u\AppData\Local\Programs\CodexUsage\codex-usage.exe";
+        let dev = r"C:\Users\u\Documents\Codex\Codex Usage Monitor\target\release\codex-usage.exe";
+        assert_eq!(startup_target(Some(installed), dev), installed);
+        assert_eq!(startup_target(None, dev), dev);
+        let quoted = startup_command(dev);
+        assert_eq!(quoted, format!("\"{dev}\""));
+        assert_eq!(startup_value_path(&quoted), dev);
+        assert_eq!(
+            startup_value_path(dev),
+            dev,
+            "older unquoted values still parse"
+        );
+        assert_eq!(
+            startup_value_path(r#""C:\a b\x.exe" --flag"#),
+            r"C:\a b\x.exe"
+        );
+        assert!(same_path(&installed.to_uppercase(), installed));
+    }
+
+    #[test]
+    fn only_the_installed_copy_repairs_a_stale_registration_of_ours() {
+        let installed = r"C:\Users\u\AppData\Local\Programs\CodexUsage\codex-usage.exe";
+        let stale =
+            r"C:\Users\u\Documents\Codex\Codex Usage Monitor\target\release\codex-usage.exe";
+        // The Build 5 situation: Run points at an old development build.
+        assert!(startup_repair_needed(stale, installed, installed));
+        assert!(
+            startup_repair_needed(installed, installed, installed),
+            "unquoted is requoted"
+        );
+        assert!(!startup_repair_needed(
+            &startup_command(installed),
+            installed,
+            installed
+        ));
+        // A development build never takes over the registration.
+        assert!(!startup_repair_needed(stale, stale, installed));
+        // Another program's value is never rewritten.
+        assert!(!startup_repair_needed(
+            r"C:\Other\tool.exe",
+            installed,
+            installed
+        ));
     }
 
     #[test]
@@ -7431,6 +8725,134 @@ mod tests {
             )
             .providers[CODEX]
         );
+    }
+
+    #[test]
+    fn the_saved_display_survives_reordering_and_temporary_absence() {
+        let primary = (Some(r"\\.\DISPLAY1".to_string()), true);
+        let second = (Some(r"\\.\DISPLAY2".to_string()), false);
+        let third = (Some(r"\\.\DISPLAY3".to_string()), false);
+        let saved = Some(r"\\.\DISPLAY2");
+        // Found by device even when enumeration order changes.
+        let taskbars = [primary.clone(), second.clone(), third.clone()];
+        assert_eq!(
+            preferred_taskbar_device_index(&taskbars, saved, 0),
+            (1, true)
+        );
+        let reordered = [third.clone(), primary.clone(), second.clone()];
+        assert_eq!(
+            preferred_taskbar_device_index(&reordered, saved, 0),
+            (2, true)
+        );
+        // Disconnected: the primary taskbar stands in, marked not preferred,
+        // so the saved choice is not overwritten and returns later.
+        let without = [third, primary.clone()];
+        assert_eq!(
+            preferred_taskbar_device_index(&without, saved, 1),
+            (1, false)
+        );
+        // Older settings without a device keep their index while it exists.
+        assert_eq!(
+            preferred_taskbar_device_index(&[primary.clone(), second.clone()], None, 1),
+            (1, true)
+        );
+        assert_eq!(
+            preferred_taskbar_device_index(&[second, primary], None, 5),
+            (1, false)
+        );
+        assert_eq!(preferred_taskbar_device_index(&[], None, 0), (0, false));
+    }
+
+    #[test]
+    fn monitor_device_setting_is_optional_and_round_trips() {
+        let old: SettingsFile = serde_json::from_str(r#"{"taskbar_index":1}"#).unwrap();
+        assert_eq!(
+            (old.taskbar_index, old.monitor_device.as_deref()),
+            (1, None)
+        );
+        let saved: SettingsFile =
+            serde_json::from_str(r#"{"taskbar_index":1,"monitor_device":"\\\\.\\DISPLAY2"}"#)
+                .unwrap();
+        assert_eq!(saved.monitor_device.as_deref(), Some(r"\\.\DISPLAY2"));
+        let json = serde_json::to_string(&SettingsFile::default()).unwrap();
+        assert!(
+            !json.contains("monitor_device"),
+            "absent until a taskbar is chosen"
+        );
+    }
+
+    #[test]
+    fn recovery_refreshes_bypass_offline_backoff_but_keep_spacing_and_server_deadlines() {
+        use provider_schedule::{Outcome, ProviderSchedule};
+        let enabled = [true, true, false];
+        let now = Instant::now();
+        let mut schedule = ProviderSchedule::default();
+        // Asleep or offline: both providers failed with network errors and
+        // backed off; Claude also holds a server Retry-After deadline.
+        assert_eq!(
+            schedule.begin(
+                now,
+                poll_request(PollTrigger::Scheduled, enabled, [false; 3], false)
+            ),
+            [true, true, false]
+        );
+        schedule.finish(
+            CLAUDE,
+            now,
+            Outcome::Transient {
+                server_delay_ms: Some(300_000),
+            },
+            provider_schedule::CLAUDE_MIN_POLL_MS,
+        );
+        schedule.finish(
+            CODEX,
+            now,
+            Outcome::Transient {
+                server_delay_ms: None,
+            },
+            POLL_15_MIN,
+        );
+        let later = now + Duration::from_secs(20);
+        assert_eq!(
+            schedule.begin(
+                later,
+                poll_request(PollTrigger::Scheduled, enabled, [false; 3], false)
+            ),
+            [false; 3],
+            "both still backing off"
+        );
+        // A network return refreshes Codex at once; Claude keeps its deadline.
+        let request = poll_request(
+            PollTrigger::NetworkRestored,
+            enabled,
+            [true, true, false],
+            false,
+        );
+        assert_eq!(schedule.begin(later, request), [false, true, false]);
+        // A provider already in flight is never started twice.
+        assert_eq!(schedule.begin(later, request), [false; 3]);
+        // Codex's auth-recovery ladder is never bypassed.
+        assert!(!poll_request(PollTrigger::Resume, enabled, [true; 3], true).providers[CODEX]);
+        // Untargeted providers (fresh after a network return) are left alone.
+        assert_eq!(
+            poll_request(PollTrigger::NetworkRestored, enabled, [false; 3], false).providers,
+            [false; 3]
+        );
+        // Claude's spacing still applies after the server deadline passes.
+        let mut spaced = ProviderSchedule::default();
+        spaced.begin(
+            now,
+            poll_request(PollTrigger::Scheduled, enabled, [false; 3], false),
+        );
+        spaced.finish(
+            CLAUDE,
+            now,
+            Outcome::Success,
+            provider_schedule::CLAUDE_MIN_POLL_MS,
+        );
+        let resume = poll_request(PollTrigger::Resume, enabled, [true; 3], false);
+        assert!(!spaced.begin(now + Duration::from_secs(60), resume)[CLAUDE]);
+        assert!(spaced.begin(now + Duration::from_secs(121), resume)[CLAUDE]);
     }
 
     #[test]
@@ -8637,6 +10059,10 @@ mod persisted_snapshot_tests {
     use crate::models::{UsageData, UsageSection};
     use poller::PollError;
 
+    pub(super) fn test_state() -> AppState {
+        state()
+    }
+
     fn state() -> AppState {
         AppState {
             hwnd: SendHwnd::from_hwnd(HWND::default()),
@@ -8672,6 +10098,7 @@ mod persisted_snapshot_tests {
             enable_codex_mcp: true,
             usage_display: UsageDisplayMode::Mixed,
             bar_color: None,
+            appearance: Appearance::default(),
             credit_value_mode: CreditValueMode::Credits,
             alert_thresholds_percent: Vec::new(),
             notified_quota_windows: BTreeSet::new(),
@@ -8681,6 +10108,10 @@ mod persisted_snapshot_tests {
             data_sources: Default::default(),
             persisted: Default::default(),
             claude_desktop_sign_in: true,
+            recovery_gate: Default::default(),
+            recovery_watch: None,
+            hover_regions: Vec::new(),
+            hovered_region: None,
             poll_interval_ms: POLL_30_SEC,
             adaptive_polling: false,
             schedule: Default::default(),
@@ -8691,6 +10122,7 @@ mod persisted_snapshot_tests {
             update_status: UpdateStatus::Idle,
             last_update_check_unix: None,
             taskbar_index: 0,
+            monitor_device: None,
             tray_offset: 0,
             manual_position: false,
             dragging: false,
@@ -8854,17 +10286,501 @@ mod persisted_snapshot_tests {
     }
 
     #[test]
-    fn desktop_sign_in_fallback_defaults_on_and_round_trips() {
-        let old: SettingsFile = serde_json::from_str("{}").unwrap();
+    fn unreported_windows_show_unknown_not_a_percentage_in_every_mode() {
+        let now = SystemTime::now();
+        for mode in [
+            UsageDisplayMode::Mixed,
+            UsageDisplayMode::Remaining,
+            UsageDisplayMode::Used,
+        ] {
+            let mut state = state();
+            state.usage_display = mode;
+            // Codex answered with Credits but no rate-limit windows; Claude
+            // answered without a weekly window.
+            let mut codex = UsageData {
+                credits: Some(crate::models::CreditBalance::Amount(3.0)),
+                ..Default::default()
+            };
+            codex.session.available = false;
+            let mut claude = usage(12.0, now + Duration::from_secs(3600), 0.0, now);
+            claude.weekly = UsageSection::default();
+            apply(&mut state, CODEX, Some(codex), None);
+            apply(&mut state, CLAUDE, Some(claude), None);
+            state.last_poll_ok = true;
+            refresh_usage_texts(&mut state);
+            assert_eq!(state.codex_session_text, "--", "{mode:?}");
+            assert_eq!(state.codex_weekly_text, "--", "{mode:?}");
+            assert!(state.codex_session_percent.is_nan() && state.codex_weekly_percent.is_nan());
+            assert_eq!(state.weekly_text, "--", "{mode:?}");
+            assert!(
+                state.session_text.contains('%'),
+                "reported window unaffected"
+            );
+            assert!(!state.codex_credit_text.is_empty(), "Credits still shown");
+        }
+    }
+
+    #[test]
+    fn alerts_never_fire_for_a_window_the_provider_did_not_report() {
+        let mut state = state();
+        state.alert_thresholds_percent = vec![10];
+        let mut data = AppUsageData::default();
+        // Even a nonsense 100%-used value is ignored when unreported.
+        data.codex = Some(UsageData {
+            session: UsageSection {
+                percentage: 100.0,
+                resets_at: None,
+                available: false,
+            },
+            ..Default::default()
+        });
+        assert!(collect_low_quota_alerts(&mut state, &data).is_empty());
+        assert!(state.notified_quota_windows.is_empty());
+        data.codex.as_mut().unwrap().session.available = true;
+        assert_eq!(collect_low_quota_alerts(&mut state, &data).len(), 1);
+    }
+
+    #[test]
+    fn desktop_sign_in_is_opt_in_and_an_explicit_choice_is_kept() {
+        let new_install: SettingsFile = serde_json::from_str("{}").unwrap();
         assert!(
-            old.use_claude_desktop_sign_in,
-            "existing settings get the fallback"
+            !new_install.use_claude_desktop_sign_in,
+            "never read Claude Desktop credentials without an explicit choice"
+        );
+        assert!(!SettingsFile::default().use_claude_desktop_sign_in);
+        let enabled: SettingsFile =
+            serde_json::from_str(r#"{"use_claude_desktop_sign_in":true}"#).unwrap();
+        assert!(
+            enabled.use_claude_desktop_sign_in,
+            "an existing opt-in is kept"
         );
         let off: SettingsFile =
             serde_json::from_str(r#"{"use_claude_desktop_sign_in":false}"#).unwrap();
         assert!(!off.use_claude_desktop_sign_in);
         let json = serde_json::to_string(&off).unwrap();
         assert!(json.contains("\"use_claude_desktop_sign_in\":false"));
-        assert!(SettingsFile::default().use_claude_desktop_sign_in);
+    }
+}
+
+#[cfg(test)]
+mod appearance_tests {
+    use super::*;
+    use crate::provider_icons::Provider;
+
+    #[test]
+    fn older_settings_get_factory_appearance_and_keep_explicit_colours() {
+        let untouched: SettingsFile = serde_json::from_str("{}").unwrap();
+        let untouched = normalize_settings(untouched);
+        assert_eq!(untouched.appearance, Appearance::default());
+        assert_eq!(untouched.bar_color, None, "no colour was ever chosen");
+        let custom =
+            normalize_settings(serde_json::from_str(r##"{"bar_color":"#7744aa"}"##).unwrap());
+        assert_eq!(custom.bar_color.as_deref(), Some("#7744AA"));
+        let accent =
+            normalize_settings(serde_json::from_str(r#"{"bar_color":"windows-accent"}"#).unwrap());
+        assert_eq!(accent.bar_color.as_deref(), Some(BAR_COLOR_WINDOWS_ACCENT));
+        let junk = normalize_settings(serde_json::from_str(r#"{"bar_color":"purple"}"#).unwrap());
+        assert_eq!(junk.bar_color, None);
+        let saved = normalize_settings(
+            serde_json::from_str(
+                r##"{"appearance":{"palette":"high_contrast_dark","bar_style":"segmented",
+                    "provider_colors":{"codex":"#aa00ff","claude":"nope"}}}"##,
+            )
+            .unwrap(),
+        );
+        assert_eq!(saved.appearance.palette, Palette::HighContrastDark);
+        assert_eq!(saved.appearance.bar_style, BarStyle::Segmented);
+        assert_eq!(
+            saved.appearance.font_size,
+            FontSize::Standard,
+            "missing fields default"
+        );
+        assert_eq!(
+            saved.appearance.provider_colors.codex.as_deref(),
+            Some("#AA00FF")
+        );
+        assert_eq!(
+            saved.appearance.provider_colors.claude, None,
+            "invalid colour dropped"
+        );
+        let json = serde_json::to_string(&SettingsFile::default()).unwrap();
+        assert!(!json.contains("provider_colors"), "absent until chosen");
+    }
+
+    #[test]
+    fn colour_precedence_is_provider_then_all_bars_then_factory() {
+        let mut appearance = Appearance::default();
+        let factory = provider_bar_color(&appearance, None, Provider::Claude, true);
+        assert_eq!(factory, Color::from_hex("#D97757"));
+        assert_eq!(
+            provider_bar_color(&appearance, None, Provider::Codex, false),
+            Color::from_hex("#0F8F70")
+        );
+        let all = provider_bar_color(&appearance, Some("#112233"), Provider::Codex, true);
+        assert_eq!(all, Color::from_hex("#112233"));
+        appearance.provider_colors.codex = Some("#445566".into());
+        assert_eq!(
+            provider_bar_color(&appearance, Some("#112233"), Provider::Codex, true),
+            Color::from_hex("#445566")
+        );
+        assert_eq!(
+            provider_bar_color(&appearance, Some("#112233"), Provider::Claude, true),
+            Color::from_hex("#112233"),
+            "other providers keep the all-bars colour"
+        );
+        // Palettes never override explicit colours for bars.
+        appearance.palette = Palette::HighContrastLight;
+        assert_eq!(
+            provider_bar_color(&appearance, None, Provider::Codex, false),
+            Color::from_hex("#445566")
+        );
+    }
+
+    #[test]
+    fn value_text_is_legible_in_high_contrast_and_coloured_otherwise() {
+        let label = Color::from_hex("#888888");
+        let mut appearance = Appearance::default();
+        assert_eq!(
+            provider_value_color(&appearance, Provider::Codex, true, &label, false),
+            Color::from_hex("#34D399")
+        );
+        assert_eq!(
+            provider_value_color(&appearance, Provider::Claude, true, &label, false),
+            label,
+            "a lone Claude column uses the label colour, as upstream"
+        );
+        assert_ne!(
+            provider_value_color(&appearance, Provider::Claude, true, &label, true),
+            label
+        );
+        appearance.provider_colors.claude = Some("#ABCDEF".into());
+        assert_eq!(
+            provider_value_color(&appearance, Provider::Claude, true, &label, false),
+            Color::from_hex("#ABCDEF")
+        );
+        appearance.palette = Palette::HighContrastDark;
+        let (_, hc_label, _) = appearance_colors(&appearance, false);
+        assert_eq!(hc_label, Color::from_hex("#FFFFFF"));
+        assert_eq!(
+            provider_value_color(&appearance, Provider::Claude, true, &hc_label, true),
+            hc_label
+        );
+    }
+
+    #[test]
+    fn appearance_commands_keep_or_clear_colours_predictably() {
+        let mut state = persisted_snapshot_tests_state();
+        state.appearance.provider_colors.claude = Some("#123456".into());
+        state.bar_color = Some("#654321".into());
+        apply_appearance_command(&mut state, IDM_APPEARANCE_RECOMMENDED);
+        assert!(state.appearance.is_translucent_dark_preset());
+        assert_eq!(
+            state.appearance.provider_colors.claude.as_deref(),
+            Some("#123456")
+        );
+        apply_appearance_command(&mut state, IDM_APPEARANCE_RESET);
+        assert_eq!(state.appearance.palette, Palette::System);
+        assert_eq!(
+            state.appearance.provider_colors.claude.as_deref(),
+            Some("#123456")
+        );
+        assert_eq!(
+            state.bar_color.as_deref(),
+            Some("#654321"),
+            "reset keeps colours"
+        );
+        apply_appearance_command(&mut state, IDM_BAR_COLOR_WINDOWS_ACCENT);
+        assert_eq!(state.bar_color.as_deref(), Some(BAR_COLOR_WINDOWS_ACCENT));
+        assert_eq!(state.appearance.provider_colors, ProviderColors::default());
+        apply_appearance_command(&mut state, IDM_COLORS_DEFAULT);
+        assert_eq!(state.bar_color, None);
+        apply_appearance_command(&mut state, IDM_FONT_LARGE);
+        apply_appearance_command(&mut state, IDM_BAR_SLIM);
+        assert_eq!(state.appearance.font_px(), 13);
+        assert!(state.appearance.bar_height() < sc(SEGMENT_H));
+    }
+
+    fn persisted_snapshot_tests_state() -> AppState {
+        let mut state = super::persisted_snapshot_tests::test_state();
+        state.last_poll_ok = true;
+        state
+    }
+
+    #[test]
+    fn countdowns_split_into_their_own_column() {
+        assert_eq!(quota_text_parts("37% 2h04m"), ("37%", "2h04m"));
+        assert_eq!(quota_text_parts("!100% 3d"), ("!100%", "3d"));
+        assert_eq!(quota_text_parts("--"), ("--", ""));
+        assert_eq!(quota_text_parts("!--"), ("!--", ""));
+        assert_eq!(quota_text_parts("NET"), ("NET", ""));
+        assert_eq!(
+            quota_text_parts("Reset now"),
+            ("Reset now", ""),
+            "no % stays whole"
+        );
+    }
+
+    #[test]
+    fn popup_text_states_reset_times_and_never_invents_them() {
+        let now = SystemTime::now();
+        let mut state = persisted_snapshot_tests_state();
+        let region = |provider, window| HoverRegion {
+            rect: RECT::default(),
+            provider,
+            window,
+        };
+        let mut codex = crate::models::UsageData::default();
+        codex.session = crate::models::UsageSection {
+            percentage: 40.0,
+            resets_at: Some(now + Duration::from_secs(3600)),
+            available: true,
+        };
+        codex.weekly = crate::models::UsageSection {
+            percentage: 10.0,
+            resets_at: None,
+            available: true,
+        };
+        let mut claude = crate::models::UsageData::default();
+        claude.session = crate::models::UsageSection {
+            percentage: 80.0,
+            resets_at: Some(now - Duration::from_secs(60)),
+            available: true,
+        };
+        state.data = Some(AppUsageData {
+            codex: Some(codex),
+            claude_code: Some(claude),
+            ..Default::default()
+        });
+        state.provider_health[CODEX].record(Some("a".into()), None, now);
+        state.provider_health[CLAUDE].restore("b".into(), now - Duration::from_secs(600));
+
+        let session = hover_text(
+            &state,
+            &region(CODEX, poller::UsageWindowKind::Session),
+            now,
+        )
+        .unwrap();
+        assert!(session.contains(" resets "), "{session}");
+        let expected =
+            native_interop::format_local_datetime(now + Duration::from_secs(3600)).unwrap();
+        assert!(session.contains(&expected), "{session}");
+        assert!(
+            !session.contains("out of date"),
+            "fresh data has no stale note"
+        );
+
+        let weekly =
+            hover_text(&state, &region(CODEX, poller::UsageWindowKind::Weekly), now).unwrap();
+        assert!(weekly.contains("not reported"), "{weekly}");
+
+        let passed = hover_text(
+            &state,
+            &region(CLAUDE, poller::UsageWindowKind::Session),
+            now,
+        )
+        .unwrap();
+        assert!(passed.contains("!--"), "{passed}");
+
+        let unavailable = hover_text(
+            &state,
+            &region(CLAUDE, poller::UsageWindowKind::Weekly),
+            now,
+        )
+        .unwrap();
+        assert!(
+            unavailable.contains("not 0% used or 100% remaining"),
+            "{unavailable}"
+        );
+
+        assert!(
+            hover_text(&state, &region(2, poller::UsageWindowKind::Session), now).is_none(),
+            "no data, no popup"
+        );
+        state.language = LanguageId::SimplifiedChinese;
+        let chinese = hover_text(
+            &state,
+            &region(CODEX, poller::UsageWindowKind::Session),
+            now,
+        )
+        .unwrap();
+        assert!(chinese.contains("重置于"), "{chinese}");
+    }
+
+    /// Render the real widget painter into image fixtures for visual review:
+    /// `cargo test render_widget_fixtures -- --ignored`, output in
+    /// `target/render-fixtures/*.bmp` (System palettes are composited over a
+    /// sample taskbar colour, as the layered window would be).
+    #[test]
+    #[ignore = "writes image fixtures for visual review"]
+    fn render_widget_fixtures() {
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("render-fixtures");
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut custom = Appearance::default();
+        custom.provider_colors.claude = Some("#9B5DE5".into());
+        custom.provider_colors.codex = Some("#F15BB5".into());
+        let cases: Vec<(&str, Appearance, Option<&str>, bool, u32)> = vec![
+            ("default-dark-100", Appearance::default(), None, true, 96),
+            ("default-light-100", Appearance::default(), None, false, 96),
+            ("default-dark-125", Appearance::default(), None, true, 120),
+            ("default-dark-150", Appearance::default(), None, true, 144),
+            (
+                "segmented-dark-100",
+                Appearance {
+                    bar_style: BarStyle::Segmented,
+                    ..Appearance::default()
+                },
+                None,
+                true,
+                96,
+            ),
+            (
+                "translucent-preset-125",
+                Appearance::default().with_translucent_dark_preset(),
+                None,
+                true,
+                120,
+            ),
+            (
+                "high-contrast-light-100",
+                Appearance {
+                    palette: Palette::HighContrastLight,
+                    ..Appearance::default()
+                },
+                None,
+                false,
+                96,
+            ),
+            ("custom-colors-dark-125", custom, None, true, 120),
+            (
+                "windows-accent-dark-100",
+                Appearance::default(),
+                Some(BAR_COLOR_WINDOWS_ACCENT),
+                true,
+                96,
+            ),
+        ];
+        for (name, appearance, legacy, dark, dpi) in cases {
+            CURRENT_DPI.store(dpi, Ordering::Relaxed);
+            set_widget_font(&appearance);
+            let texts = ["5% 3h41m", "60% 1d06h", "41% 4h12m", "!--", "--", "100% 6d"];
+            let quota = quota_text_width_for(LanguageId::English, &texts);
+            let width = total_widget_width_for(
+                2,
+                LanguageId::English,
+                true,
+                false,
+                CreditValueMode::Credits,
+                "",
+                quota,
+            );
+            let height = sc(WIDGET_HEIGHT);
+            let (bg, text, track) = appearance_colors(&appearance, dark);
+            let mut hover = Vec::new();
+            let pixels = unsafe {
+                let screen = GetDC(HWND::default());
+                let dc = CreateCompatibleDC(screen);
+                let info = BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: width,
+                        biHeight: -height,
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let mut bits = std::ptr::null_mut();
+                let dib = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
+                let old = SelectObject(dc, dib);
+                paint_content(
+                    dc,
+                    width,
+                    height,
+                    dark,
+                    &bg,
+                    &text,
+                    &appearance,
+                    legacy,
+                    &track,
+                    LanguageId::English,
+                    LanguageId::English.strings(),
+                    5.0,
+                    "5% 3h41m",
+                    60.0,
+                    "60% 1d06h",
+                    59.0,
+                    "41% 4h12m",
+                    f64::NAN,
+                    "!--",
+                    0.0,
+                    "--",
+                    100.0,
+                    "100% 6d",
+                    true,
+                    true,
+                    false,
+                    true,
+                    true,
+                    true,
+                    DisplayDirections::MIXED,
+                    false,
+                    CreditPosition::Left,
+                    CreditValueMode::Credits,
+                    "",
+                    &mut hover,
+                );
+                let _ = GdiFlush();
+                let pixels =
+                    std::slice::from_raw_parts(bits as *const u32, (width * height) as usize)
+                        .to_vec();
+                SelectObject(dc, old);
+                let _ = DeleteObject(dib);
+                let _ = DeleteDC(dc);
+                ReleaseDC(HWND::default(), screen);
+                pixels
+            };
+            assert_eq!(
+                hover.len(),
+                4,
+                "{name}: one hover cell per provider and row"
+            );
+            // Bars are antialiased: some pixels blend between track and fill.
+            let distinct: std::collections::BTreeSet<u32> =
+                pixels.iter().map(|p| p & 0xFFFFFF).collect();
+            assert!(distinct.len() > 40, "{name}: smooth edges and text");
+            // System palettes are transparent where the key colour remains;
+            // show them over a typical taskbar colour.
+            let key = (bg.r as u32) << 16 | (bg.g as u32) << 8 | bg.b as u32;
+            let taskbar = if dark { 0x202020 } else { 0xEEEEEE };
+            let mut bmp = Vec::new();
+            let row_bytes = (width * 3 + 3) & !3;
+            let image_size = row_bytes * height;
+            bmp.extend_from_slice(b"BM");
+            bmp.extend_from_slice(&(54 + image_size as u32).to_le_bytes());
+            bmp.extend_from_slice(&0u32.to_le_bytes());
+            bmp.extend_from_slice(&54u32.to_le_bytes());
+            bmp.extend_from_slice(&40u32.to_le_bytes());
+            bmp.extend_from_slice(&width.to_le_bytes());
+            bmp.extend_from_slice(&(-height).to_le_bytes());
+            bmp.extend_from_slice(&1u16.to_le_bytes());
+            bmp.extend_from_slice(&24u16.to_le_bytes());
+            bmp.extend_from_slice(&[0u8; 24]);
+            for y in 0..height {
+                for x in 0..width {
+                    let mut p = pixels[(y * width + x) as usize] & 0xFFFFFF;
+                    if p == key && !appearance.high_contrast() {
+                        p = taskbar;
+                    }
+                    bmp.extend_from_slice(&[p as u8, (p >> 8) as u8, (p >> 16) as u8]);
+                }
+                bmp.extend(std::iter::repeat_n(0u8, (row_bytes - width * 3) as usize));
+            }
+            std::fs::write(directory.join(format!("{name}.bmp")), bmp).unwrap();
+        }
+        CURRENT_DPI.store(96, Ordering::Relaxed);
+        set_widget_font(&Appearance::default());
     }
 }

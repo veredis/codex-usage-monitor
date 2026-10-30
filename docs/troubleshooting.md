@@ -65,6 +65,8 @@ Operational logging is always on and is written to:
 - each provider's schedule (time until ready, retry count, server wait)
 - window creation, taskbar placement (with the notification-area boundary and applied offset), and relaunch events
 - `layout reconcile corrected widget ...` when a delayed check had to move the widget after a burst or a suppressed shell layout event
+- `system resumed: refreshing providers in 10000 ms ...`, `resume refresh starting` and `network restored: refreshing failing or stale providers` around sleep and connectivity changes
+- `preferred taskbar unavailable; using the primary taskbar until it returns` and `preferred taskbar available again; reattaching widget` when the chosen display disconnects and reconnects
 
 The log does not include access tokens, refresh tokens, credential file contents, or API response bodies.
 
@@ -77,6 +79,28 @@ Tools that run inside an MSIX-packaged app (for example the Codex desktop app or
 Every placement path (automatic, manual offset, dragging, dropping on another taskbar, width changes) stays left of the notification area's left edge. When the tray grows (a new tray icon, for example), the widget moves left immediately. A delayed check re-reads the final layout after bursts of shell events and after the monitor's own tray-icon updates. Each countdown tick runs it again as a periodic safety net. On taskbars that expose no notification window, such as some Windows 11 secondary taskbars, a clock-sized area at the right edge is reserved.
 
 If an overlap still appears, note the time and look in the log for `positioned embedded widget ... boundary=` and `layout reconcile corrected` lines around it. A saved manual offset is kept even when a smaller taskbar cannot hold it; the widget is clamped for that taskbar and returns to the saved offset when there is room again.
+
+The chosen taskbar is remembered by its display (`monitor_device` in `settings.json`), not only by its position in the taskbar list. If that display is disconnected, the widget moves to the primary taskbar without forgetting the choice, and returns once the display reconnects. Dragging the widget onto another taskbar changes the choice.
+
+## An older version starts with Windows
+
+**Start with Windows** is the `CodexUsage` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+
+**Older versions:** builds before Build 13 wrote the path of *whichever executable turned the option on*, and never updated it. Starting a newer copy from another folder did not change it. That is how an old development build could launch at sign-in.
+
+**Build 13 and later:**
+- The value is quoted.
+- When `%LOCALAPPDATA%\Programs\CodexUsage\codex-usage.exe` exists, the value always points at that installed copy.
+- The installed copy repairs a value left pointing at another `codex-usage.exe`, and logs `startup registration repaired to launch the installed copy`.
+
+To check the value and which build runs:
+
+```powershell
+Get-ItemPropertyValue 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' CodexUsage
+Select-String "$env:LOCALAPPDATA\CodexUsage\logs\codex-usage.log" -Pattern 'identity=' | Select-Object -Last 1
+```
+
+Install or update the stable copy with `scripts\install.ps1 -SourcePath <exe> -NoLaunch`. If **Start with Windows** was already on, the installer points it at the stable copy, quoted.
 
 ## Update failures
 

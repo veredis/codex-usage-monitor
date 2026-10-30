@@ -3,7 +3,8 @@ param(
     [string]$SourcePath,
     [string]$ExpectedSha256,
     [string]$Version,
-    [switch]$NoLaunch
+    [switch]$NoLaunch,
+    [switch]$NoDesktopShortcut
 )
 
 Set-StrictMode -Version Latest
@@ -150,11 +151,11 @@ try {
         Set-ItemProperty -Path $UninstallKey -Name NoRepair -Type DWord -Value 1
 
         if ($StartupWasEnabled) {
-            Set-ItemProperty -Path $RunKey -Name 'CodexUsage' -Value $TargetPath
+            Set-ItemProperty -Path $RunKey -Name 'CodexUsage' -Value "`"$TargetPath`""
         }
 
         $Shell = New-Object -ComObject WScript.Shell
-        foreach ($LinkPath in @($ShortcutPath, $DesktopShortcutPath)) {
+        foreach ($LinkPath in $(if ($NoDesktopShortcut) { @($ShortcutPath) } else { @($ShortcutPath, $DesktopShortcutPath) })) {
             $ShortcutDirectory = Split-Path -Parent $LinkPath
             New-Item -ItemType Directory -Force -Path $ShortcutDirectory | Out-Null
             $Shortcut = $Shell.CreateShortcut($LinkPath)

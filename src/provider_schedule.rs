@@ -181,7 +181,11 @@ impl ProviderSchedule {
             .filter(|&id| enabled[id] && !self.slots[id].in_flight)
             .map(|id| {
                 let wait = self.slots[id].ready_at(id, now).duration_since(now);
-                (wait.as_millis().min(u32::MAX as u128) as u32).max(MIN_TIMER_MS)
+                // Round up: a truncated delay can wake the timer just before
+                // the deadline (upstream PR #16, benb-atlantis). The caller
+                // re-arms after every pass, so an early wake costs at most
+                // one more timer, never a skipped cycle.
+                (wait.as_nanos().div_ceil(1_000_000).min(u32::MAX as u128) as u32).max(MIN_TIMER_MS)
             })
             .min()
     }
@@ -448,5 +452,95 @@ mod tests {
         assert_eq!(transient_retry_delay_ms(5, POLL_5_MIN), 8 * 60_000);
         assert_eq!(transient_retry_delay_ms(10, POLL_5_MIN), RETRY_MAX_MS);
         assert_eq!(transient_retry_delay_ms(1, POLL_1_HOUR), POLL_1_HOUR);
+    }
+
+    /// Upstream PR #16's edge case: a deadline 0.5 ms after the last
+    /// completion must not be rounded down to an early, empty wake.
+    #[test]
+    fn sub_millisecond_remainders_round_up() {
+        let mut schedule = ProviderSchedule::default();
+        let now = Instant::now();
+        let all = Request {
+            providers: [false, true, false],
+            ..Default::default()
+        };
+        assert_eq!(schedule.begin(now, all), [false, true, false]);
+        schedule.finish(CODEX, now, Outcome::Success, 15 * 60_000);
+        let probe = now + Duration::from_millis(15 * 60_000) - Duration::from_micros(500);
+        assert_eq!(
+            schedule.next_delay_ms(probe, [false, true, false]),
+            Some(MIN_TIMER_MS)
+        );
+        let probe = now + Duration::from_millis(15 * 60_000 - 1_500) - Duration::from_micros(500);
+        assert_eq!(
+            schedule.next_delay_ms(probe, [false, true, false]),
+            Some(1_501),
+            "1500.5 ms rounds up, not down"
+        );
+    }
+
+    /// Two simulated hours of 15-minute cycles where every timer fires 2 ms
+    /// early, re-arming after each pass as `window::spawn_poll` does: every
+    /// cycle still runs within the minimum timer of its deadline.
+    #[test]
+    fn early_timer_wakes_never_skip_a_cycle() {
+        const INTERVAL: u32 = 15 * 60_000;
+        let mut schedule = ProviderSchedule::default();
+        let start = Instant::now();
+        let enabled = [false, true, false];
+        let scheduled = Request {
+            providers: enabled,
+            ..Default::default()
+        };
+        let mut now = start;
+        let mut starts = Vec::new();
+        for _ in 0..200 {
+            if schedule.begin(now, scheduled)[CODEX] {
+                starts.push(now);
+                schedule.finish(CODEX, now, Outcome::Success, INTERVAL);
+            }
+            if starts.len() == 9 {
+                break;
+            }
+            let delay = schedule.next_delay_ms(now, enabled).unwrap();
+            now += Duration::from_millis(u64::from(delay)) - Duration::from_millis(2);
+        }
+        assert_eq!(starts.len(), 9, "t=0 plus eight 15-minute cycles");
+        assert!(starts[8] - start <= Duration::from_millis(8 * u64::from(INTERVAL + MIN_TIMER_MS)));
+        for pair in starts.windows(2) {
+            let gap = pair[1] - pair[0];
+            assert!(
+                gap >= Duration::from_millis(u64::from(INTERVAL))
+                    && gap <= Duration::from_millis(u64::from(INTERVAL + MIN_TIMER_MS)),
+                "cycle gap {gap:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn server_deadlines_hold_against_early_wakes() {
+        let mut schedule = ProviderSchedule::default();
+        let now = Instant::now();
+        let claude = Request {
+            providers: [true, false, false],
+            ignore_due: true,
+            ignore_backoff: true,
+            ignore_spacing: true,
+        };
+        assert!(schedule.begin(now, claude)[CLAUDE]);
+        schedule.finish(
+            CLAUDE,
+            now,
+            Outcome::Transient {
+                server_delay_ms: Some(471_000),
+            },
+            CLAUDE_MIN_POLL_MS,
+        );
+        let early = now + Duration::from_millis(471_000) - Duration::from_millis(2);
+        assert!(
+            !schedule.begin(early, claude)[CLAUDE],
+            "even a forced request waits"
+        );
+        assert!(schedule.begin(now + Duration::from_millis(471_000), claude)[CLAUDE]);
     }
 }

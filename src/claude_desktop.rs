@@ -32,6 +32,37 @@ pub struct DesktopToken {
     pub profile_scope: bool,
 }
 
+impl Drop for DesktopToken {
+    fn drop(&mut self) {
+        wipe_string(&mut self.access_token);
+    }
+}
+
+/// Overwrite secret bytes before their memory is released. Volatile writes
+/// keep the compiler from eliding stores to memory about to be freed.
+pub(crate) fn wipe(bytes: &mut [u8]) {
+    for byte in bytes.iter_mut() {
+        unsafe { std::ptr::write_volatile(byte, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(crate) fn wipe_string(text: &mut String) {
+    // Zero bytes keep the String valid UTF-8.
+    wipe(unsafe { text.as_mut_vec() });
+    text.clear();
+}
+
+/// Wipe every string value (tokens, refresh tokens) of a parsed cache.
+fn scrub_json(value: &mut Value) {
+    match value {
+        Value::String(text) => wipe_string(text),
+        Value::Array(items) => items.iter_mut().for_each(scrub_json),
+        Value::Object(map) => map.values_mut().for_each(scrub_json),
+        _ => {}
+    }
+}
+
 impl std::fmt::Debug for DesktopToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DesktopToken")
@@ -141,10 +172,15 @@ fn read_entries(dir: &Path, len: u64) -> Result<Vec<DesktopToken>, Unavailable> 
         .filter(|value| !value.is_empty())
         .and_then(decode_base64)
         .ok_or(Unavailable::NoTokenCache)?;
-    let plain =
+    let mut plain =
         decrypt_os_crypt(&blob, &dir.join("Local State")).ok_or(Unavailable::DecryptFailed)?;
-    let json: Value = serde_json::from_slice(&plain).map_err(|_| Unavailable::DecryptFailed)?;
+    // The plaintext and its parsed copy also hold refresh tokens: wipe both
+    // as soon as the access tokens are extracted.
+    let parsed = serde_json::from_slice::<Value>(&plain);
+    wipe(&mut plain);
+    let mut json = parsed.map_err(|_| Unavailable::DecryptFailed)?;
     let entries = parse_token_cache(&json);
+    scrub_json(&mut json);
     if entries.is_empty() {
         Err(Unavailable::NoTokenCache)
     } else {
@@ -520,10 +556,12 @@ pub(crate) fn decode_base64(input: &str) -> Option<Vec<u8>> {
 
 fn decrypt_os_crypt(blob: &[u8], local_state: &Path) -> Option<Vec<u8>> {
     if blob.len() >= 31 && blob.starts_with(b"v1") && matches!(blob[2], b'0' | b'1') {
-        let key = master_key(local_state)?;
+        let mut key = master_key(local_state)?;
         let nonce = &blob[3..15];
         let (cipher, tag) = blob[15..].split_at(blob.len() - 15 - 16);
-        aes_gcm_decrypt(&key, nonce, cipher, tag)
+        let plain = aes_gcm_decrypt(&key, nonce, cipher, tag);
+        wipe(&mut key);
+        plain
     } else {
         // Pre-v10 Chromium stored a raw DPAPI blob.
         dpapi_unprotect(blob)
@@ -533,8 +571,12 @@ fn decrypt_os_crypt(blob: &[u8], local_state: &Path) -> Option<Vec<u8>> {
 fn master_key(local_state: &Path) -> Option<Vec<u8>> {
     let state: Value = serde_json::from_slice(&std::fs::read(local_state).ok()?).ok()?;
     let wrapped = decode_base64(state.get("os_crypt")?.get("encrypted_key")?.as_str()?)?;
-    let key = dpapi_unprotect(wrapped.strip_prefix(b"DPAPI")?)?;
-    (key.len() == 32).then_some(key)
+    let mut key = dpapi_unprotect(wrapped.strip_prefix(b"DPAPI")?)?;
+    if key.len() != 32 {
+        wipe(&mut key);
+        return None;
+    }
+    Some(key)
 }
 
 fn dpapi_unprotect(data: &[u8]) -> Option<Vec<u8>> {
@@ -547,7 +589,9 @@ fn dpapi_unprotect(data: &[u8]) -> Option<Vec<u8>> {
     let mut output = CRYPT_INTEGER_BLOB::default();
     unsafe {
         CryptUnprotectData(&input, None, None, None, None, 0, &mut output).ok()?;
-        let plain = std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
+        let buffer = std::slice::from_raw_parts_mut(output.pbData, output.cbData as usize);
+        let plain = buffer.to_vec();
+        wipe(buffer);
         let _ = LocalFree(HLOCAL(output.pbData.cast()));
         Some(plain)
     }
@@ -663,6 +707,28 @@ mod tests {
             account_uuid: account,
             org_uuid: org,
         }
+    }
+
+    #[test]
+    fn secrets_are_wiped_from_buffers_and_parsed_copies() {
+        let mut bytes = b"synthetic-refresh-token".to_vec();
+        wipe(&mut bytes);
+        assert!(bytes.iter().all(|b| *b == 0));
+        let mut text = String::from("synthetic-access-token");
+        wipe_string(&mut text);
+        assert!(text.is_empty());
+        let mut cache = json!({
+            key(Some(ACCOUNT), ORG, SCOPE): entry("synthetic-access", 1),
+            "nested": [{"refreshToken": "synthetic-refresh"}]
+        });
+        let entries = parse_token_cache(&cache);
+        scrub_json(&mut cache);
+        let scrubbed = cache.to_string();
+        assert!(!scrubbed.contains("synthetic"), "{scrubbed}");
+        assert_eq!(
+            entries[0].access_token, "synthetic-access",
+            "extracted copy intact"
+        );
     }
 
     #[test]

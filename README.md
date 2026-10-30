@@ -14,7 +14,11 @@ This repository is the `veredis` fork of [upstream-ray/codex-usage-monitor](http
 
 Download the latest fork release from [veredis/codex-usage-monitor](https://github.com/veredis/codex-usage-monitor/releases/latest).
 
-The release is portable: download `codex-usage.exe` and run it directly. No installer is required.
+The release is portable: download `codex-usage.exe` and run it directly.
+
+To keep **Start with Windows** stable across updates, install it to `%LOCALAPPDATA%\Programs\CodexUsage` with `scripts\install.ps1`. `-SourcePath <exe>` installs a local build, and `-NoLaunch` and `-NoDesktopShortcut` are optional.
+
+**Start with Windows** always registers that installed copy when it exists. The installed copy also repairs a registration left pointing at another `codex-usage.exe`, so a development or older build you launched by hand never takes over sign-in startup.
 
 ## Features
 
@@ -26,7 +30,15 @@ The release is portable: download `codex-usage.exe` and run it directly. No inst
 - A separate one-time 0% exhaustion alert for enabled quota windows.
 - Optional Credits display with Left or Right placement.
 - Credits or approximate USD display (`~$13.40`) using the raw balance for conversion.
-- Windows accent-colored bars or a custom color selected with the native color picker.
+- Upstream's appearance:
+  - a provider mark beside each provider's bars
+  - antialiased rounded bars, continuous or segmented, standard or slim
+  - standard or larger text
+  - high-contrast dark and light palettes with a solid backdrop for translucent taskbars
+
+  The widget also shrinks to fit shorter taskbars.
+- Default per-provider colors (Claude orange, Codex green, Antigravity blue), or your own: one color for every bar (custom or the Windows accent), or a color per provider, chosen with the native color picker. **Appearance > Colors > Default provider colors** restores the defaults.
+- Hover a quota value to see its exact local reset date and time, or what `--` (not reported) and `!--` (reset since the last refresh) mean.
 - Fixed polling intervals from 30 seconds to 1 hour, plus optional Adaptive polling.
 - Optional compact 2x3 drag handle and persistent widget positioning.
 - Automatic, manual and dragged positions all stay left of the notification area (Show hidden icons, tray icons and clock); taskbar layout changes are always reconciled, even when they arrive in bursts.
@@ -45,6 +57,12 @@ Important defaults and settings:
 - **Update frequency:** Fixed choices are 30 seconds, 1 minute, 5 minutes, 15 minutes, and 1 hour. Adaptive uses 5 minutes above 30% remaining, 1 minute from above 10% through 30%, and 30 seconds at 10% or below. Claude usage requests are spaced at least 2 minutes apart at every setting (a current design decision, see below). Countdown movement is local and does not create extra provider requests.
 - **Quota alerts:** Off by default. Select any combination of 2%, 5%, 10%, 20%, and 30% remaining. Each selected threshold alerts once per genuine quota window; an enabled window can also send one separate alert at 0% remaining.
 - **Credits:** Credits visibility is **Always** by default, with **Always**, **When needed**, and **Off** options. **When needed** shows the auxiliary area when an included Codex quota reaches 0%. The area can be placed **Left** or **Right**, independently of visibility. Choose **Credits** or **USD** value format. Finite Credits use the precise underlying balance for USD estimates and display whole Credits rounded to the nearest whole credit; known zero, unlimited, and unknown data remain distinct.
+- **Appearance:** **Settings > Appearance** offers:
+  - the translucent-dark-taskbar preset
+  - **Reset appearance**, which keeps your colors
+  - contrast, bar style and thickness, text size and colors
+
+  An explicitly chosen color always wins over a palette, and a color saved by an earlier version keeps applying to every bar.
 - **Taskbar placement:** **Show drag handle** is off by default. Reset Position computes a safe default without forgetting a manually saved position.
 - **MCP integration:** Enable **Enable MCP integration** to expose the local read-only usage tools described below.
 
@@ -53,6 +71,10 @@ Important defaults and settings:
 Each provider is polled on its own schedule and its own worker, so one provider's slow response, rate limit or outage never delays another provider or marks it stale. Failures back off per provider, never faster than the selected frequency, and a server `Retry-After` deadline is honored even by **Refresh**.
 
 Claude's usage endpoint is shared with every Claude Code session's status line and rate-limits aggressively, so the monitor currently spaces Claude requests at least 120 seconds apart, even at the 30-second or Adaptive settings. **Refresh** may bypass this spacing but not a server deadline. This is the Build 6 design decision and may be revised.
+
+After the computer resumes from sleep or hibernation, providers refresh about 10 seconds later. When internet access returns after an outage, failing or stale providers refresh at once. Both recovery refreshes skip backoff that built up while offline, but never Claude's request spacing, a server `Retry-After` deadline or a request already in flight.
+
+A window the provider does not report is shown as `--`, never as 0% used or 100% remaining, and it never triggers an alert.
 
 Provider results feed one normalized monitor cache. The taskbar UI and MCP server read that cache; MCP requests do not trigger another usage request. During transient failures, the last successful percentages remain visible with a leading `!` while reset countdowns continue from their known timestamps and freshness is reported honestly. A value is marked stale only when its own provider failed or has not succeeded within twice its own interval.
 
@@ -97,7 +119,7 @@ Claude usage comes from the same read-only usage endpoint Claude Code uses. Each
 
 1. **Claude Code's own cached reading** (`cachedUsageUtilization` in `~/.claude.json`) when the CLI fetched it within the last two minutes and it belongs to the CLI's signed-in account. No request is made.
 2. **The Claude Code CLI sign-in** (`~/.claude/.credentials.json`).
-3. **The Claude desktop app's own sign-in**, read-only, when the CLI sign-in is expired, missing or rejected. Claude Desktop keeps this sign-in fresh while you use it (including its Code tab), whereas the CLI file only renews when the CLI itself runs. Only an entry for the CLI's signed-in account is used, decrypted with the current Windows user's DPAPI key; the token is held in memory for the request and never logged or saved. Set `"use_claude_desktop_sign_in": false` in `%APPDATA%\CodexUsage\settings.json` to turn this off.
+3. **The Claude desktop app's own sign-in**, read-only, when the CLI sign-in is expired, missing or rejected. Claude Desktop keeps this sign-in fresh while you use it (including its Code tab), whereas the CLI file only renews when the CLI itself runs. Only an entry for the CLI's signed-in account is used, decrypted with the current Windows user's DPAPI key; the token is held in memory for the request and never logged or saved. This fallback is **off unless you turn it on**. **Settings > Use Claude Desktop sign-in (read-only)** explains what it reads and sends, and asks before enabling it. The same menu item turns it off again; it is saved as `use_claude_desktop_sign_in` in `settings.json`.
 
 If no sign-in is usable, the monitor keeps the last values marked stale (`!`) and waits; as soon as Claude Code or Claude Desktop refreshes its own sign-in, the next tick resumes without restarting the widget. A rejected token is never resent until it changes. The monitor never runs a model request, `claude -p`, or an OAuth refresh to force renewal. Unattended renewal of the CLI sign-in is not automated; see `docs/troubleshooting.md`.
 
@@ -167,4 +189,4 @@ Released under the [MIT License](LICENSE).
 
 ## Current version
 
-The public fork release is `1.9.1-veredis.7`. The current development binary identifies itself as `1.9.1-veredis.7 (Build 11)`; the Build number is an informational candidate identifier and does not change update ordering.
+The public fork release is `1.9.1-veredis.7`. The current development binary identifies itself as `1.9.1-veredis.7 (Build 13)`; the Build number is an informational candidate identifier and does not change update ordering.

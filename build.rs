@@ -8,6 +8,10 @@ fn main() {
     let numeric_version = pack_version(version);
 
     res.set_icon("src/icons/icon.ico")
+        // Layered child windows (the embedded widget) require a Windows 8+
+        // compatibility declaration, notably when reattached to another
+        // taskbar. From upstream PR #30 (SoKeiKei).
+        .set_manifest(include_str!("app.manifest"))
         .set("FileVersion", version)
         .set("ProductVersion", version)
         .set_version_info(VersionInfo::FILEVERSION, numeric_version)

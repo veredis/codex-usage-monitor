@@ -856,7 +856,7 @@ fn poll_claude_sources(
         Some(Ok(token)) if is_token_expired(token.expires_at_ms) => {
             log_claude_state_change(1, "Claude Desktop sign-in also expired".to_string());
         }
-        Some(Ok(token)) => {
+        Some(Ok(mut token)) => {
             log_claude_state_change(
                 1,
                 format!(
@@ -868,7 +868,7 @@ fn poll_claude_sources(
                 record_claude_observation(|o| o.account_override = token.account_uuid.clone());
             }
             let creds = Credentials {
-                access_token: token.access_token,
+                access_token: std::mem::take(&mut token.access_token),
                 expires_at: token.expires_at_ms,
             };
             return fetch_claude_passively(creds, desktop_rejected, fetch);
@@ -1778,6 +1778,12 @@ fn unix_to_system_time(unix_secs: Option<i64>) -> Option<SystemTime> {
 struct Credentials {
     access_token: String,
     expires_at: Option<i64>,
+}
+
+impl Drop for Credentials {
+    fn drop(&mut self) {
+        crate::claude_desktop::wipe_string(&mut self.access_token);
+    }
 }
 
 fn read_first_credentials() -> Option<Credentials> {

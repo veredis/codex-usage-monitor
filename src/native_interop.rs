@@ -27,6 +27,8 @@ pub const TIMER_RESET_POLL: usize = 3;
 pub const TIMER_UPDATE_CHECK: usize = 4;
 pub const TIMER_CREDENTIAL_WATCH: usize = 5;
 pub const TIMER_LAYOUT_RECONCILE: usize = 6;
+/// One-shot refresh shortly after the system resumes.
+pub const TIMER_RESUME_RECOVERY: usize = 7;
 
 // Custom messages
 pub const WM_APP: u32 = 0x8000;
@@ -34,6 +36,56 @@ pub const WM_APP_USAGE_UPDATED: u32 = WM_APP + 1;
 pub const WM_APP_TRAY: u32 = WM_APP + 3;
 
 const WINDOWS_TO_UNIX_EPOCH_SECONDS: u64 = 11_644_473_600;
+
+/// `value` in the user's locale and time zone, e.g. `Thu 10/31/2026 6:59 PM`
+/// (weekday, short date, time without seconds).
+pub fn format_local_datetime(value: SystemTime) -> Option<String> {
+    use windows::Win32::Globalization::{
+        GetDateFormatEx, GetTimeFormatEx, DATE_SHORTDATE, TIME_NOSECONDS,
+    };
+    let local = system_time_to_local(value)?;
+    let read = |buffer: &[u16], len: i32| {
+        (len > 1).then(|| String::from_utf16_lossy(&buffer[..len as usize - 1]))
+    };
+    unsafe {
+        let mut weekday = [0u16; 32];
+        let weekday_format = wide_str("ddd");
+        let weekday_len = GetDateFormatEx(
+            PCWSTR::null(),
+            Default::default(),
+            Some(&local),
+            PCWSTR::from_raw(weekday_format.as_ptr()),
+            Some(&mut weekday),
+            PCWSTR::null(),
+        );
+        let mut date = [0u16; 64];
+        let date_len = GetDateFormatEx(
+            PCWSTR::null(),
+            DATE_SHORTDATE,
+            Some(&local),
+            PCWSTR::null(),
+            Some(&mut date),
+            PCWSTR::null(),
+        );
+        let mut time = [0u16; 64];
+        let time_len = GetTimeFormatEx(
+            PCWSTR::null(),
+            TIME_NOSECONDS,
+            Some(&local),
+            PCWSTR::null(),
+            Some(&mut time),
+        );
+        let parts: Vec<String> = [
+            read(&weekday, weekday_len),
+            read(&date, date_len),
+            read(&time, time_len),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        (!parts.is_empty()).then(|| parts.join(" "))
+    }
+}
 
 pub fn system_time_to_local(value: SystemTime) -> Option<SYSTEMTIME> {
     let unix_seconds = value.duration_since(UNIX_EPOCH).ok()?.as_secs();
@@ -57,6 +109,38 @@ pub fn system_time_to_local(value: SystemTime) -> Option<SYSTEMTIME> {
 pub struct TaskbarWindow {
     pub hwnd: HWND,
     pub rect: RECT,
+    /// `Shell_TrayWnd` (the primary taskbar) rather than a secondary one.
+    pub is_primary: bool,
+}
+
+/// Windows display device name (for example `\\.\DISPLAY2`) of a taskbar's
+/// monitor. Stable across taskbar reordering, unlike an enumeration index.
+/// Adapted from upstream main `taskbar_monitor_device` (upstream-ray, MIT).
+pub fn taskbar_monitor_device(taskbar: &TaskbarWindow) -> Option<String> {
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
+    };
+    let point = windows::Win32::Foundation::POINT {
+        x: taskbar.rect.left + (taskbar.rect.right - taskbar.rect.left) / 2,
+        y: taskbar.rect.top + (taskbar.rect.bottom - taskbar.rect.top) / 2,
+    };
+    unsafe {
+        let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
+        if monitor.is_invalid() {
+            return None;
+        }
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        if !GetMonitorInfoW(monitor, &mut info as *mut _ as *mut MONITORINFO).as_bool() {
+            return None;
+        }
+        let len = info
+            .szDevice
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(info.szDevice.len());
+        Some(String::from_utf16_lossy(&info.szDevice[..len])).filter(|name| !name.is_empty())
+    }
 }
 
 pub fn find_taskbars() -> Vec<TaskbarWindow> {
@@ -68,7 +152,11 @@ pub fn find_taskbars() -> Vec<TaskbarWindow> {
             let class_name = String::from_utf16_lossy(&class_name[..len as usize]);
             if class_name == "Shell_TrayWnd" || class_name == "Shell_SecondaryTrayWnd" {
                 if let Some(rect) = get_taskbar_rect(hwnd).or_else(|| get_window_rect_safe(hwnd)) {
-                    taskbars.push(TaskbarWindow { hwnd, rect });
+                    taskbars.push(TaskbarWindow {
+                        hwnd,
+                        rect,
+                        is_primary: class_name == "Shell_TrayWnd",
+                    });
                 }
             }
         }
@@ -326,7 +414,7 @@ pub fn colorref(r: u8, g: u8, b: u8) -> u32 {
 }
 
 /// Color helper
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Color {
     pub r: u8,
     pub g: u8,
