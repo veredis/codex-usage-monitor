@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 
 use crate::diagnose;
 use crate::models::{CreditBalance, UsageData, UsageSection};
-use crate::poller::remaining_percentage;
+use crate::poller::{remaining_percentage, DataSource};
 
 pub const MCP_PORT: u16 = 46827;
 const MCP_PATH: &str = "/mcp";
@@ -24,6 +24,7 @@ const SOCKET_TIMEOUT: Duration = Duration::from_secs(2);
 struct CachedSnapshot {
     data: UsageData,
     updated_at: SystemTime,
+    source: DataSource,
 }
 
 #[derive(Clone, Debug)]
@@ -95,24 +96,46 @@ impl SharedUsage {
         }
     }
 
+    #[cfg(test)]
     fn publish(&mut self, data: UsageData, claude: bool) {
+        self.publish_at(data, claude, SystemTime::now(), DataSource::Live, true);
+    }
+
+    /// `clear_error` is false for stale data shown during a failure (a
+    /// restored snapshot or Claude Code's cached reading), so the failure
+    /// stays visible.
+    fn publish_at(
+        &mut self,
+        data: UsageData,
+        claude: bool,
+        updated_at: SystemTime,
+        source: DataSource,
+        clear_error: bool,
+    ) {
         // A poll already in flight must not repopulate a disabled provider.
-        if if claude {
+        if !(if claude {
             self.claude_enabled
         } else {
             self.codex_enabled
-        } {
-            let snapshot = Some(CachedSnapshot {
-                data,
-                updated_at: SystemTime::now(),
-            });
-            if claude {
-                self.errors[1] = None;
-                self.claude_snapshot = snapshot;
-            } else {
-                self.errors[0] = None;
-                self.snapshot = snapshot;
-            }
+        }) {
+            return;
+        }
+        let slot = if claude {
+            &mut self.claude_snapshot
+        } else {
+            &mut self.snapshot
+        };
+        // An older observation never replaces a newer one.
+        if slot.as_ref().is_some_and(|s| s.updated_at > updated_at) {
+            return;
+        }
+        *slot = Some(CachedSnapshot {
+            data,
+            updated_at,
+            source,
+        });
+        if clear_error {
+            self.errors[usize::from(claude)] = None;
         }
     }
 }
@@ -128,20 +151,22 @@ fn shared_usage() -> &'static RwLock<SharedUsage> {
     SHARED.get_or_init(|| RwLock::new(SharedUsage::default()))
 }
 
-pub fn publish_snapshot(data: UsageData, adaptive: bool, interval_ms: u32) {
-    let metadata = PollingMetadata {
-        mode: if adaptive { "adaptive" } else { "fixed" },
-        effective_interval_seconds: interval_ms.saturating_add(999) / 1000,
+/// Publish a provider observation (`id` 0 = Claude, 1 = Codex). The MCP
+/// tools only ever read what is published here.
+pub fn publish_observation(
+    id: usize,
+    data: UsageData,
+    updated_at: SystemTime,
+    source: DataSource,
+    clear_error: bool,
+) {
+    let claude = match id {
+        0 => true,
+        1 => false,
+        _ => return,
     };
     if let Ok(mut shared) = shared_usage().write() {
-        shared.polling = metadata;
-        shared.publish(data, false);
-    }
-}
-
-pub fn publish_claude_snapshot(data: UsageData) {
-    if let Ok(mut shared) = shared_usage().write() {
-        shared.publish(data, true);
+        shared.publish_at(data, claude, updated_at, source, clear_error);
     }
 }
 
@@ -574,6 +599,7 @@ fn usage_snapshot_result(
             "age_seconds": null,
             "polling_mode": polling.mode,
             "effective_poll_interval_seconds": effective_interval,
+            "data_source": null,
             "status":"unavailable"
         });
     };
@@ -583,7 +609,18 @@ fn usage_snapshot_result(
         .unwrap_or_default()
         .as_secs();
     let stale_after_seconds = effective_interval.saturating_mul(2).max(60);
-    let (lowest, limiting_window) = lowest_remaining(&snapshot.data);
+    // A window whose reset passed after the observation has no known value.
+    let mut data = snapshot.data.clone();
+    for section in [&mut data.session, &mut data.weekly] {
+        if crate::provider_health::window_reset_since(
+            section.resets_at,
+            Some(snapshot.updated_at),
+            now,
+        ) {
+            section.available = false;
+        }
+    }
+    let (lowest, limiting_window) = lowest_remaining(&data);
     let credits = match snapshot.data.credits.as_ref() {
         Some(CreditBalance::Amount(amount)) => json!({"state":"amount","balance":amount}),
         Some(CreditBalance::Unlimited) => json!({"state":"unlimited"}),
@@ -594,9 +631,10 @@ fn usage_snapshot_result(
         .duration_since(UNIX_EPOCH)
         .ok()
         .map(|duration| duration.as_secs());
+    let stale = age > stale_after_seconds as u64 || snapshot.source == DataSource::Restored;
     json!({
-        "five_hour": section_json(&snapshot.data.session),
-        "weekly": section_json(&snapshot.data.weekly),
+        "five_hour": section_json(&data.session),
+        "weekly": section_json(&data.weekly),
         "credits": credits,
         "lowest_remaining_percent": lowest,
         "limiting_window": limiting_window,
@@ -604,7 +642,8 @@ fn usage_snapshot_result(
         "age_seconds": age,
         "polling_mode": polling.mode,
         "effective_poll_interval_seconds": effective_interval,
-        "status": if age > stale_after_seconds as u64 { "stale" } else { "ok" }
+        "data_source": snapshot.source.name(),
+        "status": if stale { "stale" } else { "ok" }
     })
 }
 
@@ -765,9 +804,10 @@ mod tests {
     fn usage_results_keep_a_stable_field_set_without_reserve() {
         // Both tools share this schema; clients (Codex, Claude Code) rely on
         // these keys. The experimental luna_reserve field is gone.
-        const KEYS: [&str; 10] = [
+        const KEYS: [&str; 11] = [
             "age_seconds",
             "credits",
+            "data_source",
             "effective_poll_interval_seconds",
             "five_hour",
             "limiting_window",
@@ -805,7 +845,82 @@ mod tests {
         CachedSnapshot {
             data,
             updated_at: UNIX_EPOCH + Duration::from_secs(2_000_000_000) - age,
+            source: DataSource::Live,
         }
+    }
+
+    #[test]
+    fn restored_and_cached_observations_are_labelled_and_never_override_newer_data() {
+        let now = UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        let polling = PollingMetadata::default();
+        let mut shared = SharedUsage::default();
+        shared.set_monitoring_enabled(true, true);
+        shared.record_health(1, false, Some(crate::poller::PollError::TokenExpired));
+        shared.publish_at(
+            test_data(20.0, 40.0),
+            true,
+            now - Duration::from_secs(5),
+            DataSource::Restored,
+            false,
+        );
+        let restored = snapshot_with_health(
+            shared.claude_snapshot.as_ref(),
+            &polling,
+            now,
+            shared.errors[1],
+        );
+        assert_eq!(restored["data_source"], "restored_snapshot");
+        assert_eq!(restored["status"], "stale", "restored values are never ok");
+        assert_eq!(restored["authentication_required"], true, "error kept");
+        // An older cached reading does not replace the restored snapshot.
+        shared.publish_at(
+            test_data(1.0, 1.0),
+            true,
+            now - Duration::from_secs(60),
+            DataSource::ClaudeCodeCache,
+            false,
+        );
+        assert_eq!(
+            shared
+                .claude_snapshot
+                .as_ref()
+                .unwrap()
+                .data
+                .session
+                .percentage,
+            20.0
+        );
+        shared.publish_at(test_data(25.0, 45.0), true, now, DataSource::Live, true);
+        let live = snapshot_with_health(
+            shared.claude_snapshot.as_ref(),
+            &polling,
+            now,
+            shared.errors[1],
+        );
+        assert_eq!(live["data_source"], "live");
+        assert_eq!(live["status"], "ok");
+        assert_eq!(live["error_category"], Value::Null);
+    }
+
+    #[test]
+    fn windows_whose_reset_passed_after_the_observation_report_no_value() {
+        let now = UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        let mut data = test_data(80.0, 30.0);
+        data.session.resets_at = Some(now - Duration::from_secs(60));
+        data.weekly.resets_at = Some(now + Duration::from_secs(3_600));
+        let snapshot = CachedSnapshot {
+            data,
+            updated_at: now - Duration::from_secs(600),
+            source: DataSource::Restored,
+        };
+        let result = usage_snapshot_result(Some(&snapshot), &PollingMetadata::default(), now);
+        assert_eq!(
+            result["five_hour"],
+            Value::Null,
+            "pre-reset 80% is not reported"
+        );
+        assert_eq!(result["weekly"]["used_percent"], 30.0);
+        assert_eq!(result["limiting_window"], "weekly");
     }
 
     fn test_data(session: f64, weekly: f64) -> UsageData {

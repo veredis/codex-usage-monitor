@@ -29,6 +29,7 @@ use crate::native_interop::{
 };
 use crate::poller;
 use crate::provider_schedule::{self, CLAUDE, CODEX};
+use crate::quota_cache;
 use crate::taskbar_layout::{self, LayoutAction, LayoutEventGate};
 use crate::theme;
 use crate::tray_icon;
@@ -101,6 +102,11 @@ struct AppState {
     data: Option<AppUsageData>,
     provider_health: [crate::provider_health::ProviderHealth; 3],
     provider_generation: u64,
+    /// Where each provider's shown values came from.
+    data_sources: [poller::DataSource; 3],
+    /// Last snapshot written to (or restored from) disk, to limit rewrites.
+    persisted: [Option<quota_cache::Snapshot>; 3],
+    claude_desktop_sign_in: bool,
 
     poll_interval_ms: u32,
     adaptive_polling: bool,
@@ -452,6 +458,14 @@ struct SettingsFile {
     adaptive_polling: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     notified_quota_windows: Vec<String>,
+    /// Read-only fallback to the Claude Desktop app's own sign-in when the
+    /// Claude Code CLI sign-in has expired. Settings-file only.
+    #[serde(default = "default_claude_desktop_sign_in")]
+    use_claude_desktop_sign_in: bool,
+}
+
+fn default_claude_desktop_sign_in() -> bool {
+    true
 }
 
 impl Default for SettingsFile {
@@ -481,6 +495,7 @@ impl Default for SettingsFile {
             alert_thresholds_percent: None,
             adaptive_polling: false,
             notified_quota_windows: Vec::new(),
+            use_claude_desktop_sign_in: default_claude_desktop_sign_in(),
         }
     }
 }
@@ -873,6 +888,7 @@ fn save_state_settings() {
             alert_thresholds_percent: Some(s.alert_thresholds_percent.clone()),
             adaptive_polling: s.adaptive_polling,
             notified_quota_windows: s.notified_quota_windows.iter().cloned().collect(),
+            use_claude_desktop_sign_in: s.claude_desktop_sign_in,
         });
     }
 }
@@ -1621,9 +1637,19 @@ fn refresh_usage_texts(state: &mut AppState) {
             missing_usage_text(&state.antigravity_weekly_text, error, state.language);
     }
     let now = std::time::SystemTime::now();
+    sync_provider_percents(state, now);
     // Age against each provider's own cadence, never against an escalating
     // error delay or another provider's backoff.
     let base_interval = effective_poll_interval_ms(state);
+    let unknown = [
+        [state.session_percent, state.weekly_percent],
+        [state.codex_session_percent, state.codex_weekly_percent],
+        [
+            state.antigravity_session_percent,
+            state.antigravity_weekly_percent,
+        ],
+    ]
+    .map(|row| row.map(f64::is_nan));
     for (id, session, weekly) in [
         (0, &mut state.session_text, &mut state.weekly_text),
         (
@@ -1639,9 +1665,137 @@ fn refresh_usage_texts(state: &mut AppState) {
     ] {
         let interval = provider_schedule::provider_interval_ms(id, base_interval);
         let stale = state.provider_health[id].stale(now, interval);
-        *session = crate::provider_health::stale_text(session, stale);
-        *weekly = crate::provider_health::stale_text(weekly, stale);
+        for (text, unknown) in [(session, unknown[id][0]), (weekly, unknown[id][1])] {
+            *text = if unknown {
+                // The old value predates a reset that has passed: unknown,
+                // never a guessed post-reset value.
+                if stale { "!--" } else { "--" }.to_string()
+            } else {
+                crate::provider_health::stale_text(text, stale)
+            };
+        }
     }
+}
+
+/// Bar values follow the shown data; a window whose reset passed after the
+/// observation is unknown (NaN draws an empty track in either direction).
+fn sync_provider_percents(state: &mut AppState, now: SystemTime) {
+    for id in 0..provider_schedule::PROVIDERS {
+        let updated = state.provider_health[id].updated_at();
+        let values = state
+            .data
+            .as_ref()
+            .and_then(|data| provider_usage(data, id))
+            .map(|usage| {
+                [&usage.session, &usage.weekly].map(|section| {
+                    if crate::provider_health::window_reset_since(section.resets_at, updated, now) {
+                        f64::NAN
+                    } else {
+                        section.percentage
+                    }
+                })
+            })
+            .unwrap_or([0.0, 0.0]);
+        let (session, weekly) = match id {
+            CLAUDE => (&mut state.session_percent, &mut state.weekly_percent),
+            CODEX => (
+                &mut state.codex_session_percent,
+                &mut state.codex_weekly_percent,
+            ),
+            _ => (
+                &mut state.antigravity_session_percent,
+                &mut state.antigravity_weekly_percent,
+            ),
+        };
+        (*session, *weekly) = (values[0], values[1]);
+    }
+}
+
+/// Providers whose shown values predate a reset that has now passed and
+/// that are healthy; failing providers already retry on their own schedule.
+fn reset_poll_pending(state: &AppState, now: SystemTime) -> [bool; provider_schedule::PROVIDERS] {
+    std::array::from_fn(|id| {
+        state.provider_health[id].error.is_none()
+            && state
+                .data
+                .as_ref()
+                .and_then(|data| provider_usage(data, id))
+                .is_some_and(|usage| {
+                    let updated = state.provider_health[id].updated_at();
+                    [&usage.session, &usage.weekly].iter().any(|section| {
+                        crate::provider_health::window_reset_since(section.resets_at, updated, now)
+                    })
+                })
+    })
+}
+
+/// Restore each enabled provider's last snapshot for its current account
+/// before the first poll, shown stale (`!`) until a successful refresh. For
+/// Claude, Claude Code's own cached reading wins when it is newer.
+fn restore_snapshots() {
+    let enabled = {
+        let state = lock_state();
+        let Some(state) = state.as_ref() else {
+            return;
+        };
+        enabled_providers(state)
+    };
+    // File reads happen outside the state lock.
+    let restored: Vec<_> = (0..provider_schedule::PROVIDERS)
+        .filter(|&id| enabled[id])
+        .filter_map(|id| {
+            let scope = poller::account_scope(id)?;
+            let persisted = quota_cache::load(id, &scope);
+            let mut best = persisted
+                .clone()
+                .map(|snapshot| (snapshot, poller::DataSource::Restored));
+            if id == CLAUDE {
+                if let Some((data, updated_at)) = crate::claude_local::read().cached_usage {
+                    if best.as_ref().is_none_or(|(s, _)| updated_at > s.updated_at) {
+                        best = Some((
+                            quota_cache::Snapshot { data, updated_at },
+                            poller::DataSource::ClaudeCodeCache,
+                        ));
+                    }
+                }
+            }
+            best.map(|(snapshot, source)| (id, scope, snapshot, source, persisted))
+        })
+        .collect();
+    if restored.is_empty() {
+        diagnose::log("no persisted quota snapshots to restore");
+        return;
+    }
+
+    let mut guard = lock_state();
+    let Some(state) = guard.as_mut() else {
+        return;
+    };
+    let now = SystemTime::now();
+    for (id, scope, snapshot, source, persisted) in restored {
+        diagnose::log(format!(
+            "restored {} snapshot source={} age_s={}; shown stale until refreshed",
+            poller::provider_name(id),
+            source.name(),
+            now.duration_since(snapshot.updated_at)
+                .unwrap_or_default()
+                .as_secs()
+        ));
+        state.provider_health[id].restore(scope, snapshot.updated_at);
+        state.data_sources[id] = poller::DataSource::Restored;
+        state.persisted[id] = persisted;
+        codex_mcp::publish_observation(
+            id,
+            snapshot.data.clone(),
+            snapshot.updated_at,
+            poller::DataSource::Restored,
+            false,
+        );
+        *provider_usage_mut(state.data.get_or_insert_with(Default::default), id) =
+            Some(snapshot.data);
+    }
+    state.last_poll_ok = true;
+    refresh_usage_texts(state);
 }
 
 /// Text for an enabled provider without usable data: its error label once it
@@ -2668,6 +2822,11 @@ pub fn run() {
 
         let claude_code_available = poller::claude_code_credentials_available();
         let settings = load_settings(claude_code_available);
+        poller::set_claude_desktop_sign_in(settings.use_claude_desktop_sign_in);
+        diagnose::log(format!(
+            "Claude Desktop sign-in fallback enabled={}",
+            settings.use_claude_desktop_sign_in
+        ));
         let manual_position = settings
             .manual_position
             .unwrap_or(settings.tray_offset != 0);
@@ -2770,6 +2929,9 @@ pub fn run() {
                 data: None,
                 provider_health: Default::default(),
                 provider_generation: 0,
+                data_sources: Default::default(),
+                persisted: Default::default(),
+                claude_desktop_sign_in: settings.use_claude_desktop_sign_in,
                 poll_interval_ms: settings.poll_interval_ms,
                 adaptive_polling: settings.adaptive_polling,
                 schedule: Default::default(),
@@ -2847,7 +3009,11 @@ pub fn run() {
         // (WM_TIMER included), so a timer would never fire again.
         spawn_taskbar_watchdog();
 
-        // Initial poll; each provider then re-arms TIMER_POLL from its own deadline.
+        // Last known values first (marked stale), then the initial poll; each
+        // provider then re-arms TIMER_POLL from its own deadline.
+        restore_snapshots();
+        position_at_taskbar();
+        render_layered();
         spawn_poll(SendHwnd::from_hwnd(hwnd), PollTrigger::Scheduled);
 
         schedule_auto_update_check(hwnd);
@@ -3493,13 +3659,7 @@ fn spawn_poll(send_hwnd: SendHwnd, trigger: PollTrigger) {
             return;
         };
         let enabled = enabled_providers(state);
-        let past_reset = std::array::from_fn(|id| {
-            state
-                .data
-                .as_ref()
-                .and_then(|data| provider_usage(data, id))
-                .is_some_and(poller::is_past_reset)
-        });
+        let past_reset = reset_poll_pending(state, SystemTime::now());
         let request = poll_request(trigger, enabled, past_reset, state.codex_auth.active);
         let started = state.schedule.begin(Instant::now(), request);
         if started.contains(&true) {
@@ -3831,6 +3991,9 @@ fn apply_provider_poll(hwnd: HWND, id: usize, generation: u64, result: poller::P
     let mut balloon = None;
     let mut codex_watch = None;
     let polling_metadata;
+    let mut persist: Option<(String, quota_cache::Snapshot)> = None;
+    let mut adopted_fallback = None;
+    let observed_at = result.observed_at.unwrap_or_else(SystemTime::now);
 
     {
         let mut guard = lock_state();
@@ -3852,7 +4015,7 @@ fn apply_provider_poll(hwnd: HWND, id: usize, generation: u64, result: poller::P
 
         let previous_error = state.provider_health[id].error;
         let invalidate =
-            state.provider_health[id].record(result.scope.clone(), result.error, SystemTime::now());
+            state.provider_health[id].record(result.scope.clone(), result.error, observed_at);
         codex_mcp::record_provider_health(id, invalidate, result.error);
         merge_provider_result(
             state.data.get_or_insert_with(Default::default),
@@ -3860,24 +4023,41 @@ fn apply_provider_poll(hwnd: HWND, id: usize, generation: u64, result: poller::P
             fresh.clone(),
             invalidate,
         );
-        let (session, weekly) = state
-            .data
-            .as_ref()
-            .and_then(|data| provider_usage(data, id))
-            .map(|usage| (usage.session.percentage, usage.weekly.percentage))
-            .unwrap_or((0.0, 0.0));
-        match id {
-            CLAUDE => (state.session_percent, state.weekly_percent) = (session, weekly),
-            CODEX => (state.codex_session_percent, state.codex_weekly_percent) = (session, weekly),
-            _ => {
-                (
-                    state.antigravity_session_percent,
-                    state.antigravity_weekly_percent,
-                ) = (session, weekly)
+        if invalidate {
+            state.persisted[id] = None;
+            state.data_sources[id] = poller::DataSource::Live;
+        }
+        if let Some(usage) = fresh.as_ref() {
+            state.data_sources[id] = result.source;
+            if let Some(scope) = result.scope.clone().filter(|_| {
+                quota_cache::should_write(state.persisted[id].as_ref(), usage, observed_at)
+            }) {
+                let snapshot = quota_cache::Snapshot {
+                    data: usage.clone(),
+                    updated_at: observed_at,
+                };
+                state.persisted[id] = Some(snapshot.clone());
+                persist = Some((scope, snapshot));
+            }
+        } else if let Some((data, fetched_at)) = result.stale_fallback.clone() {
+            // The request failed, but Claude Code itself fetched newer
+            // official values for this account: show them, still marked stale.
+            if state.provider_health[id].adopt_observation(fetched_at) {
+                diagnose::log(format!(
+                    "Claude showing Claude Code's newer cached reading age_s={} while the sign-in is unavailable",
+                    SystemTime::now()
+                        .duration_since(fetched_at)
+                        .unwrap_or_default()
+                        .as_secs()
+                ));
+                state.data_sources[id] = poller::DataSource::ClaudeCodeCache;
+                *provider_usage_mut(state.data.get_or_insert_with(Default::default), id) =
+                    Some(data.clone());
+                adopted_fallback = Some((data, fetched_at));
             }
         }
 
-        if fresh.is_some() && !state.data.as_ref().is_some_and(poller::app_is_past_reset) {
+        if fresh.is_some() && !reset_poll_pending(state, SystemTime::now()).contains(&true) {
             unsafe {
                 let _ = KillTimer(hwnd, TIMER_RESET_POLL);
             }
@@ -3981,13 +4161,28 @@ fn apply_provider_poll(hwnd: HWND, id: usize, generation: u64, result: poller::P
             return;
         }
         let (adaptive, interval) = polling_metadata;
-        match (id, fresh) {
-            (CODEX, Some(codex)) => codex_mcp::publish_snapshot(codex, adaptive, interval),
-            (CLAUDE, Some(claude)) => {
-                codex_mcp::publish_claude_snapshot(claude);
-                codex_mcp::update_polling_metadata(adaptive, interval);
-            }
-            _ => codex_mcp::update_polling_metadata(adaptive, interval),
+        codex_mcp::update_polling_metadata(adaptive, interval);
+        if let Some(data) = fresh {
+            codex_mcp::publish_observation(id, data, observed_at, result.source, true);
+        } else if let Some((data, fetched_at)) = adopted_fallback {
+            codex_mcp::publish_observation(
+                id,
+                data,
+                fetched_at,
+                poller::DataSource::ClaudeCodeCache,
+                false,
+            );
+        }
+    }
+
+    // Persist outside the state lock; older observations never replace
+    // newer ones and other accounts' files are never matched.
+    if let Some((scope, snapshot)) = persist {
+        if let Err(error) = quota_cache::save(id, &scope, &snapshot.data, snapshot.updated_at) {
+            diagnose::log_error(
+                &format!("{} quota snapshot not saved", poller::provider_name(id)),
+                error,
+            );
         }
     }
 
@@ -4044,10 +4239,15 @@ fn schedule_countdown_timer() {
         None => return,
     };
 
-    // If a reset time has passed, poll every 5s to pick up fresh data
-    if poller::app_is_past_reset(data) {
+    // If a healthy provider's reset time has passed, poll every 5s to pick
+    // up fresh data; failing providers keep their own retry schedule.
+    if reset_poll_pending(s, SystemTime::now()).contains(&true) {
         unsafe {
             SetTimer(hwnd, TIMER_RESET_POLL, 5_000, None);
+        }
+    } else {
+        unsafe {
+            let _ = KillTimer(hwnd, TIMER_RESET_POLL);
         }
     }
 
@@ -4929,6 +5129,8 @@ unsafe extern "system" fn wnd_proc(
                             for (id, enabled) in enabled.into_iter().enumerate() {
                                 if !enabled {
                                     s.provider_health[id] = Default::default();
+                                    s.data_sources[id] = Default::default();
+                                    s.persisted[id] = None;
                                     // Keeps any server Retry-After deadline.
                                     s.schedule.disable(id);
                                     if let Some(data) = s.data.as_mut() {
@@ -8426,5 +8628,243 @@ mod tests {
             ),
             "Codex: 5h 82% 2h | 7d 41% 3d | Credits 341"
         );
+    }
+}
+
+#[cfg(test)]
+mod persisted_snapshot_tests {
+    use super::*;
+    use crate::models::{UsageData, UsageSection};
+    use poller::PollError;
+
+    fn state() -> AppState {
+        AppState {
+            hwnd: SendHwnd::from_hwnd(HWND::default()),
+            taskbar_hwnd: None,
+            tray_notify_hwnd: None,
+            win_event_hook: None,
+            is_dark: true,
+            embedded: false,
+            language_override: None,
+            language: LanguageId::English,
+            session_percent: 0.0,
+            session_text: "--".into(),
+            weekly_percent: 0.0,
+            weekly_text: "--".into(),
+            codex_session_percent: 0.0,
+            codex_session_text: "--".into(),
+            codex_weekly_percent: 0.0,
+            codex_weekly_text: "--".into(),
+            credit_display: CreditDisplayMode::from_setting("always"),
+            credit_position: CreditPosition::from_setting("left"),
+            codex_credit_text: String::new(),
+            antigravity_session_percent: 0.0,
+            antigravity_session_text: "--".into(),
+            antigravity_weekly_percent: 0.0,
+            antigravity_weekly_text: "--".into(),
+            claude_code_available: true,
+            show_claude_code: true,
+            show_codex: true,
+            show_antigravity: false,
+            show_session_window: true,
+            show_weekly_window: true,
+            show_drag_handle: false,
+            enable_codex_mcp: true,
+            usage_display: UsageDisplayMode::Mixed,
+            bar_color: None,
+            credit_value_mode: CreditValueMode::Credits,
+            alert_thresholds_percent: Vec::new(),
+            notified_quota_windows: BTreeSet::new(),
+            data: None,
+            provider_health: Default::default(),
+            provider_generation: 0,
+            data_sources: Default::default(),
+            persisted: Default::default(),
+            claude_desktop_sign_in: true,
+            poll_interval_ms: POLL_30_SEC,
+            adaptive_polling: false,
+            schedule: Default::default(),
+            codex_auth: CodexAuthEpisode::default(),
+            last_codex_exec_refresh_unix: None,
+            force_notify_auth_error: false,
+            last_poll_ok: false,
+            update_status: UpdateStatus::Idle,
+            last_update_check_unix: None,
+            taskbar_index: 0,
+            tray_offset: 0,
+            manual_position: false,
+            dragging: false,
+            drag_start_mouse_x: 0,
+            drag_start_client_x: 0,
+            drag_start_offset: 0,
+            widget_visible: true,
+        }
+    }
+
+    fn usage(
+        session: f64,
+        session_reset: SystemTime,
+        weekly: f64,
+        weekly_reset: SystemTime,
+    ) -> UsageData {
+        UsageData {
+            session: UsageSection {
+                percentage: session,
+                resets_at: Some(session_reset),
+                available: true,
+            },
+            weekly: UsageSection {
+                percentage: weekly,
+                resets_at: Some(weekly_reset),
+                available: true,
+            },
+            credits: None,
+        }
+    }
+
+    /// Simulates restore_snapshots for one provider without touching disk.
+    fn restore(state: &mut AppState, id: usize, data: UsageData, updated_at: SystemTime) {
+        state.provider_health[id].restore("account".into(), updated_at);
+        state.data_sources[id] = poller::DataSource::Restored;
+        *provider_usage_mut(state.data.get_or_insert_with(Default::default), id) = Some(data);
+        state.last_poll_ok = true;
+    }
+
+    fn apply(state: &mut AppState, id: usize, data: Option<UsageData>, error: Option<PollError>) {
+        let invalidate =
+            state.provider_health[id].record(Some("account".into()), error, SystemTime::now());
+        merge_provider_result(
+            state.data.get_or_insert_with(Default::default),
+            id,
+            data,
+            invalidate,
+        );
+    }
+
+    #[test]
+    fn restart_during_claude_auth_failure_shows_last_values_stale_and_codex_live() {
+        let now = SystemTime::now();
+        let hours = |h: u64| Duration::from_secs(h * 3600);
+        let mut state = state();
+        let claude = usage(25.0, now + hours(2), 35.0, now + hours(30));
+        let codex = usage(40.0, now + hours(3), 22.0, now + hours(90));
+        restore(&mut state, CLAUDE, claude, now - hours(1));
+        restore(&mut state, CODEX, codex, now - hours(1));
+        refresh_usage_texts(&mut state);
+        assert!(
+            state.session_text.starts_with("!25%"),
+            "{}",
+            state.session_text
+        );
+        assert!(
+            state.codex_session_text.starts_with('!'),
+            "restored Codex is stale too"
+        );
+
+        // First polls: Claude's sign-in is expired, Codex succeeds.
+        apply(&mut state, CLAUDE, None, Some(PollError::TokenExpired));
+        let codex = usage(41.0, now + hours(3), 22.0, now + hours(90));
+        apply(&mut state, CODEX, Some(codex), None);
+        refresh_usage_texts(&mut state);
+        assert!(
+            state.session_text.starts_with("!25%"),
+            "{}",
+            state.session_text
+        );
+        assert!(
+            state.weekly_text.starts_with("!35%"),
+            "{}",
+            state.weekly_text
+        );
+        assert_eq!(state.session_percent, 25.0);
+        // Mixed shows Codex as Remaining: 59% left, fresh and unmarked.
+        assert!(
+            state.codex_session_text.starts_with("59%"),
+            "{}",
+            state.codex_session_text
+        );
+
+        // The CLI refreshes its own sign-in; the next poll recovers Claude.
+        let claude = usage(26.0, now + hours(2), 35.0, now + hours(30));
+        apply(&mut state, CLAUDE, Some(claude), None);
+        refresh_usage_texts(&mut state);
+        assert!(
+            state.session_text.starts_with("26%"),
+            "{}",
+            state.session_text
+        );
+    }
+
+    #[test]
+    fn a_reset_that_passed_since_the_snapshot_is_unknown_not_the_old_value() {
+        let now = SystemTime::now();
+        let day = Duration::from_secs(86_400);
+        let mut state = state();
+        let before_reset = usage(80.0, now - Duration::from_secs(60), 35.0, now + day);
+        restore(
+            &mut state,
+            CLAUDE,
+            before_reset,
+            now - Duration::from_secs(600),
+        );
+        refresh_usage_texts(&mut state);
+        assert_eq!(state.session_text, "!--");
+        assert!(
+            state.session_percent.is_nan(),
+            "empty bar, not a guessed value"
+        );
+        assert!(
+            state.weekly_text.starts_with("!35%"),
+            "{}",
+            state.weekly_text
+        );
+        // A healthy provider past its reset asks for one prompt refresh...
+        assert_eq!(reset_poll_pending(&state, now), [true, false, false]);
+        // ...but a failing one keeps its own retry schedule (no 5 s loop).
+        apply(&mut state, CLAUDE, None, Some(PollError::TokenExpired));
+        assert_eq!(reset_poll_pending(&state, now), [false, false, false]);
+        refresh_usage_texts(&mut state);
+        assert_eq!(state.session_text, "!--");
+        // A fresh observation after the reset shows real values again.
+        let after_reset = usage(3.0, now + Duration::from_secs(18_000), 36.0, now + day);
+        apply(&mut state, CLAUDE, Some(after_reset), None);
+        refresh_usage_texts(&mut state);
+        assert!(
+            state.session_text.starts_with("3%"),
+            "{}",
+            state.session_text
+        );
+        assert_eq!(state.session_percent, 3.0);
+    }
+
+    #[test]
+    fn a_different_account_never_shows_the_restored_snapshot() {
+        let now = SystemTime::now();
+        let mut state = state();
+        let data = usage(25.0, now + Duration::from_secs(3600), 35.0, now);
+        restore(&mut state, CLAUDE, data, now);
+        let invalidate = state.provider_health[CLAUDE].record(
+            Some("another-account".into()),
+            Some(PollError::TokenExpired),
+            now,
+        );
+        merge_provider_result(state.data.as_mut().unwrap(), CLAUDE, None, invalidate);
+        assert!(invalidate);
+        assert!(state.data.as_ref().unwrap().claude_code.is_none());
+    }
+
+    #[test]
+    fn desktop_sign_in_fallback_defaults_on_and_round_trips() {
+        let old: SettingsFile = serde_json::from_str("{}").unwrap();
+        assert!(
+            old.use_claude_desktop_sign_in,
+            "existing settings get the fallback"
+        );
+        let off: SettingsFile =
+            serde_json::from_str(r#"{"use_claude_desktop_sign_in":false}"#).unwrap();
+        assert!(!off.use_claude_desktop_sign_in);
+        let json = serde_json::to_string(&off).unwrap();
+        assert!(json.contains("\"use_claude_desktop_sign_in\":false"));
+        assert!(SettingsFile::default().use_claude_desktop_sign_in);
     }
 }

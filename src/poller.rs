@@ -14,7 +14,7 @@ use std::os::windows::process::CommandExt;
 
 use crate::diagnose;
 use crate::localization::Strings;
-use crate::models::{AppUsageData, CreditBalance, UsageData, UsageSection};
+use crate::models::{CreditBalance, UsageData, UsageSection};
 use crate::native_interop;
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
@@ -71,8 +71,60 @@ pub struct ProviderPoll {
     pub error: Option<PollError>,
     /// Server Retry-After deadline from a 429 response, in milliseconds.
     pub retry_after_ms: Option<u32>,
-    /// Credential scope after the request; `None` when credentials are missing.
+    /// Account scope after the request (stable across token refreshes);
+    /// `None` when no credentials identify an account.
     pub scope: Option<String>,
+    /// When the returned data was observed, if not "now" (a local cache).
+    pub observed_at: Option<SystemTime>,
+    pub source: DataSource,
+    /// On failure: an account-matched official reading from Claude Code's
+    /// local cache, for display as stale data when newer than ours.
+    pub stale_fallback: Option<(UsageData, SystemTime)>,
+}
+
+/// Where a provider's displayed values came from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DataSource {
+    /// This monitor's own request.
+    #[default]
+    Live,
+    /// Claude Code's own cached `/api/oauth/usage` reading (`~/.claude.json`).
+    ClaudeCodeCache,
+    /// This monitor's persisted snapshot, restored at startup.
+    Restored,
+}
+
+impl DataSource {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::ClaudeCodeCache => "claude_code_cache",
+            Self::Restored => "restored_snapshot",
+        }
+    }
+}
+
+/// Claude Code's cached reading is used instead of a request while it is
+/// younger than Claude's own request spacing.
+const CLAUDE_LOCAL_CACHE_FRESH: Duration =
+    Duration::from_millis(crate::provider_schedule::CLAUDE_MIN_POLL_MS as u64);
+
+static CLAUDE_DESKTOP_SIGN_IN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Whether an expired or rejected CLI sign-in may fall back to the Claude
+/// Desktop app's own sign-in (read-only). On by default.
+pub fn set_claude_desktop_sign_in(enabled: bool) {
+    CLAUDE_DESKTOP_SIGN_IN.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[derive(Default)]
+struct ClaudeObservation {
+    observed_at: Option<SystemTime>,
+    source: DataSource,
+    fallback: Option<(UsageData, SystemTime)>,
+    /// Account used when it is not the CLI's (Desktop sign-in, no CLI account).
+    account_override: Option<String>,
 }
 
 pub fn provider_name(id: usize) -> &'static str {
@@ -83,8 +135,9 @@ pub fn provider_name(id: usize) -> &'static str {
     }
 }
 
+/// `/api/oauth/usage` body; Claude Code caches the same shape locally.
 #[derive(Deserialize)]
-struct UsageResponse {
+pub(crate) struct UsageResponse {
     five_hour: Option<UsageBucket>,
     seven_day: Option<UsageBucket>,
 }
@@ -236,16 +289,30 @@ pub fn poll_provider(id: usize) -> ProviderPoll {
         "provider request started provider={}",
         provider_name(id)
     ));
-    let before = cache_scope(id);
+    let before = (cache_scope(id), account_scope(id));
     RETRY_AFTER_HINT.with(|cell| cell.set(None));
+    CLAUDE_OBSERVATION.with(|cell| cell.take());
     let result = match id {
         0 => poll_claude_code(),
         1 => poll_codex(),
         _ => poll_antigravity(),
     };
     let retry_after_ms = RETRY_AFTER_HINT.with(|cell| cell.take());
-    let after = cache_scope(id);
-    let poll = finish_provider_poll(id, result, before, after, retry_after_ms);
+    let observation = CLAUDE_OBSERVATION.with(|cell| cell.take());
+    let after = (cache_scope(id), account_scope(id));
+    let account = observation
+        .account_override
+        .as_deref()
+        .map(|uuid| account_digest("claude", uuid))
+        .or_else(|| after.1.clone());
+    let mut poll = finish_provider_poll(id, result, before, after, retry_after_ms);
+    poll.scope = account;
+    if poll.data.is_some() {
+        poll.observed_at = observation.observed_at;
+        poll.source = observation.source;
+    } else {
+        poll.stale_fallback = observation.fallback;
+    }
     diagnose::log(format!(
         "provider request completed provider={} elapsed_ms={} error={:?} retry_after_ms={:?}",
         provider_name(id),
@@ -256,11 +323,11 @@ pub fn poll_provider(id: usize) -> ProviderPoll {
     poll
 }
 
-fn finish_provider_poll(
+fn finish_provider_poll<S: PartialEq>(
     id: usize,
     result: Result<UsageData, PollError>,
-    before: Option<String>,
-    after: Option<String>,
+    before: (Option<String>, S),
+    after: (Option<String>, S),
     retry_after_ms: Option<u32>,
 ) -> ProviderPoll {
     // Never publish a response from credentials that changed during the request.
@@ -291,7 +358,8 @@ fn finish_provider_poll(
         data,
         error,
         retry_after_ms: retry_after_ms.filter(|_| error == Some(PollError::RateLimited)),
-        scope: after,
+        scope: after.0,
+        ..Default::default()
     }
 }
 
@@ -336,8 +404,42 @@ pub fn cache_scope(id: usize) -> Option<String> {
     }
 }
 
+/// Fingerprint of a provider account identifier. Unlike token digests it
+/// survives token refreshes, so persisted snapshots stay attached to the
+/// account; a different account never matches.
+fn account_digest(provider: &str, account: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(b"codex-usage-monitor\0account-v1\0");
+    digest.update(provider.as_bytes());
+    digest.update([0]);
+    digest.update(account.as_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+/// Account scope for snapshots and cache invalidation: the account
+/// identifier when the provider exposes one, otherwise (conservatively) the
+/// current token. Never logged or exposed over MCP.
+pub fn account_scope(id: usize) -> Option<String> {
+    match id {
+        0 => crate::claude_local::read()
+            .account_uuid
+            .map(|uuid| account_digest("claude", &uuid))
+            .or_else(|| cache_scope(0)),
+        1 => {
+            let creds = read_codex_credentials()?;
+            match creds.account_id.as_deref().filter(|id| !id.is_empty()) {
+                Some(account) => Some(account_digest("codex", account)),
+                None => cache_scope(1),
+            }
+        }
+        _ => cache_scope(id),
+    }
+}
+
 /// Whether Claude Code CLI credentials are available from a supported source.
-/// Claude Desktop authentication is intentionally not treated as CLI access.
+/// This decides the default provider selection only; polling may also use
+/// the Claude Desktop sign-in when the CLI sign-in has expired.
 pub fn claude_code_credentials_available() -> bool {
     let _ = resolve_windows_claude_path();
     read_first_credentials().is_some()
@@ -365,23 +467,421 @@ fn log_codex_success(codex: &UsageData) {
     ));
 }
 
-fn poll_claude_code() -> Result<UsageData, PollError> {
-    let creds = match read_first_credentials() {
-        Some(c) => c,
-        None => {
-            diagnose::log(
-                "Claude Code CLI credentials missing; Claude Desktop sign-in is not used for CLI monitoring",
+/// What a probe run should do after the read-only report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeRequest {
+    None,
+    /// One normal poll (CLI sign-in first, Desktop only as fallback).
+    NormalPoll,
+    /// One usage GET with the matched Claude Desktop sign-in only.
+    DesktopOnly,
+}
+
+/// Whether a one-shot Desktop probe request may run now. It must not add to
+/// a running monitor's Claude polling, the 120 s spacing, or a server
+/// Retry-After deadline. Refuses rather than waits; the reason says why.
+fn desktop_probe_gate(
+    monitor_running: bool,
+    claude_enabled_in_settings: bool,
+    history: ClaudeRequestHistory,
+    now_unix: u64,
+) -> Result<(), String> {
+    if monitor_running && claude_enabled_in_settings {
+        return Err("monitor_running_with_claude_enabled".into());
+    }
+    if let Some(deadline) = history.retry_deadline_unix.filter(|d| *d > now_unix) {
+        return Err(format!(
+            "retry_after_active remaining_s={}",
+            deadline - now_unix
+        ));
+    }
+    let spacing = u64::from(crate::provider_schedule::CLAUDE_MIN_POLL_MS / 1000);
+    if let Some(last) = history.last_request_unix {
+        let next = last.saturating_add(spacing);
+        if next > now_unix {
+            return Err(format!("claude_spacing remaining_s={}", next - now_unix));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ClaudeRequestHistory {
+    last_request_unix: Option<u64>,
+    retry_deadline_unix: Option<u64>,
+}
+
+/// Claude request times from the operational log (any process): request
+/// starts and 429 Retry-After hints. Lines are `[unix] pid=N message`.
+fn claude_request_history(log: &str) -> ClaudeRequestHistory {
+    let mut history = ClaudeRequestHistory::default();
+    for line in log.lines() {
+        let Some(time) = line
+            .strip_prefix('[')
+            .and_then(|rest| rest.split_once(']'))
+            .and_then(|(time, _)| time.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if line.contains("provider request started provider=claude") {
+            history.last_request_unix = Some(time);
+        } else if let Some(hint) = line
+            .split_once("Claude usage endpoint failed http_status=429 retry_after_ms=Some(")
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .and_then(|(ms, _)| ms.parse::<u64>().ok())
+        {
+            let deadline = time.saturating_add(hint.div_ceil(1000));
+            history.retry_deadline_unix = Some(
+                history
+                    .retry_deadline_unix
+                    .map_or(deadline, |d| d.max(deadline)),
             );
-            return Err(PollError::NoCredentials);
+        }
+    }
+    history
+}
+
+/// The tail of the real operational log; requests older than this are
+/// irrelevant to the 120 s spacing and any capped Retry-After.
+fn recent_log_text() -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL_BYTES: u64 = 2 * 1024 * 1024;
+    let Some(path) = diagnose::active_log_file_path() else {
+        return String::new();
+    };
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let _ = file.seek(SeekFrom::Start(len.saturating_sub(TAIL_BYTES)));
+    let mut bytes = Vec::new();
+    let _ = file.read_to_end(&mut bytes);
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// A monitor instance holds the `Global\CodexUsage` single-instance mutex.
+fn monitor_instance_running() -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
+    let name = native_interop::wide_str("Global\\CodexUsage");
+    unsafe {
+        match OpenMutexW(
+            SYNCHRONIZATION_SYNCHRONIZE,
+            false,
+            windows::core::PCWSTR::from_raw(name.as_ptr()),
+        ) {
+            Ok(handle) => {
+                let _ = CloseHandle(handle);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// `show_claude_code` from the monitor's settings; unknown counts as enabled.
+fn claude_enabled_in_settings() -> bool {
+    let Some(appdata) = std::env::var_os("APPDATA") else {
+        return true;
+    };
+    std::fs::read(
+        PathBuf::from(appdata)
+            .join("CodexUsage")
+            .join("settings.json"),
+    )
+    .ok()
+    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+    .and_then(|settings| settings.get("show_claude_code")?.as_bool())
+    .unwrap_or(true)
+}
+
+fn file_stamp(path: Option<PathBuf>) -> Option<(SystemTime, u64)> {
+    let meta = std::fs::metadata(path?).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+/// One usage GET with the matched Desktop sign-in only: no CLI selection, no
+/// rejected-token guards, no snapshot writes, no retry, no other source.
+fn probe_desktop_request(cli: &crate::claude_local::CliState) -> String {
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if let Err(reason) = desktop_probe_gate(
+        monitor_instance_running(),
+        claude_enabled_in_settings(),
+        claude_request_history(&recent_log_text()),
+        now_unix,
+    ) {
+        return format!("desktop_request=refused reason={reason}");
+    }
+    let token = match crate::claude_desktop::token_for_account(cli.desktop_expected()) {
+        Ok(token) => token,
+        Err(reason) => {
+            return format!("desktop_request=not_sent reason={}", reason.category());
         }
     };
+    if is_token_expired(token.expires_at_ms) {
+        return "desktop_request=not_sent reason=desktop_token_expired_locally".into();
+    }
+    let cli_file = windows_credentials_path();
+    let cli_before = file_stamp(cli_file.clone());
+    diagnose::log("provider request started provider=claude source=desktop_probe");
+    RETRY_AFTER_HINT.with(|cell| cell.set(None));
+    LAST_USAGE_HTTP_STATUS.with(|cell| cell.set(None));
+    let result = try_usage_endpoint(&token.access_token);
+    drop(token);
+    let status = LAST_USAGE_HTTP_STATUS.with(|cell| cell.take());
+    let retry_after_s = RETRY_AFTER_HINT
+        .with(|cell| cell.take())
+        .map(|ms| ms.div_ceil(1000));
+    diagnose::log(format!(
+        "claude desktop probe request completed http_status={status:?} error={}",
+        result
+            .as_ref()
+            .err()
+            .map(|e| e.category())
+            .unwrap_or("none")
+    ));
+    let cli_unchanged = file_stamp(cli_file) == cli_before;
+    let section = |s: &UsageSection| {
+        if s.available {
+            format!(
+                "{:.0}% reset={}",
+                s.percentage,
+                if s.resets_at.is_some() {
+                    "present"
+                } else {
+                    "absent"
+                }
+            )
+        } else {
+            "absent".into()
+        }
+    };
+    let mut line = format!(
+        "desktop_request=sent http_status={} result={}",
+        status.map_or_else(|| "none".into(), |s| s.to_string()),
+        result.as_ref().err().map(|e| e.category()).unwrap_or("ok")
+    );
+    if let Ok(data) = &result {
+        line.push_str(&format!(
+            " five_hour={} weekly={}",
+            section(&data.session),
+            section(&data.weekly)
+        ));
+    }
+    if let Some(seconds) = retry_after_s {
+        line.push_str(&format!(" retry_after_s={seconds}"));
+    }
+    line.push_str(&format!(" cli_credentials_unchanged={cli_unchanged}"));
+    line
+}
 
-    static REJECTED: OnceLock<Mutex<crate::provider_health::RejectedCredential>> = OnceLock::new();
-    let mut rejected = REJECTED
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    fetch_claude_passively(creds, &mut rejected, fetch_usage_with_fallback)
+/// Read-only report for `--probe-claude-sign-in`: which Claude sources are
+/// usable, without tokens, emails or account identifiers. `NormalPoll`
+/// performs one normal usage poll; `DesktopOnly` one gated usage GET with the
+/// Claude Desktop sign-in.
+pub fn probe_claude_sign_in(request: ProbeRequest) -> String {
+    let now = SystemTime::now();
+    let cli = crate::claude_local::read();
+    let mut lines = vec![format!("cli_account_known={}", cli.account_uuid.is_some())];
+    lines.push(match cli.cached_usage.as_ref() {
+        Some((_, at)) => format!(
+            "cli_usage_cache=account_matched age_s={}",
+            now.duration_since(*at).unwrap_or_default().as_secs()
+        ),
+        None => "cli_usage_cache=none".into(),
+    });
+    lines.push(match read_first_credentials() {
+        None => "cli_credentials=missing".into(),
+        Some(creds) => format!(
+            "cli_credentials=present expired={} expires_in_s={}",
+            is_token_expired(creds.expires_at),
+            creds
+                .expires_at
+                .map(|exp| {
+                    let now_ms = now
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64;
+                    ((exp - now_ms) / 1000).to_string()
+                })
+                .unwrap_or_else(|| "unknown".into())
+        ),
+    });
+    lines.extend(crate::claude_desktop::probe_lines(cli.desktop_expected()));
+    let desktop_stamp = || file_stamp(crate::claude_desktop::config_path());
+    let desktop_before = desktop_stamp();
+    if request == ProbeRequest::DesktopOnly {
+        lines.push(probe_desktop_request(&cli));
+        lines.push(format!(
+            "desktop_store_unchanged={}",
+            desktop_stamp() == desktop_before
+        ));
+    }
+    if request == ProbeRequest::NormalPoll {
+        let poll = poll_provider(0);
+        lines.push(format!(
+            "usage_poll error={} source={} session_used={} weekly_used={}",
+            poll.error.map(PollError::category).unwrap_or("none"),
+            poll.source.name(),
+            poll.data
+                .as_ref()
+                .map(|d| format!("{:.0}%", d.session.percentage))
+                .unwrap_or_else(|| "-".into()),
+            poll.data
+                .as_ref()
+                .map(|d| format!("{:.0}%", d.weekly.percentage))
+                .unwrap_or_else(|| "-".into()),
+        ));
+    }
+    lines.join("\n") + "\n"
+}
+
+thread_local! {
+    static CLAUDE_OBSERVATION: std::cell::RefCell<ClaudeObservation> =
+        std::cell::RefCell::new(ClaudeObservation::default());
+}
+
+fn record_claude_observation(update: impl FnOnce(&mut ClaudeObservation)) {
+    CLAUDE_OBSERVATION.with(|cell| update(&mut cell.borrow_mut()));
+}
+
+/// Log a state line only when it differs from the previous one for `slot`,
+/// so a long sign-in wait does not repeat itself every tick.
+fn log_claude_state_change(slot: usize, message: String) {
+    static LAST: Mutex<[Option<String>; 3]> = Mutex::new([None, None, None]);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last[slot].as_deref() != Some(message.as_str()) {
+        diagnose::log(&message);
+        last[slot] = Some(message);
+    }
+}
+
+/// One Claude usage observation, strictly model-free and without touching
+/// any credential store:
+/// 1. Claude Code's own cached reading, when younger than Claude's request
+///    spacing (no request at all).
+/// 2. The Claude Code CLI sign-in (`~/.claude/.credentials.json`).
+/// 3. When the CLI sign-in is expired, missing or rejected, the Claude
+///    Desktop app's own sign-in for the same account (read-only).
+///
+/// Nothing here refreshes or rotates a token: renewal is left to Claude Code
+/// and Claude Desktop, whose new credentials are picked up on the next tick.
+fn poll_claude_code() -> Result<UsageData, PollError> {
+    static CLI_REJECTED: OnceLock<Mutex<crate::provider_health::RejectedCredential>> =
+        OnceLock::new();
+    static DESKTOP_REJECTED: OnceLock<Mutex<crate::provider_health::RejectedCredential>> =
+        OnceLock::new();
+    let lock = |guard: &'static OnceLock<Mutex<crate::provider_health::RejectedCredential>>| {
+        guard
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    };
+    let cli = crate::claude_local::read();
+    let desktop = || {
+        CLAUDE_DESKTOP_SIGN_IN
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .then(|| crate::claude_desktop::token_for_account(cli.desktop_expected()))
+    };
+    let result = poll_claude_sources(
+        &cli,
+        SystemTime::now(),
+        read_first_credentials(),
+        desktop,
+        &mut lock(&CLI_REJECTED),
+        &mut lock(&DESKTOP_REJECTED),
+        fetch_usage_with_fallback,
+    );
+    if result.is_ok() {
+        log_claude_state_change(2, "Claude sign-in available".to_string());
+    }
+    result
+}
+
+fn poll_claude_sources(
+    cli: &crate::claude_local::CliState,
+    now: SystemTime,
+    cli_credentials: Option<Credentials>,
+    desktop: impl FnOnce() -> Option<
+        Result<crate::claude_desktop::DesktopToken, crate::claude_desktop::Unavailable>,
+    >,
+    cli_rejected: &mut crate::provider_health::RejectedCredential,
+    desktop_rejected: &mut crate::provider_health::RejectedCredential,
+    mut fetch: impl FnMut(&str) -> Result<UsageData, PollError>,
+) -> Result<UsageData, PollError> {
+    if let Some((data, fetched_at)) = cli.cached_usage.as_ref() {
+        let age = now.duration_since(*fetched_at).unwrap_or_default();
+        if age < CLAUDE_LOCAL_CACHE_FRESH {
+            diagnose::log(format!(
+                "Claude usage served from Claude Code's local cache age_s={}; no request",
+                age.as_secs()
+            ));
+            record_claude_observation(|o| {
+                o.observed_at = Some(*fetched_at);
+                o.source = DataSource::ClaudeCodeCache;
+            });
+            return Ok(data.clone());
+        }
+    }
+    record_claude_observation(|o| o.fallback = cli.cached_usage.clone());
+
+    let cli_error = match cli_credentials {
+        None => PollError::NoCredentials,
+        Some(creds) => match fetch_claude_passively(creds, cli_rejected, &mut fetch) {
+            Ok(data) => return Ok(data),
+            // Only an unusable sign-in falls through; 429, network and server
+            // errors are shared by both sign-ins and back off as one provider.
+            Err(error @ (PollError::TokenExpired | PollError::AuthRequired)) => error,
+            Err(error) => return Err(error),
+        },
+    };
+
+    match desktop() {
+        None => {
+            log_claude_state_change(
+                1,
+                "Claude Desktop sign-in fallback disabled in settings".to_string(),
+            );
+        }
+        Some(Err(reason)) => log_claude_state_change(
+            1,
+            format!(
+                "Claude Desktop sign-in unavailable reason={}",
+                reason.category()
+            ),
+        ),
+        Some(Ok(token)) if is_token_expired(token.expires_at_ms) => {
+            log_claude_state_change(1, "Claude Desktop sign-in also expired".to_string());
+        }
+        Some(Ok(token)) => {
+            log_claude_state_change(
+                1,
+                format!(
+                    "Claude using the Claude Desktop sign-in (read-only); CLI sign-in category={}",
+                    cli_error.category()
+                ),
+            );
+            if cli.account_uuid.is_none() {
+                record_claude_observation(|o| o.account_override = token.account_uuid.clone());
+            }
+            let creds = Credentials {
+                access_token: token.access_token,
+                expires_at: token.expires_at_ms,
+            };
+            return fetch_claude_passively(creds, desktop_rejected, fetch);
+        }
+    }
+
+    if cli_error == PollError::TokenExpired {
+        log_claude_state_change(
+            2,
+            "Claude sign-in expired; no verified model-free renewal is enabled, waiting for Claude Code or Claude Desktop to refresh its own sign-in".to_string(),
+        );
+    }
+    Err(cli_error)
 }
 
 fn fetch_claude_passively(
@@ -393,6 +893,9 @@ fn fetch_claude_passively(
     if !rejected.permits(&scope) {
         diagnose::log("Claude auth recovery waiting for credential change; no usage request");
         return Err(PollError::AuthRequired);
+    }
+    if rejected.is_parked() {
+        diagnose::log("Claude credential change detected; resuming usage requests");
     }
     let result = refresh_or_fallback(creds).and_then(|creds| fetch(&creds.access_token));
     rejected.record(scope, result.as_ref().map(|_| ()).map_err(|error| *error));
@@ -754,6 +1257,8 @@ thread_local! {
     // Each provider request runs on its own worker thread, so the hint from a
     // 429 response reaches poll_provider without widening the Copy PollError.
     static RETRY_AFTER_HINT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    // HTTP status of this thread's last usage request, for the probe only.
+    static LAST_USAGE_HTTP_STATUS: std::cell::Cell<Option<u16>> = const { std::cell::Cell::new(None) };
 }
 
 fn record_retry_after(response: &ureq::Response) {
@@ -795,12 +1300,19 @@ fn fetch_usage_with_fallback(token: &str) -> Result<UsageData, PollError> {
 fn try_usage_endpoint(token: &str) -> Result<UsageData, PollError> {
     let agent = build_agent()?;
 
-    let resp = match agent
+    let result = agent
         .get(USAGE_URL)
         .set("Authorization", &format!("Bearer {token}"))
         .set("anthropic-beta", "oauth-2025-04-20")
-        .call()
-    {
+        .call();
+    LAST_USAGE_HTTP_STATUS.with(|cell| {
+        cell.set(match &result {
+            Ok(resp) => Some(resp.status()),
+            Err(ureq::Error::Status(code, _)) => Some(*code),
+            Err(_) => None,
+        })
+    });
+    let resp = match result {
         Ok(resp) => resp,
         Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
             diagnose::log(format!(
@@ -825,6 +1337,11 @@ fn try_usage_endpoint(token: &str) -> Result<UsageData, PollError> {
         Ok(response) => response,
         Err(_) => return Err(PollError::RequestFailed),
     };
+    claude_usage_from_response(&response).ok_or(PollError::RequestFailed)
+}
+
+/// Normalize a Claude usage body (live or Claude Code's cached copy).
+pub(crate) fn claude_usage_from_response(response: &UsageResponse) -> Option<UsageData> {
     let mut data = UsageData::default();
 
     if let Some(bucket) = &response.five_hour {
@@ -840,9 +1357,9 @@ fn try_usage_endpoint(token: &str) -> Result<UsageData, PollError> {
     }
 
     if !data.session.available && !data.weekly.available {
-        return Err(PollError::RequestFailed);
+        return None;
     }
-    Ok(data)
+    Some(data)
 }
 
 fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData, PollError> {
@@ -1873,18 +2390,6 @@ fn time_until_display_change_from_secs(total_secs: u64) -> Duration {
 }
 
 /// Returns true if either section has reached "now" (reset time has passed).
-pub fn is_past_reset(data: &UsageData) -> bool {
-    let now = SystemTime::now();
-    let past = |s: &UsageSection| matches!(s.resets_at, Some(t) if now.duration_since(t).is_ok());
-    past(&data.session) || past(&data.weekly)
-}
-
-pub fn app_is_past_reset(data: &AppUsageData) -> bool {
-    data.claude_code.as_ref().is_some_and(is_past_reset)
-        || data.codex.as_ref().is_some_and(is_past_reset)
-        || data.antigravity.as_ref().is_some_and(is_past_reset)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1894,6 +2399,352 @@ mod tests {
             access_token: token.into(),
             expires_at,
         }
+    }
+
+    mod claude_sources {
+        use super::*;
+        use crate::claude_desktop::{DesktopToken, Unavailable};
+        use crate::claude_local::CliState;
+        use crate::provider_health::RejectedCredential;
+
+        const ACCOUNT: &str = "00000000-0000-4000-8000-000000000001";
+        const FUTURE: i64 = i64::MAX;
+
+        fn now() -> SystemTime {
+            UNIX_EPOCH + Duration::from_secs(1_800_000_000)
+        }
+
+        fn cli_state(cache_age: Option<u64>) -> CliState {
+            CliState {
+                account_uuid: Some(ACCOUNT.into()),
+                organization_uuid: None,
+                cached_usage: cache_age.map(|age| {
+                    (
+                        usage_with_session_percent(33.0),
+                        now() - Duration::from_secs(age),
+                    )
+                }),
+            }
+        }
+
+        fn desktop_token(token: &str, expires: i64) -> DesktopToken {
+            DesktopToken {
+                access_token: token.into(),
+                expires_at_ms: Some(expires),
+                account_uuid: Some(ACCOUNT.into()),
+                org_uuid: None,
+                profile_scope: true,
+            }
+        }
+
+        struct Run {
+            result: Result<UsageData, PollError>,
+            tokens: Vec<String>,
+            desktop_consulted: bool,
+            observation: ClaudeObservation,
+        }
+
+        fn run(
+            cli: &CliState,
+            cli_creds: Option<Credentials>,
+            desktop: Option<Result<DesktopToken, Unavailable>>,
+            guards: &mut (RejectedCredential, RejectedCredential),
+            response: impl Fn(&str) -> Result<UsageData, PollError>,
+        ) -> Run {
+            CLAUDE_OBSERVATION.with(|cell| cell.take());
+            let mut tokens = Vec::new();
+            let mut desktop_consulted = false;
+            let result = poll_claude_sources(
+                cli,
+                now(),
+                cli_creds,
+                || {
+                    desktop_consulted = true;
+                    desktop
+                },
+                &mut guards.0,
+                &mut guards.1,
+                |token| {
+                    tokens.push(token.to_string());
+                    response(token)
+                },
+            );
+            Run {
+                result,
+                tokens,
+                desktop_consulted,
+                observation: CLAUDE_OBSERVATION.with(|cell| cell.take()),
+            }
+        }
+
+        #[test]
+        fn a_fresh_claude_code_cache_answers_without_any_request() {
+            let mut guards = Default::default();
+            let run = run(
+                &cli_state(Some(30)),
+                Some(synthetic_credentials("cli", Some(FUTURE))),
+                None,
+                &mut guards,
+                |_| panic!("no request expected"),
+            );
+            assert_eq!(run.result.unwrap().session.percentage, 33.0);
+            assert!(run.tokens.is_empty() && !run.desktop_consulted);
+            assert_eq!(run.observation.source, DataSource::ClaudeCodeCache);
+            assert_eq!(
+                run.observation.observed_at,
+                Some(now() - Duration::from_secs(30))
+            );
+        }
+
+        #[test]
+        fn an_older_cache_does_not_replace_the_live_request_but_is_kept_as_fallback() {
+            let mut guards = Default::default();
+            let run = run(
+                &cli_state(Some(600)),
+                Some(synthetic_credentials("cli", Some(FUTURE))),
+                None,
+                &mut guards,
+                |_| Ok(usage_with_session_percent(40.0)),
+            );
+            assert_eq!(run.result.unwrap().session.percentage, 40.0);
+            assert_eq!(run.tokens, ["cli"]);
+            assert!(!run.desktop_consulted);
+            assert_eq!(run.observation.source, DataSource::Live);
+            assert!(run.observation.fallback.is_some());
+        }
+
+        #[test]
+        fn an_expired_cli_sign_in_uses_the_matching_desktop_sign_in_read_only() {
+            let mut guards = Default::default();
+            let run = run(
+                &cli_state(None),
+                Some(synthetic_credentials("cli-expired", Some(0))),
+                Some(Ok(desktop_token("desktop", FUTURE))),
+                &mut guards,
+                |_| Ok(usage_with_session_percent(12.0)),
+            );
+            assert_eq!(run.result.unwrap().session.percentage, 12.0);
+            assert_eq!(
+                run.tokens,
+                ["desktop"],
+                "the expired CLI token is never sent"
+            );
+            assert!(
+                run.observation.account_override.is_none(),
+                "CLI account known"
+            );
+        }
+
+        #[test]
+        fn without_a_usable_desktop_sign_in_expiry_waits_with_no_request() {
+            for desktop in [
+                None,
+                Some(Err(Unavailable::NotInstalled)),
+                Some(Err(Unavailable::DecryptFailed)),
+                Some(Err(Unavailable::AccountMismatch)),
+                Some(Err(Unavailable::AccountUnparsed)),
+                Some(Ok(desktop_token("desktop-expired", 0))),
+            ] {
+                let mut guards = Default::default();
+                let run = run(
+                    &cli_state(Some(3_600)),
+                    Some(synthetic_credentials("cli-expired", Some(0))),
+                    desktop,
+                    &mut guards,
+                    |_| panic!("no request expected"),
+                );
+                assert_eq!(run.result.unwrap_err(), PollError::TokenExpired);
+                assert!(run.tokens.is_empty());
+                assert!(run.observation.fallback.is_some(), "stale cache offered");
+            }
+            let mut guards = Default::default();
+            let missing = run(&cli_state(None), None, None, &mut guards, |_| {
+                panic!("no request expected")
+            });
+            assert_eq!(missing.result.unwrap_err(), PollError::NoCredentials);
+        }
+
+        #[test]
+        fn rate_limits_and_transport_errors_never_retry_with_the_other_sign_in() {
+            for error in [
+                PollError::RateLimited,
+                PollError::NetworkUnavailable,
+                PollError::ServerError,
+            ] {
+                let mut guards = Default::default();
+                let run = run(
+                    &cli_state(None),
+                    Some(synthetic_credentials("cli", Some(FUTURE))),
+                    Some(Ok(desktop_token("desktop", FUTURE))),
+                    &mut guards,
+                    move |_| Err(error),
+                );
+                assert_eq!(run.result.unwrap_err(), error);
+                assert_eq!(run.tokens, ["cli"], "one request per tick");
+                assert!(!run.desktop_consulted);
+            }
+        }
+
+        #[test]
+        fn rejected_tokens_are_never_resent_and_do_not_alternate_between_sign_ins() {
+            let mut guards = Default::default();
+            let cli = cli_state(None);
+            let creds = || Some(synthetic_credentials("cli-rejected", Some(FUTURE)));
+            let desktop = || Some(Ok(desktop_token("desktop", FUTURE)));
+            let respond = |token: &str| {
+                if token == "cli-rejected" {
+                    Err(PollError::AuthRequired)
+                } else {
+                    Ok(usage_with_session_percent(5.0))
+                }
+            };
+            let first = run(&cli, creds(), desktop(), &mut guards, respond);
+            assert!(first.result.is_ok());
+            assert_eq!(first.tokens, ["cli-rejected", "desktop"]);
+            for _ in 0..3 {
+                let next = run(&cli, creds(), desktop(), &mut guards, respond);
+                assert!(next.result.is_ok());
+                assert_eq!(next.tokens, ["desktop"], "rejected CLI token stays parked");
+            }
+            // Both rejected: no request at all until either credential changes.
+            let both = |_: &str| Err(PollError::AuthRequired);
+            let rejected = run(
+                &cli,
+                creds(),
+                Some(Ok(desktop_token("desktop-rejected", FUTURE))),
+                &mut guards,
+                both,
+            );
+            assert_eq!(rejected.tokens, ["desktop-rejected"]);
+            let parked = run(
+                &cli,
+                creds(),
+                Some(Ok(desktop_token("desktop-rejected", FUTURE))),
+                &mut guards,
+                both,
+            );
+            assert!(parked.tokens.is_empty());
+            assert_eq!(parked.result.unwrap_err(), PollError::AuthRequired);
+            let refreshed = run(
+                &cli,
+                Some(synthetic_credentials("cli-refreshed", Some(FUTURE))),
+                None,
+                &mut guards,
+                |_| Ok(usage_with_session_percent(6.0)),
+            );
+            assert_eq!(refreshed.tokens, ["cli-refreshed"]);
+            assert!(refreshed.result.is_ok());
+        }
+
+        #[test]
+        fn a_desktop_only_account_is_reported_for_scoping() {
+            let mut guards = Default::default();
+            let run = run(
+                &CliState::default(),
+                None,
+                Some(Ok(desktop_token("desktop", FUTURE))),
+                &mut guards,
+                |_| Ok(usage_with_session_percent(1.0)),
+            );
+            assert!(run.result.is_ok());
+            assert_eq!(run.observation.account_override.as_deref(), Some(ACCOUNT));
+        }
+
+        #[test]
+        fn account_scopes_are_stable_opaque_and_account_specific() {
+            let a = account_digest("claude", ACCOUNT);
+            assert_eq!(a, account_digest("claude", ACCOUNT));
+            assert_ne!(a, account_digest("codex", ACCOUNT));
+            assert_ne!(
+                a,
+                account_digest("claude", "00000000-0000-4000-8000-000000000002")
+            );
+            assert_eq!(a.len(), 64);
+            assert!(!a.contains(ACCOUNT));
+        }
+
+        #[test]
+        fn no_source_file_contains_a_model_or_token_endpoint() {
+            // Monitoring must stay model-free and never rotate OAuth tokens.
+            for (name, source) in [
+                ("poller.rs", include_str!("poller.rs")),
+                ("window.rs", include_str!("window.rs")),
+                ("claude_desktop.rs", include_str!("claude_desktop.rs")),
+                ("claude_local.rs", include_str!("claude_local.rs")),
+                ("codex_mcp.rs", include_str!("codex_mcp.rs")),
+            ] {
+                for forbidden in [
+                    concat!("/v1/", "messages"),
+                    concat!("oauth/", "token"),
+                    concat!("grant_type", "="),
+                    concat!("\"-p\"", ","),
+                ] {
+                    assert!(!source.contains(forbidden), "{name} contains {forbidden}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn probe_history_reads_claude_request_starts_and_retry_after_deadlines() {
+        let log = "\
+[1000] pid=1 provider request started provider=claude
+[1010] pid=1 provider request started provider=codex
+[1050] pid=1 Claude usage endpoint failed http_status=429 retry_after_ms=Some(300500)
+[1060] pid=1 Claude usage endpoint failed http_status=429 retry_after_ms=Some(1000)
+[1070] pid=1 Claude usage endpoint failed http_status=500 retry_after_ms=None
+garbage line provider request started provider=claude
+[bad] pid=1 provider request started provider=claude
+[1100] pid=2 provider request started provider=claude source=desktop_probe
+";
+        let history = claude_request_history(log);
+        assert_eq!(history.last_request_unix, Some(1100));
+        assert_eq!(
+            history.retry_deadline_unix,
+            Some(1050 + 301),
+            "latest deadline wins"
+        );
+        assert_eq!(claude_request_history(""), ClaudeRequestHistory::default());
+    }
+
+    #[test]
+    fn desktop_probe_refuses_to_add_to_a_monitor_spacing_or_retry_window() {
+        let history = |last: Option<u64>, deadline: Option<u64>| ClaudeRequestHistory {
+            last_request_unix: last,
+            retry_deadline_unix: deadline,
+        };
+        // A running monitor still polling Claude would collide with its schedule.
+        assert_eq!(
+            desktop_probe_gate(true, true, history(None, None), 5_000).unwrap_err(),
+            "monitor_running_with_claude_enabled"
+        );
+        // With Claude disabled (or the monitor exited) only spacing matters.
+        assert_eq!(
+            desktop_probe_gate(true, false, history(Some(4_950), None), 5_000).unwrap_err(),
+            "claude_spacing remaining_s=70"
+        );
+        assert!(desktop_probe_gate(true, false, history(Some(4_880), None), 5_000).is_ok());
+        assert!(desktop_probe_gate(false, true, history(Some(4_000), None), 5_000).is_ok());
+        assert!(desktop_probe_gate(false, true, history(None, None), 5_000).is_ok());
+        // A server Retry-After deadline is always honoured.
+        assert_eq!(
+            desktop_probe_gate(false, true, history(Some(1_000), Some(5_600)), 5_000).unwrap_err(),
+            "retry_after_active remaining_s=600"
+        );
+        assert!(desktop_probe_gate(false, true, history(Some(1_000), Some(4_999)), 5_000).is_ok());
+    }
+
+    #[test]
+    fn provider_poll_rejects_responses_when_the_account_changes_mid_request() {
+        let poll = finish_provider_poll(
+            0,
+            Ok(usage_with_session_percent(64.0)),
+            (Some("token".into()), Some("account-a".to_string())),
+            (Some("token".into()), Some("account-b".to_string())),
+            None,
+        );
+        assert!(poll.data.is_none());
+        assert_eq!(poll.error, Some(PollError::AuthRequired));
     }
 
     #[test]
@@ -2418,15 +3269,21 @@ mod tests {
         let ok = finish_provider_poll(
             1,
             Ok(usage_with_session_percent(42.0)),
-            scope.clone(),
-            scope.clone(),
+            (scope.clone(), ()),
+            (scope.clone(), ()),
             None,
         );
         assert_eq!(ok.data.unwrap().session.percentage, 42.0);
         assert_eq!(ok.error, None);
         assert_eq!(ok.scope, scope);
 
-        let failed = finish_provider_poll(0, Err(PollError::RequestFailed), None, None, None);
+        let failed = finish_provider_poll(
+            0,
+            Err(PollError::RequestFailed),
+            (None, ()),
+            (None, ()),
+            None,
+        );
         assert!(failed.data.is_none());
         assert_eq!(failed.error, Some(PollError::RequestFailed));
         assert_eq!(failed.scope, None);
@@ -2437,8 +3294,8 @@ mod tests {
         let poll = finish_provider_poll(
             0,
             Ok(usage_with_session_percent(64.0)),
-            Some("old".into()),
-            Some("new".into()),
+            (Some("old".into()), ()),
+            (Some("new".into()), ()),
             None,
         );
         assert!(poll.data.is_none());
@@ -2451,16 +3308,16 @@ mod tests {
         let limited = finish_provider_poll(
             0,
             Err(PollError::RateLimited),
-            Some("a".into()),
-            Some("a".into()),
+            (Some("a".into()), ()),
+            (Some("a".into()), ()),
             Some(471_000),
         );
         assert_eq!(limited.retry_after_ms, Some(471_000));
         let other = finish_provider_poll(
             0,
             Err(PollError::ServerError),
-            Some("a".into()),
-            Some("a".into()),
+            (Some("a".into()), ()),
+            (Some("a".into()), ()),
             Some(471_000),
         );
         assert_eq!(other.retry_after_ms, None);

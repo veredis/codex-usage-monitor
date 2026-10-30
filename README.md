@@ -85,15 +85,23 @@ For Claude Code, register it once at user scope (the monitor never edits client 
 claude mcp add --transport http --scope user codex_usage_monitor http://127.0.0.1:46827/mcp
 ```
 
-Start a new Claude Code session afterwards; `/mcp` lists the server and its two tools.
+Start a new Claude Code session afterwards. In the Claude desktop app's Code tab, `/mcp` opens the account Connectors screen, which does not list user-config servers; the tools are still available to new sessions.
+
+Each result includes `data_source`: `live` (this monitor's request), `claude_code_cache` (Claude Code's own cached reading), `restored_snapshot` (the last values saved before a restart, always reported `stale` until refreshed) or `null` when nothing is known. A window whose reset has passed since its values were observed is reported as `null` rather than as its old percentage.
 
 For an agent using the tools, query usage at meaningful milestones rather than continuously. Check before starting another large work phase, and if a quota is low, finish or preserve the current coherent unit instead of blindly starting a large new phase.
 
 ## Claude support and authentication
 
-Claude monitoring uses the Claude Code CLI's credentials and usage interface where available. Claude Code CLI authentication is required; being signed in to the Claude desktop app alone does not necessarily provide the credentials used by this monitor.
+Claude usage comes from the same read-only usage endpoint Claude Code uses. Each Claude tick uses the first of these that works, without ever refreshing, rotating or writing a credential:
 
-Monitoring is passive. If Claude credentials expire or are rejected, the monitor keeps the last values marked stale and waits for the Claude Code CLI to refresh its own credentials (for example the next time you use the CLI); it never runs a model request to force a refresh.
+1. **Claude Code's own cached reading** (`cachedUsageUtilization` in `~/.claude.json`) when the CLI fetched it within the last two minutes and it belongs to the CLI's signed-in account. No request is made.
+2. **The Claude Code CLI sign-in** (`~/.claude/.credentials.json`).
+3. **The Claude desktop app's own sign-in**, read-only, when the CLI sign-in is expired, missing or rejected. Claude Desktop keeps this sign-in fresh while you use it (including its Code tab), whereas the CLI file only renews when the CLI itself runs. Only an entry for the CLI's signed-in account is used, decrypted with the current Windows user's DPAPI key; the token is held in memory for the request and never logged or saved. Set `"use_claude_desktop_sign_in": false` in `%APPDATA%\CodexUsage\settings.json` to turn this off.
+
+If no sign-in is usable, the monitor keeps the last values marked stale (`!`) and waits; as soon as Claude Code or Claude Desktop refreshes its own sign-in, the next tick resumes without restarting the widget. A rejected token is never resent until it changes. The monitor never runs a model request, `claude -p`, or an OAuth refresh to force renewal. Unattended renewal of the CLI sign-in is not automated; see `docs/troubleshooting.md`.
+
+The last successful values of each provider are saved to `%APPDATA%\CodexUsage\quota-*.json` (percentages, reset and update times and an opaque account fingerprint only) and restored at startup, shown stale until the first successful refresh. A snapshot from another account, a corrupt file, or one older than eight days is ignored.
 
 ## Codex authentication
 
@@ -159,4 +167,4 @@ Released under the [MIT License](LICENSE).
 
 ## Current version
 
-The public fork release is `1.9.1-veredis.7`. The current development binary identifies itself as `1.9.1-veredis.7 (Build 8)`; the Build number is an informational candidate identifier and does not change update ordering.
+The public fork release is `1.9.1-veredis.7`. The current development binary identifies itself as `1.9.1-veredis.7 (Build 11)`; the Build number is an informational candidate identifier and does not change update ordering.

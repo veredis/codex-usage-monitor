@@ -6,19 +6,49 @@ Codex Usage keeps authentication failures separate from transient service failur
 
 | Simplified Chinese | Other languages | Meaning | Recommended action |
 |---|---|---|---|
-| `!` | `!` | Enabled service credentials are missing or expired | Sign in with the relevant CLI/app, then refresh Codex Usage. Claude Desktop login does not count as Claude Code CLI login. |
+| `!` | `!` | Enabled service credentials are missing or expired | Sign in with the relevant CLI/app, then refresh Codex Usage. For Claude, an active Claude desktop app sign-in for the same account is also used (read-only). |
 | `网络` | `NET` | Network or TLS connection failed | Check connectivity, VPN, proxy, and firewall settings |
 | `限流` | `429` | Provider rate limit | Wait for the provider retry window; Codex Usage retries that provider with backoff and honors `Retry-After` |
 | `服务` | `5XX` | Provider service failure | Wait and retry; check provider status if it persists |
 | `错误` | `ERR` | Invalid or unsupported response | Enable diagnostics and inspect the log |
 
-A leading `!` before a percentage (for example `!88% 1h04m`) means that provider's last value is stale: its latest request failed, or it has not succeeded within twice its own polling interval. Other providers are unaffected; each provider has its own schedule and backoff.
+A leading `!` before a percentage (for example `!88% 1h04m`) means that provider's last value is stale: its latest request failed, it has not succeeded within twice its own polling interval, or it was restored from the snapshot saved before the last restart and has not been refreshed yet. Other providers are unaffected; each provider has its own schedule and backoff.
+
+`!--` means the window's reset time has passed since the last value was observed, so the old percentage no longer applies and the new one is not known yet. The bar is empty until the next successful refresh.
 
 Rejected Claude credentials are not resent until the credential file changes, preventing repeated login notifications. Transient failures back off per provider (never faster than the selected frequency, up to 30 minutes) and honor any server `Retry-After` deadline, including on **Refresh**.
 
 ### Claude shows `!` or `429` frequently
 
 Claude's usage endpoint is shared with every running Claude Code session's status line and rate-limits aggressively. In Build 6 the monitor spaces Claude requests at least 120 seconds apart regardless of the selected frequency; this is a current design decision and may be revised. Many concurrent Claude Code sessions can still exhaust the shared limit; the monitor then backs off Claude alone while Codex keeps updating.
+
+### Claude shows `!` after the CLI sign-in expires
+
+The Claude Code CLI keeps its sign-in in `~/.claude/.credentials.json` and renews it only while the CLI runs; its access token lasts about eight hours. The Claude desktop app, including its Code tab, keeps a **separate** sign-in that it renews itself, so using Desktop does not renew the CLI file.
+
+Codex Usage therefore falls back, read-only, to the Claude Desktop sign-in for the same account when the CLI sign-in has expired. The log shows which source is in use:
+
+- `Claude using the Claude Desktop sign-in (read-only); CLI sign-in category=token_expired`
+- `Claude Desktop sign-in unavailable reason=…`, where the reason is one of:
+  - `not_installed`, `no_token_cache` or `decrypt_failed`: Desktop's store is missing or unreadable.
+  - `account_unparsed`: no Desktop entry names its account, so it cannot be attributed.
+  - `account_mismatch`: Desktop is signed in to a different account than the CLI.
+  - `organization_mismatch`: the same account, but a different organization.
+  - `ambiguous`: several accounts or organizations fit, so none is guessed.
+  - `no_profile_scope`: the entry cannot read usage.
+- `Claude sign-in expired; no verified model-free renewal is enabled, waiting for Claude Code or Claude Desktop to refresh its own sign-in`
+- `Claude credential change detected; resuming usage requests` and `Claude sign-in available` once a refreshed sign-in works
+- `Claude usage served from Claude Code's local cache age_s=N; no request` when the CLI fetched usage itself within two minutes
+
+To check the sources without opening the widget, run (no tokens, emails or account identifiers are written):
+
+```powershell
+codex-usage.exe --probe-claude-sign-in "$env:TEMP\claude-sign-in.txt"
+```
+
+Add `--with-request` to also make one normal usage request (CLI sign-in first). Add `--with-desktop-request` instead to make exactly one usage request with the matched Claude Desktop sign-in only. It refuses to run, sending nothing, if a monitor instance is running with Claude enabled, if Claude's last request in the log was under 120 seconds ago, or if a logged Retry-After deadline is still active. Exit the monitor, or turn Claude off in it, first. If neither sign-in is usable, start the Claude Code CLI once (`claude`, then `/exit`) or use Claude Desktop; the monitor picks up the renewed sign-in on its next tick.
+
+**Why there is no automatic CLI renewal.** The monitor never refreshes OAuth tokens itself: refresh-token rotation races the CLI and can sign it out. Short-lived CLI commands such as `claude auth status` or `claude doctor` can start a refresh and exit before saving it, spending the refresh token (anthropics/claude-code#95822). `claude -p /usage` is reported to renew safely, because in `-p` mode `/usage` is a local command that waits for the refresh before fetching usage. This has not been validated for this installation and is not used.
 
 ## Diagnostic log
 
