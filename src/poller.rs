@@ -5,8 +5,8 @@ use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
@@ -26,19 +26,6 @@ const ANTIGRAVITY_ENDPOINTS: &[&str] = &[
     "https://cloudcode-pa.googleapis.com",
 ];
 const CREATE_NO_WINDOW: u32 = 0x08000000;
-const CLAUDE_EXEC_REFRESH_COOLDOWN_SECS: u64 = 24 * 60 * 60;
-const CLAUDE_PASSIVE_RECOVERY_POLLS: u8 = 3;
-
-static LAST_CLAUDE_EXEC_REFRESH_UNIX: AtomicU64 = AtomicU64::new(0);
-static CLAUDE_PASSIVE_RECOVERY_FAILURES: AtomicU8 = AtomicU8::new(0);
-
-fn now_unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PollError {
     AuthRequired,
@@ -95,6 +82,7 @@ pub struct PollOutcome {
     pub antigravity_error: Option<PollError>,
     pub first_error: Option<PollError>,
     pub has_success: bool,
+    pub scopes: [Option<String>; 3],
 }
 
 #[derive(Deserialize)]
@@ -265,22 +253,87 @@ extern "system" {
 }
 
 pub fn poll(show_claude_code: bool, show_codex: bool, show_antigravity: bool) -> PollOutcome {
+    let started = std::time::Instant::now();
     diagnose::log(format!(
         "usage poll started providers=claude:{show_claude_code},codex:{show_codex},antigravity:{show_antigravity}"
     ));
-    poll_with(
+    let enabled = [show_claude_code, show_codex, show_antigravity];
+    let before = std::array::from_fn(|id| enabled[id].then(|| cache_scope(id)).flatten());
+    let mut outcome = poll_with(
         show_claude_code,
         show_codex,
         show_antigravity,
         poll_claude_code,
         poll_codex,
         poll_antigravity,
-    )
+    );
+    outcome.scopes = before;
+    let after: [Option<String>; 3] =
+        std::array::from_fn(|id| enabled[id].then(|| cache_scope(id)).flatten());
+    // Never publish a response from credentials that changed during the request.
+    for id in 0..3 {
+        if outcome.scopes[id] != after[id] {
+            match id {
+                0 => {
+                    outcome.data.claude_code = None;
+                    outcome.claude_error = Some(PollError::AuthRequired);
+                }
+                1 => {
+                    outcome.data.codex = None;
+                    outcome.codex_error = Some(PollError::AuthRequired);
+                }
+                _ => {
+                    outcome.data.antigravity = None;
+                    outcome.antigravity_error = Some(PollError::AuthRequired);
+                }
+            }
+            outcome.scopes[id] = after[id].clone();
+        }
+    }
+    outcome.has_success = outcome.data.claude_code.is_some()
+        || outcome.data.codex.is_some()
+        || outcome.data.antigravity.is_some();
+    diagnose::log(format!("provider round completed elapsed_ms={} claude_error={:?} codex_error={:?} antigravity_error={:?}", started.elapsed().as_millis(), outcome.claude_error, outcome.codex_error, outcome.antigravity_error));
+    if let Some(data) = &outcome.data.claude_code {
+        diagnose::log(format!(
+            "Claude usage poll succeeded session_used={:.2}% weekly_used={:.2}%",
+            data.session.percentage, data.weekly.percentage
+        ));
+    }
+    outcome
+}
+
+// Conservative token-bound cache identity, adapted from upstream PR #30.
+// Digests stay in memory and are never logged or exposed over MCP.
+fn credential_scope(provider: &str, token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(provider.as_bytes());
+    digest.update([0]);
+    digest.update(token.as_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+pub fn cache_scope(id: usize) -> Option<String> {
+    match id {
+        0 => read_first_credentials().map(|c| credential_scope("claude", &c.access_token)),
+        1 => read_codex_credentials().map(|c| {
+            credential_scope(
+                "codex",
+                &format!("{}|{}", c.access_token, c.account_id.unwrap_or_default()),
+            )
+        }),
+        2 => {
+            read_antigravity_credentials().map(|c| credential_scope("antigravity", &c.access_token))
+        }
+        _ => None,
+    }
 }
 
 /// Whether Claude Code CLI credentials are available from a supported source.
 /// Claude Desktop authentication is intentionally not treated as CLI access.
 pub fn claude_code_credentials_available() -> bool {
+    let _ = resolve_windows_claude_path();
     read_first_credentials().is_some()
 }
 
@@ -297,16 +350,16 @@ fn poll_with(
     let mut claude_error = None;
     let mut codex_error = None;
     let mut antigravity_error = None;
-    let active_provider_count = show_claude_code as u8 + show_codex as u8 + show_antigravity as u8;
 
     if show_claude_code {
         match poll_claude_code() {
             Ok(claude_code) => data.claude_code = Some(claude_code),
             Err(error) => {
                 claude_error = Some(error);
-                if active_provider_count > 1 {
-                    diagnose::log(format!("Claude Code usage poll failed: {error:?}"));
-                }
+                diagnose::log(format!(
+                    "Claude Code usage poll failed category={}",
+                    error.category()
+                ));
                 first_error.get_or_insert(error);
             }
         }
@@ -317,9 +370,10 @@ fn poll_with(
             Ok(codex) => data.codex = Some(codex),
             Err(error) => {
                 codex_error = Some(error);
-                if active_provider_count > 1 {
-                    diagnose::log(format!("Codex usage poll failed: {error:?}"));
-                }
+                diagnose::log(format!(
+                    "Codex usage poll failed category={}",
+                    error.category()
+                ));
                 first_error.get_or_insert(error);
             }
         }
@@ -330,9 +384,10 @@ fn poll_with(
             Ok(antigravity) => data.antigravity = Some(antigravity),
             Err(error) => {
                 antigravity_error = Some(error);
-                if active_provider_count > 1 {
-                    diagnose::log(format!("Antigravity usage poll failed: {error:?}"));
-                }
+                diagnose::log(format!(
+                    "Antigravity usage poll failed category={}",
+                    error.category()
+                ));
                 first_error.get_or_insert(error);
             }
         }
@@ -391,6 +446,7 @@ fn poll_with(
         antigravity_error,
         first_error,
         has_success,
+        scopes: Default::default(),
     }
 }
 
@@ -405,9 +461,27 @@ fn poll_claude_code() -> Result<UsageData, PollError> {
         }
     };
 
-    let creds = refresh_or_fallback(creds)?;
+    static REJECTED: OnceLock<Mutex<crate::provider_health::RejectedCredential>> = OnceLock::new();
+    let mut rejected = REJECTED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    fetch_claude_passively(creds, &mut rejected, fetch_usage_with_fallback)
+}
 
-    fetch_usage_with_fallback(&creds.access_token)
+fn fetch_claude_passively(
+    creds: Credentials,
+    rejected: &mut crate::provider_health::RejectedCredential,
+    fetch: impl FnOnce(&str) -> Result<UsageData, PollError>,
+) -> Result<UsageData, PollError> {
+    let scope = credential_scope("claude", &creds.access_token);
+    if !rejected.permits(&scope) {
+        diagnose::log("Claude auth recovery waiting for credential change; no usage request");
+        return Err(PollError::AuthRequired);
+    }
+    let result = refresh_or_fallback(creds).and_then(|creds| fetch(&creds.access_token));
+    rejected.record(scope, result.as_ref().map(|_| ()).map_err(|error| *error));
+    result
 }
 
 fn poll_codex() -> Result<UsageData, PollError> {
@@ -434,167 +508,14 @@ fn poll_antigravity() -> Result<UsageData, PollError> {
     fetch_antigravity_usage(&creds.access_token)
 }
 
-fn refresh_or_fallback(mut creds: Credentials) -> Result<Credentials, PollError> {
-    let mut passive_failure = None;
-    loop {
-        if !is_token_expired(creds.expires_at) {
-            CLAUDE_PASSIVE_RECOVERY_FAILURES.store(0, Ordering::Release);
-            return Ok(creds);
-        }
-
-        let source = creds.source.clone();
-        if passive_failure.is_none() {
-            passive_failure = Some(
-                CLAUDE_PASSIVE_RECOVERY_FAILURES
-                    .fetch_add(1, Ordering::AcqRel)
-                    .saturating_add(1),
-            );
-        }
-        let passive_failure_count = passive_failure.unwrap_or(CLAUDE_PASSIVE_RECOVERY_POLLS);
-        if claude_passive_recovery_should_defer(passive_failure_count) {
-            diagnose::log(
-                format!(
-                    "Claude credentials are expired; passive auth recovery poll {passive_failure_count}/{CLAUDE_PASSIVE_RECOVERY_POLLS}, no model task started"
-                ),
-            );
-        } else if claude_exec_refresh_allowed(now_unix_secs()) {
-            diagnose::log(
-                "Claude passive auth recovery exhausted; starting guarded last-resort model refresh",
-            );
-            cli_refresh_token(&source);
-        } else {
-            diagnose::log(
-                "Claude credentials are expired; last-resort model refresh cooldown is active",
-            );
-        }
-
-        match read_credentials_from_source(&source) {
-            Some(refreshed) if !is_token_expired(refreshed.expires_at) => {
-                CLAUDE_PASSIVE_RECOVERY_FAILURES.store(0, Ordering::Release);
-                return Ok(refreshed);
-            }
-            Some(_) => diagnose::log(format!(
-                "credentials from {source:?} still expired after refresh attempt"
-            )),
-            None => diagnose::log(format!(
-                "credentials from {source:?} unavailable after refresh attempt"
-            )),
-        }
-
-        if claude_passive_recovery_should_defer(passive_failure_count) {
-            return Err(PollError::TokenExpired);
-        }
-
-        match read_next_credentials_after(&source) {
-            Some(next) => {
-                creds = next;
-                passive_failure = Some(passive_failure_count);
-            }
-            None => return Err(PollError::TokenExpired),
-        }
-    }
-}
-
-fn claude_passive_recovery_should_defer(failures: u8) -> bool {
-    failures < CLAUDE_PASSIVE_RECOVERY_POLLS
-}
-
-fn claude_exec_refresh_allowed(now: u64) -> bool {
-    let previous = LAST_CLAUDE_EXEC_REFRESH_UNIX.load(Ordering::Acquire);
-    if previous != 0 && now.saturating_sub(previous) < CLAUDE_EXEC_REFRESH_COOLDOWN_SECS {
-        return false;
-    }
-    LAST_CLAUDE_EXEC_REFRESH_UNIX
-        .compare_exchange(previous, now, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
-}
-
-/// Invoke the Claude CLI with a minimal prompt to force its internal
-/// OAuth token refresh.
-fn cli_refresh_token(source: &CredentialSource) {
-    match source {
-        CredentialSource::Windows(_) => cli_refresh_windows_token(),
-        CredentialSource::Wsl { distro } => cli_refresh_wsl_token(distro),
-    }
-}
-
-fn cli_refresh_windows_token() {
-    let claude_path = resolve_windows_claude_path();
-    let is_cmd = claude_path.to_lowercase().ends_with(".cmd");
-    diagnose::log(format!(
-        "attempting Windows Claude token refresh via {claude_path}"
-    ));
-
-    let args: &[&str] = &["-p", "."];
-
-    let mut cmd = if is_cmd {
-        let mut c = Command::new("cmd.exe");
-        c.arg("/c").arg(&claude_path).args(args);
-        c
+// Monitoring never launches inference for authentication. Claude Code refreshes
+// its own credentials when the user signs in; we watch those changes.
+fn refresh_or_fallback(creds: Credentials) -> Result<Credentials, PollError> {
+    if is_token_expired(creds.expires_at) {
+        Err(PollError::TokenExpired)
     } else {
-        let mut c = Command::new(&claude_path);
-        c.args(args);
-        c
-    };
-    cmd.env_remove("CLAUDECODE")
-        .env_remove("CLAUDE_CODE_ENTRYPOINT")
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(error) => {
-            diagnose::log_error("unable to spawn Windows Claude token refresh", error);
-            return;
-        }
-    };
-
-    // Wait up to 30 seconds — don't block the poll thread forever
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if start.elapsed() > Duration::from_secs(30) {
-                    let _ = child.kill();
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(500));
-            }
-            Err(_) => break,
-        }
+        Ok(creds)
     }
-}
-
-fn cli_refresh_wsl_token(distro: &str) {
-    diagnose::log(format!(
-        "attempting WSL Claude token refresh in distro {distro}"
-    ));
-    let mut cmd = Command::new("wsl.exe");
-    cmd.arg("-d")
-        .arg(distro)
-        .arg("--")
-        .arg("bash")
-        .arg("-lic")
-        .arg("if command -v claude >/dev/null 2>&1; then claude -p .; elif [ -x \"$HOME/.local/bin/claude\" ]; then \"$HOME/.local/bin/claude\" -p .; else exit 127; fi")
-        .env_remove("CLAUDECODE")
-        .env_remove("CLAUDE_CODE_ENTRYPOINT")
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(error) => {
-            diagnose::log_error("unable to spawn WSL Claude token refresh", error);
-            return;
-        }
-    };
-
-    wait_for_refresh(&mut child);
 }
 
 /// Ask Codex's own auth manager to refresh OAuth without starting a model task.
@@ -683,22 +604,8 @@ pub fn refresh_codex_token_model_free() -> bool {
 /// Last-resort legacy recovery. Callers gate this behind passive retries and a
 /// persistent cooldown; unlike app-server refresh, this may consume model use.
 pub fn run_codex_exec_last_resort() -> bool {
-    let codex_path = resolve_windows_codex_path();
-    diagnose::log("starting last-resort Codex exec auth refresh (may use model allowance)");
-    let mut command = codex_command(&codex_path, &["exec", "."]);
-    command
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            diagnose::log_error("unable to spawn last-resort Codex exec auth refresh", error);
-            return false;
-        }
-    };
-    wait_for_refresh(&mut child)
+    diagnose::log("model-consuming Codex recovery disabled; sign in through the official CLI");
+    false
 }
 
 fn codex_command(codex_path: &str, args: &[&str]) -> Command {
@@ -798,25 +705,6 @@ fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Option<std::process
                 std::thread::sleep(Duration::from_millis(100));
             }
             Err(_) => return None,
-        }
-    }
-}
-
-fn wait_for_refresh(child: &mut std::process::Child) -> bool {
-    // Wait up to 30 seconds; don't block the poll thread forever.
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
-            Ok(None) => {
-                if start.elapsed() > Duration::from_secs(30) {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return false;
-                }
-                std::thread::sleep(Duration::from_millis(500));
-            }
-            Err(_) => return false,
         }
     }
 }
@@ -1069,7 +957,10 @@ fn try_usage_endpoint(token: &str) -> Result<UsageData, PollError> {
             ));
             return Err(PollError::AuthRequired);
         }
-        Err(ureq::Error::Status(code, _)) => return Err(classify_http_status(code)),
+        Err(ureq::Error::Status(code, _)) => {
+            diagnose::log(format!("Claude usage endpoint failed http_status={code}"));
+            return Err(classify_http_status(code));
+        }
         Err(error) => return Err(classify_ureq_error(&error)),
     };
 
@@ -1113,7 +1004,14 @@ fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData,
         Ok(resp) => resp,
         Err(error) => {
             let classified = classify_ureq_error(&error);
-            diagnose::log_error("Codex usage endpoint request failed", error);
+            let status = match error {
+                ureq::Error::Status(code, _) => Some(code),
+                _ => None,
+            };
+            diagnose::log(format!(
+                "Codex usage endpoint failed category={} http_status={status:?}",
+                classified.category()
+            ));
             return Err(classified);
         }
     };
@@ -1615,16 +1513,6 @@ fn read_windows_credentials() -> Option<Credentials> {
     parse_credentials(&content, CredentialSource::Windows(cred_path))
 }
 
-fn read_credentials_from_source(source: &CredentialSource) -> Option<Credentials> {
-    match source {
-        CredentialSource::Windows(path) => {
-            let content = std::fs::read_to_string(path).ok()?;
-            parse_credentials(&content, source.clone())
-        }
-        CredentialSource::Wsl { distro } => read_wsl_credentials(distro),
-    }
-}
-
 fn codex_auth_path() -> Option<PathBuf> {
     if let Some(codex_home) = std::env::var_os("CODEX_HOME").map(PathBuf::from) {
         return Some(codex_home.join("auth.json"));
@@ -1847,32 +1735,6 @@ fn parse_credentials(content: &str, source: CredentialSource) -> Option<Credenti
         expires_at,
         source,
     })
-}
-
-fn read_next_credentials_after(source: &CredentialSource) -> Option<Credentials> {
-    match source {
-        CredentialSource::Windows(_) => {
-            for distro in list_wsl_distros() {
-                if let Some(creds) = read_wsl_credentials(&distro) {
-                    return Some(creds);
-                }
-            }
-        }
-        CredentialSource::Wsl { distro } => {
-            let mut past_current = false;
-            for candidate_distro in list_wsl_distros() {
-                if !past_current {
-                    past_current = candidate_distro == *distro;
-                    continue;
-                }
-                if let Some(creds) = read_wsl_credentials(&candidate_distro) {
-                    return Some(creds);
-                }
-            }
-        }
-    }
-
-    None
 }
 
 fn list_wsl_distros() -> Vec<String> {
@@ -2249,6 +2111,86 @@ pub fn app_is_past_reset(data: &AppUsageData) -> bool {
 mod tests {
     use super::*;
 
+    fn synthetic_credentials(token: &str, expires_at: Option<i64>) -> Credentials {
+        Credentials {
+            access_token: token.into(),
+            expires_at,
+            source: CredentialSource::Windows(PathBuf::from("synthetic")),
+        }
+    }
+
+    #[test]
+    fn claude_rejected_future_token_is_not_retried_until_changed() {
+        for status in [401, 403] {
+            let mut guard = crate::provider_health::RejectedCredential::default();
+            let error = classify_http_status(status);
+            let result = fetch_claude_passively(
+                synthetic_credentials("old", Some(i64::MAX)),
+                &mut guard,
+                |_| Err(error),
+            );
+            assert_eq!(result.err(), Some(PollError::AuthRequired));
+            let result = fetch_claude_passively(
+                synthetic_credentials("old", Some(i64::MAX)),
+                &mut guard,
+                |_| panic!("rejected credentials must not make a request"),
+            );
+            assert_eq!(result.err(), Some(PollError::AuthRequired));
+            assert!(fetch_claude_passively(
+                synthetic_credentials("new", Some(i64::MAX)),
+                &mut guard,
+                |_| Ok(UsageData::default())
+            )
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn expired_and_transient_claude_paths_never_require_a_model_task() {
+        let mut guard = crate::provider_health::RejectedCredential::default();
+        assert_eq!(
+            fetch_claude_passively(
+                synthetic_credentials("expired", Some(0)),
+                &mut guard,
+                |_| panic!("expired token must not be sent")
+            )
+            .err(),
+            Some(PollError::TokenExpired)
+        );
+        for error in [
+            PollError::NetworkUnavailable,
+            PollError::RateLimited,
+            PollError::ServerError,
+        ] {
+            assert_eq!(
+                fetch_claude_passively(synthetic_credentials("valid", None), &mut guard, |_| Err(
+                    error
+                ))
+                .err(),
+                Some(error)
+            );
+            assert!(fetch_claude_passively(
+                synthetic_credentials("valid", None),
+                &mut guard,
+                |_| Ok(UsageData::default())
+            )
+            .is_ok());
+        }
+        assert!(!run_codex_exec_last_resort());
+    }
+
+    #[test]
+    fn credential_scopes_are_provider_and_account_specific() {
+        assert_ne!(
+            credential_scope("claude", "a"),
+            credential_scope("claude", "b")
+        );
+        assert_ne!(
+            credential_scope("claude", "a"),
+            credential_scope("codex", "a")
+        );
+    }
+
     #[test]
     fn reserve_is_optional_on_every_successful_response() {
         for present in [false, true, false, true] {
@@ -2303,10 +2245,17 @@ mod tests {
     }
 
     #[test]
-    fn claude_model_refresh_is_deferred_for_initial_passive_recovery_polls() {
-        assert!(claude_passive_recovery_should_defer(1));
-        assert!(claude_passive_recovery_should_defer(2));
-        assert!(!claude_passive_recovery_should_defer(3));
+    fn expired_claude_credentials_require_passive_reauthentication() {
+        let creds = Credentials {
+            access_token: "synthetic".into(),
+            expires_at: Some(0),
+            source: CredentialSource::Windows(PathBuf::from("test")),
+        };
+        assert!(matches!(
+            refresh_or_fallback(creds),
+            Err(PollError::TokenExpired)
+        ));
+        assert!(!run_codex_exec_last_resort());
     }
 
     fn usage_with_session_percent(percentage: f64) -> UsageData {

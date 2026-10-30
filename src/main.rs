@@ -7,6 +7,7 @@ mod localization;
 mod models;
 mod native_interop;
 mod poller;
+mod provider_health;
 mod theme;
 mod tray_icon;
 mod updater;

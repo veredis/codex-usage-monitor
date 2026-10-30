@@ -97,6 +97,8 @@ struct AppState {
     notified_quota_windows: BTreeSet<String>,
 
     data: Option<AppUsageData>,
+    provider_health: [crate::provider_health::ProviderHealth; 3],
+    provider_generation: u64,
 
     poll_interval_ms: u32,
     adaptive_polling: bool,
@@ -138,6 +140,8 @@ const RETRY_MAX_MS: u32 = 30 * 60 * 1000;
 const CODEX_AUTH_REFRESH_AFTER_FAILURES: u8 = 3;
 const CODEX_AUTH_EXEC_AFTER_FAILURES: u8 = 6;
 const CODEX_EXEC_REFRESH_COOLDOWN_SECS: u64 = 24 * 60 * 60;
+// No automatic model tasks. Legacy cooldown settings remain readable.
+const ALLOW_AUTOMATIC_MODEL_RECOVERY: bool = false;
 const CODEX_AUTH_WATCH_MS: u32 = 2_000;
 
 const POLL_1_MIN: u32 = 60_000;
@@ -1578,6 +1582,26 @@ fn refresh_usage_texts(state: &mut AppState) {
         state.antigravity_session_text = "!".to_string();
         state.antigravity_weekly_text = "!".to_string();
     }
+    let now = std::time::SystemTime::now();
+    // Age against configured cadence, never against an escalating error delay.
+    let interval = effective_poll_interval_ms(state);
+    for (id, session, weekly) in [
+        (0, &mut state.session_text, &mut state.weekly_text),
+        (
+            1,
+            &mut state.codex_session_text,
+            &mut state.codex_weekly_text,
+        ),
+        (
+            2,
+            &mut state.antigravity_session_text,
+            &mut state.antigravity_weekly_text,
+        ),
+    ] {
+        let stale = state.provider_health[id].stale(now, interval);
+        *session = crate::provider_health::stale_text(session, stale);
+        *weekly = crate::provider_health::stale_text(weekly, stale);
+    }
 }
 
 fn set_window_title(hwnd: HWND, strings: Strings) {
@@ -2104,7 +2128,14 @@ fn quota_text_width_for(language: LanguageId, texts: &[&str]) -> i32 {
         .then(widest_measured_quota_digit);
     let stable_shapes: Vec<String> = texts
         .iter()
-        .map(|text| normalize_quota_text_shape(text, widest_digit))
+        .map(|text| {
+            let shape = normalize_quota_text_shape(text.trim_start_matches('!'), widest_digit);
+            if text.contains('%') {
+                format!("!{shape}")
+            } else {
+                shape
+            }
+        })
         .collect();
     let stable_shape_refs: Vec<&str> = stable_shapes.iter().map(String::as_str).collect();
     measured_column_width(&stable_shape_refs, quota_text_width_fallback(language)) + 1
@@ -2751,6 +2782,8 @@ pub fn run() {
                 alert_thresholds_percent: settings.alert_thresholds_percent.unwrap_or_default(),
                 notified_quota_windows: settings.notified_quota_windows.into_iter().collect(),
                 data: None,
+                provider_health: Default::default(),
+                provider_generation: 0,
                 poll_interval_ms: settings.poll_interval_ms,
                 adaptive_polling: settings.adaptive_polling,
                 poll_in_flight: false,
@@ -3530,7 +3563,9 @@ fn should_attempt_codex_exec_fallback(
     exec_attempted: bool,
     cooldown_elapsed: bool,
 ) -> bool {
-    model_free_attempted
+    // Automatic monitoring is strictly model-free (upstream PR #25 policy).
+    ALLOW_AUTOMATIC_MODEL_RECOVERY
+        && model_free_attempted
         && !model_free_succeeded
         && !exec_attempted
         && cooldown_elapsed
@@ -3718,24 +3753,15 @@ fn merge_transient_cached_provider_data(
         return false;
     };
     let mut merged = false;
-    if data.claude_code.is_none()
-        && claude_error.is_some_and(poller::is_transient_error)
-        && previous.claude_code.is_some()
-    {
+    if data.claude_code.is_none() && claude_error.is_some() && previous.claude_code.is_some() {
         data.claude_code = previous.claude_code.clone();
         merged = true;
     }
-    if data.codex.is_none()
-        && codex_error.is_some_and(poller::is_transient_error)
-        && previous.codex.is_some()
-    {
+    if data.codex.is_none() && codex_error.is_some() && previous.codex.is_some() {
         data.codex = previous.codex.clone();
         merged = true;
     }
-    if data.antigravity.is_none()
-        && antigravity_error.is_some_and(poller::is_transient_error)
-        && previous.antigravity.is_some()
-    {
+    if data.antigravity.is_none() && antigravity_error.is_some() && previous.antigravity.is_some() {
         data.antigravity = previous.antigravity.clone();
         merged = true;
     }
@@ -3760,14 +3786,58 @@ fn do_poll(send_hwnd: SendHwnd) {
         }
     }
     let widget_width_before_poll = total_widget_width();
-    let (show_claude_code, show_codex, show_antigravity) = {
+    let (show_claude_code, show_codex, show_antigravity, generation) = {
         let state = lock_state();
         state
             .as_ref()
-            .map(|s| (s.show_claude_code, s.show_codex, s.show_antigravity))
-            .unwrap_or((true, false, false))
+            .map(|s| {
+                (
+                    s.show_claude_code,
+                    s.show_codex,
+                    s.show_antigravity,
+                    s.provider_generation,
+                )
+            })
+            .unwrap_or((false, false, false, 0))
     };
     let outcome = poller::poll(show_claude_code, show_codex, show_antigravity);
+    {
+        let mut guard = lock_state();
+        let Some(state) = guard.as_mut() else {
+            return;
+        };
+        if state.provider_generation != generation {
+            diagnose::log("discarding poll after provider selection changed");
+            unsafe {
+                SetTimer(hwnd, TIMER_POLL, 1_000, None);
+            }
+            return;
+        }
+        for (id, error) in [
+            outcome.claude_error,
+            outcome.codex_error,
+            outcome.antigravity_error,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let invalidate = state.provider_health[id].record(
+                outcome.scopes[id].clone(),
+                error,
+                std::time::SystemTime::now(),
+            );
+            if invalidate {
+                if let Some(data) = state.data.as_mut() {
+                    match id {
+                        0 => data.claude_code = None,
+                        1 => data.codex = None,
+                        _ => data.antigravity = None,
+                    }
+                }
+            }
+            codex_mcp::record_provider_health(id, invalidate, error);
+        }
+    }
     let codex_auth_failed = is_codex_auth_error(outcome.codex_error);
 
     let claude_error = outcome.claude_error;
@@ -3776,14 +3846,13 @@ fn do_poll(send_hwnd: SendHwnd) {
     if !outcome.has_success {
         let mut cached_display = false;
         let mut retry_ms = RETRY_BASE_MS;
-        let has_nontransient_error = [claude_error, codex_error, antigravity_error]
-            .into_iter()
-            .flatten()
-            .any(|error| !poller::is_transient_error(error));
         {
             let mut state = lock_state();
             if let Some(state) = state.as_mut() {
                 let mut display_data = AppUsageData::default();
+                if state.provider_generation != generation {
+                    return;
+                }
                 cached_display = merge_transient_cached_provider_data(
                     &mut display_data,
                     state.data.as_ref(),
@@ -3801,14 +3870,19 @@ fn do_poll(send_hwnd: SendHwnd) {
                     );
                     refresh_usage_texts(state);
                     diagnose::log(format!(
-                        "all providers failed transiently; retaining cached display retry={} retry_ms={retry_ms}",
+                        "provider failures; retaining credential-scoped stale display retry={} retry_ms={retry_ms}",
                         state.retry_count
                     ));
                 }
             }
         }
-        if cached_display && !has_nontransient_error {
-            unsafe { SetTimer(hwnd, TIMER_POLL, retry_ms, None) };
+        if cached_display {
+            if codex_auth_failed {
+                handle_codex_auth_failure(hwnd, true);
+            }
+            if !codex_auth_failed {
+                unsafe { SetTimer(hwnd, TIMER_POLL, retry_ms, None) };
+            }
             update_cached_poll_metadata();
             if widget_width_before_poll != total_widget_width() {
                 position_at_taskbar();
@@ -3862,6 +3936,9 @@ fn do_poll(send_hwnd: SendHwnd) {
         let mut state = lock_state();
         if let Some(state) = state.as_mut() {
             let widget_width_before = total_widget_width_for_state(state);
+            if state.provider_generation != generation {
+                return;
+            }
             let extra_display_before = codex_extra_usage_display(
                 state.show_codex,
                 state.credit_display,
@@ -3870,21 +3947,21 @@ fn do_poll(send_hwnd: SendHwnd) {
 
             let mut display_data = fresh_data.clone();
             let claude_cached = display_data.claude_code.is_some()
-                || (claude_error.is_some_and(poller::is_transient_error)
+                || (claude_error.is_some()
                     && state
                         .data
                         .as_ref()
                         .and_then(|data| data.claude_code.as_ref())
                         .is_some());
             let codex_cached = display_data.codex.is_some()
-                || (codex_error.is_some_and(poller::is_transient_error)
+                || (codex_error.is_some()
                     && state
                         .data
                         .as_ref()
                         .and_then(|data| data.codex.as_ref())
                         .is_some());
             let antigravity_cached = display_data.antigravity.is_some()
-                || (antigravity_error.is_some_and(poller::is_transient_error)
+                || (antigravity_error.is_some()
                     && state
                         .data
                         .as_ref()
@@ -3941,7 +4018,7 @@ fn do_poll(send_hwnd: SendHwnd) {
             } else if codex_success.is_some() {
                 clear_codex_watch = finish_codex_auth_recovery(state);
             } else if let Some(error) =
-                codex_error.filter(|error| !poller::is_transient_error(*error))
+                codex_error.filter(|error| !poller::is_transient_error(*error) && !codex_cached)
             {
                 state.codex_session_text =
                     poll_error_display_label(error, state.language).to_string();
@@ -3999,10 +4076,6 @@ fn do_poll(send_hwnd: SendHwnd) {
                     unsafe { SetTimer(hwnd, TIMER_POLL, interval, None) };
                 }
             }
-            if codex_auth_retry_delay.is_some() {
-                state.codex_session_text = "!".to_string();
-                state.codex_weekly_text = "!".to_string();
-            }
             state.auth_error_paused_polling = false;
             state.auth_watch_mode = poller::CredentialWatchMode::ActiveSource;
             state.auth_watch_snapshot.clear();
@@ -4010,12 +4083,19 @@ fn do_poll(send_hwnd: SendHwnd) {
         }
     }
 
+    // Serialize publication with selection changes, including disable/re-enable.
+    let publication_guard = lock_state();
+    if publication_guard
+        .as_ref()
+        .is_none_or(|s| s.provider_generation != generation)
+    {
+        return;
+    }
     if let Some(codex) = codex_success {
         let (adaptive, interval) = mcp_polling_metadata.unwrap_or((false, POLL_15_MIN));
         codex_mcp::publish_snapshot(codex, adaptive, interval);
     } else {
-        let state = lock_state();
-        if let Some(state) = state.as_ref() {
+        if let Some(state) = publication_guard.as_ref() {
             codex_mcp::update_polling_metadata(
                 state.adaptive_polling,
                 effective_poll_interval_ms(state),
@@ -4025,6 +4105,7 @@ fn do_poll(send_hwnd: SendHwnd) {
     if let Some(claude) = claude_snapshot {
         codex_mcp::publish_claude_snapshot(claude);
     }
+    drop(publication_guard);
 
     if let Some(delay) = codex_auth_retry_delay {
         unsafe {
@@ -5148,6 +5229,20 @@ unsafe extern "system" fn wnd_proc(
                             } else {
                                 None
                             };
+                            s.provider_generation = s.provider_generation.wrapping_add(1);
+                            let enabled = [s.show_claude_code, s.show_codex, s.show_antigravity];
+                            for (id, enabled) in enabled.into_iter().enumerate() {
+                                if !enabled {
+                                    s.provider_health[id] = Default::default();
+                                    if let Some(data) = s.data.as_mut() {
+                                        match id {
+                                            0 => data.claude_code = None,
+                                            1 => data.codex = None,
+                                            _ => data.antigravity = None,
+                                        }
+                                    }
+                                }
+                            }
                             codex_mcp::set_monitoring_enabled(s.show_codex, s.show_claude_code);
                             s.session_text = "...".to_string();
                             s.weekly_text = "...".to_string();
@@ -5287,7 +5382,7 @@ fn open_log_file(hwnd: HWND) {
     };
     let command = shell_open_log_file_command(&log_path, log_path.is_file());
     diagnose::log(format!(
-        "Open log file requested logger_path={} path_source={} target={} exists={} api=ShellExecuteW verb=open parameters=null working_directory={} file_quoted=false",
+        "Open log file requested logger_path={} path_source={} target={} exists={} api=ShellExecuteW verb=open parameters=null working_directory={} file_quoted=false write_failures={}",
         log_path.display(),
         if diagnose::is_enabled() {
             "active_logger"
@@ -5296,7 +5391,8 @@ fn open_log_file(hwnd: HWND) {
         },
         command.target.display(),
         command.file_exists,
-        command.working_directory.display()
+        command.working_directory.display(),
+        diagnose::write_failure_count()
     ));
 
     let parameters = command
@@ -6440,6 +6536,77 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stale_prefix_preserves_width_and_auxiliary_anchors() {
+        for text in ["88% 1h04m", "12% 1h04m", "100% 5h", "5% 1d23h"] {
+            let fresh = quota_text_width_for(LanguageId::English, &[text]);
+            let stale = quota_text_width_for(LanguageId::English, &[&format!("!{text}")]);
+            assert_eq!(fresh, stale);
+            for dpi in [96, 120, 144, 192] {
+                assert_eq!(
+                    scale_logical_at_dpi(fresh, dpi),
+                    scale_logical_at_dpi(stale, dpi)
+                );
+                for side in [CreditPosition::Left, CreditPosition::Right] {
+                    for grip in [false, true] {
+                        assert_eq!(
+                            widget_content_positions_for(
+                                2,
+                                LanguageId::English,
+                                grip,
+                                true,
+                                side,
+                                CreditValueMode::Credits,
+                                "360",
+                                fresh
+                            ),
+                            widget_content_positions_for(
+                                2,
+                                LanguageId::English,
+                                grip,
+                                true,
+                                side,
+                                CreditValueMode::Credits,
+                                "360",
+                                stale
+                            )
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn claude_auth_failure_retains_only_credential_scoped_data() {
+        let mut old = AppUsageData::default();
+        let mut usage = crate::models::UsageData::default();
+        usage.session.percentage = 12.0;
+        old.claude_code = Some(usage);
+        let mut fresh = AppUsageData::default();
+        fresh.codex = Some(crate::models::UsageData::default());
+        assert!(merge_transient_cached_provider_data(
+            &mut fresh,
+            Some(&old),
+            Some(poller::PollError::AuthRequired),
+            None,
+            None
+        ));
+        assert_eq!(fresh.claude_code.as_ref().unwrap().session.percentage, 12.0);
+        assert!(fresh.codex.is_some());
+        // Invalidating a changed scope removes the only source of cached data.
+        old.claude_code = None;
+        fresh.claude_code = None;
+        assert!(!merge_transient_cached_provider_data(
+            &mut fresh,
+            Some(&old),
+            Some(poller::PollError::AuthRequired),
+            None,
+            None
+        ));
+        assert!(fresh.claude_code.is_none());
+    }
+
+    #[test]
     fn partial_provider_errors_keep_backoff_and_block_reset_polling() {
         for provider in 0..3 {
             let mut errors = [None; 3];
@@ -7126,7 +7293,7 @@ mod tests {
         assert!(!should_attempt_codex_exec_fallback(
             6, true, false, false, false
         ));
-        assert!(should_attempt_codex_exec_fallback(
+        assert!(!should_attempt_codex_exec_fallback(
             6, true, false, false, true
         ));
         assert!(!should_attempt_codex_exec_fallback(
@@ -7167,7 +7334,7 @@ mod tests {
     }
 
     #[test]
-    fn rejected_usage_poll_keeps_last_resort_available_after_nominal_refresh_success() {
+    fn rejected_usage_poll_cannot_enable_model_consuming_recovery() {
         let mut episode = CodexAuthEpisode {
             active: true,
             passive_failures: 6,
@@ -7178,7 +7345,7 @@ mod tests {
 
         mark_model_free_refresh_ineffective_after_auth_rejection(&mut episode);
 
-        assert!(should_attempt_codex_exec_fallback(
+        assert!(!should_attempt_codex_exec_fallback(
             episode.passive_failures,
             episode.model_free_refresh_attempted,
             episode.model_free_refresh_succeeded,

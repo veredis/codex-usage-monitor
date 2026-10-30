@@ -1,6 +1,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -15,6 +16,11 @@ struct DiagnoseState {
 }
 
 static DIAGNOSE_STATE: OnceLock<DiagnoseState> = OnceLock::new();
+static WRITE_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+pub fn write_failure_count() -> u64 {
+    WRITE_FAILURES.load(Ordering::Relaxed)
+}
 
 /// Initialize bounded persistent operational logging. Failure is intentionally
 /// non-fatal so diagnostics can never prevent the taskbar monitor from starting.
@@ -33,6 +39,12 @@ pub fn init(verbose: bool) -> Result<PathBuf, String> {
     })?;
 
     rotate_if_needed(&path);
+    if !append_record_to(&path, "operational log write probe succeeded") {
+        return Err(
+            "Operational log append failed; check the logs directory permissions and file locks"
+                .to_string(),
+        );
+    }
     let state = DiagnoseState {
         path: path.clone(),
         verbose,
@@ -103,7 +115,21 @@ fn write_record(message: &str) {
         return;
     };
 
-    append_record_to(&state.path, message);
+    if !append_record_to(&state.path, message) {
+        let count = WRITE_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+        // Debugger output is independent of the failing file. Rate-limit it and
+        // never include the original record or credential-related error text.
+        if count == 1 || count.is_power_of_two() {
+            let message =
+                format!("Codex Usage Monitor operational log write failed count={count}\0");
+            let wide: Vec<u16> = message.encode_utf16().collect();
+            unsafe {
+                windows::Win32::System::Diagnostics::Debug::OutputDebugStringW(
+                    windows::core::PCWSTR(wide.as_ptr()),
+                );
+            }
+        }
+    }
 }
 
 fn log_file_path(local_app_data: &std::path::Path) -> PathBuf {
@@ -114,18 +140,21 @@ fn log_directory_path(local_app_data: &std::path::Path) -> PathBuf {
     local_app_data.join("CodexUsage").join("logs")
 }
 
-fn append_record_to(path: &std::path::Path, message: &str) {
+fn append_record_to(path: &std::path::Path, message: &str) -> bool {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
     let message = truncate_record(message);
-    let line = format!("[{timestamp}] {message}\n");
+    let line = format!("[{timestamp}] pid={} {message}\n", std::process::id());
     rotate_if_record_would_exceed(path, line.len() as u64);
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = file.write_all(line.as_bytes());
-        let _ = file.flush();
+        return file
+            .write_all(line.as_bytes())
+            .and_then(|_| file.flush())
+            .is_ok();
     }
+    false
 }
 
 fn truncate_record(message: &str) -> &str {
@@ -243,7 +272,10 @@ mod tests {
         fs::create_dir_all(&base).unwrap();
         let invalid_path = base.join("is-a-directory");
         fs::create_dir(&invalid_path).unwrap();
-        append_record_to(&invalid_path, "write failure is ignored");
+        assert!(!append_record_to(
+            &invalid_path,
+            "write failure is reported"
+        ));
 
         let path = base.join(LOG_FILE_NAME);
         fs::write(&path, vec![b'x'; 32]).unwrap();

@@ -48,16 +48,34 @@ struct SharedUsage {
     polling: PollingMetadata,
     codex_enabled: bool,
     claude_enabled: bool,
+    errors: [Option<crate::poller::PollError>; 2],
 }
 
 impl SharedUsage {
+    fn record_health(
+        &mut self,
+        index: usize,
+        invalidate: bool,
+        error: Option<crate::poller::PollError>,
+    ) {
+        self.errors[index] = error;
+        if invalidate {
+            if index == 1 {
+                self.claude_snapshot = None;
+            } else {
+                self.snapshot = None;
+            }
+        }
+    }
     fn set_monitoring_enabled(&mut self, codex: bool, claude: bool) {
         self.codex_enabled = codex;
         self.claude_enabled = claude;
         if !codex {
+            self.errors[0] = None;
             self.snapshot = None;
         }
         if !claude {
+            self.errors[1] = None;
             self.claude_snapshot = None;
         }
     }
@@ -74,8 +92,10 @@ impl SharedUsage {
                 updated_at: SystemTime::now(),
             });
             if claude {
+                self.errors[1] = None;
                 self.claude_snapshot = snapshot;
             } else {
+                self.errors[0] = None;
                 self.snapshot = snapshot;
             }
         }
@@ -107,6 +127,23 @@ pub fn publish_snapshot(data: UsageData, adaptive: bool, interval_ms: u32) {
 pub fn publish_claude_snapshot(data: UsageData) {
     if let Ok(mut shared) = shared_usage().write() {
         shared.publish(data, true);
+    }
+}
+
+/// Publish failure metadata without changing the last-success timestamp.
+/// Scope changes clear the old account before any new response is published.
+pub fn record_provider_health(
+    id: usize,
+    invalidate: bool,
+    error: Option<crate::poller::PollError>,
+) {
+    let index = match id {
+        0 => 1,
+        1 => 0,
+        _ => return,
+    };
+    if let Ok(mut shared) = shared_usage().write() {
+        shared.record_health(index, invalidate, error);
     }
 }
 
@@ -441,7 +478,7 @@ fn handle_rpc_at(request: &Value, now: SystemTime) -> Option<Value> {
                     "error":{"code":-32602,"message":"Unknown tool or arguments are not supported"}
                 }));
             }
-            let (snapshot, polling) = shared_usage()
+            let (snapshot, polling, error) = shared_usage()
                 .read()
                 .map(|shared| {
                     (
@@ -451,10 +488,15 @@ fn handle_rpc_at(request: &Value, now: SystemTime) -> Option<Value> {
                             shared.snapshot.clone()
                         },
                         shared.polling.clone(),
+                        shared.errors[if tool_name == Some("get_claude_usage") {
+                            1
+                        } else {
+                            0
+                        }],
                     )
                 })
-                .unwrap_or((None, PollingMetadata::default()));
-            let data = usage_snapshot_result(snapshot.as_ref(), &polling, now);
+                .unwrap_or((None, PollingMetadata::default(), None));
+            let data = snapshot_with_health(snapshot.as_ref(), &polling, now, error);
             let text = serde_json::to_string(&data).unwrap_or_else(|_| "{}".to_string());
             json!({
                 "content":[{"type":"text","text":text}],
@@ -471,6 +513,28 @@ fn handle_rpc_at(request: &Value, now: SystemTime) -> Option<Value> {
         }
     };
     Some(json!({"jsonrpc":"2.0","id":id_copy,"result":result}))
+}
+
+fn snapshot_with_health(
+    snapshot: Option<&CachedSnapshot>,
+    polling: &PollingMetadata,
+    now: SystemTime,
+    error: Option<crate::poller::PollError>,
+) -> Value {
+    let mut data = usage_snapshot_result(snapshot, polling, now);
+    if error.is_some() && snapshot.is_some() {
+        data["status"] = json!("stale");
+    }
+    data["error_category"] = json!(error.map(|e| e.category()));
+    data["authentication_required"] = json!(matches!(
+        error,
+        Some(
+            crate::poller::PollError::AuthRequired
+                | crate::poller::PollError::TokenExpired
+                | crate::poller::PollError::NoCredentials
+        )
+    ));
+    data
 }
 
 fn usage_snapshot_result(
@@ -586,6 +650,52 @@ fn lowest_remaining(data: &UsageData) -> (Option<f64>, Option<&'static str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_failure_is_stale_without_changing_success_time_and_other_provider_is_fresh() {
+        let now = UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        let mut shared = SharedUsage::default();
+        shared.set_monitoring_enabled(true, true);
+        shared.snapshot = Some(cached(test_data(12.0, 34.0), Duration::from_secs(2)));
+        shared.claude_snapshot = Some(cached(test_data(20.0, 40.0), Duration::from_secs(5)));
+        let updated = shared.claude_snapshot.as_ref().unwrap().updated_at;
+        shared.record_health(1, false, Some(crate::poller::PollError::AuthRequired));
+        let claude = snapshot_with_health(
+            shared.claude_snapshot.as_ref(),
+            &shared.polling,
+            now,
+            shared.errors[1],
+        );
+        let codex = snapshot_with_health(
+            shared.snapshot.as_ref(),
+            &shared.polling,
+            now,
+            shared.errors[0],
+        );
+        assert_eq!(claude["status"], "stale");
+        assert_eq!(claude["authentication_required"], true);
+        assert_eq!(claude["error_category"], "auth_required");
+        assert_eq!(claude["age_seconds"], 5);
+        assert_eq!(claude["five_hour"]["remaining_percent"], 80.0);
+        assert_eq!(codex["status"], "ok");
+        assert_eq!(shared.claude_snapshot.as_ref().unwrap().updated_at, updated);
+        shared.record_health(1, true, Some(crate::poller::PollError::AuthRequired));
+        assert_eq!(
+            snapshot_with_health(
+                shared.claude_snapshot.as_ref(),
+                &shared.polling,
+                now,
+                shared.errors[1]
+            )["status"],
+            "unavailable"
+        );
+        shared.publish(test_data(21.0, 41.0), true);
+        assert!(shared.errors[1].is_none());
+        assert!(shared.claude_snapshot.is_some());
+        shared.set_monitoring_enabled(true, false);
+        shared.set_monitoring_enabled(true, true);
+        assert!(shared.claude_snapshot.is_none());
+    }
 
     #[test]
     fn disabling_provider_clears_cache_and_rejects_in_flight_publication() {
