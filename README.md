@@ -31,14 +31,14 @@ To keep **Start with Windows** stable across updates, install it to `%LOCALAPPDA
 - Optional Credits display with Left or Right placement.
 - Credits or approximate USD display (`~$13.40`) using the raw balance for conversion.
 - Upstream's appearance:
-  - a provider mark beside each provider's bars
+  - a provider mark beside each provider's bars (**Appearance > Show provider icons** hides them and reclaims their space)
   - antialiased rounded bars, continuous or segmented, standard or slim
   - standard or larger text
   - high-contrast dark and light palettes with a solid backdrop for translucent taskbars
 
   The widget also shrinks to fit shorter taskbars.
 - Default per-provider colors (Claude orange, Codex green, Antigravity blue), or your own: one color for every bar (custom or the Windows accent), or a color per provider, chosen with the native color picker. **Appearance > Colors > Default provider colors** restores the defaults.
-- Hover a quota value to see its exact local reset date and time, or what `--` (not reported) and `!--` (reset since the last refresh) mean.
+- Hover a quota value to see its exact local reset date and time, or what `--` (not reported) and `!--` (reset since the last refresh) mean. The popup and the right-click menu follow the widget's dark or light palette.
 - Fixed polling intervals from 30 seconds to 1 hour, plus optional Adaptive polling.
 - Optional compact 2x3 drag handle and persistent widget positioning.
 - Automatic, manual and dragged positions all stay left of the notification area (Show hidden icons, tray icons and clock); taskbar layout changes are always reconciled, even when they arrive in bursts.
@@ -60,7 +60,7 @@ Important defaults and settings:
 - **Appearance:** **Settings > Appearance** offers:
   - the translucent-dark-taskbar preset
   - **Reset appearance**, which keeps your colors
-  - contrast, bar style and thickness, text size and colors
+  - contrast, bar style and thickness, text size, provider icons and colors
 
   An explicitly chosen color always wins over a palette, and a color saved by an earlier version keeps applying to every bar.
 - **Taskbar placement:** **Show drag handle** is off by default. Reset Position computes a safe default without forgetting a manually saved position.
@@ -189,4 +189,4 @@ Released under the [MIT License](LICENSE).
 
 ## Current version
 
-The public fork release is `1.9.1-veredis.7`. The current development binary identifies itself as `1.9.1-veredis.7 (Build 13)`; the Build number is an informational candidate identifier and does not change update ordering.
+The public fork release is `1.9.1-veredis.7`. The current development binary identifies itself as `1.9.1-veredis.7 (Build 14)`; the Build number is an informational candidate identifier and does not change update ordering.

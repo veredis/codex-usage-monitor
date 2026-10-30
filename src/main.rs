@@ -6,6 +6,7 @@ mod claude_local;
 mod codex_mcp;
 mod diagnose;
 mod localization;
+mod menu_theme;
 mod models;
 mod native_interop;
 mod poller;

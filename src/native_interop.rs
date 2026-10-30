@@ -486,3 +486,74 @@ pub fn choose_custom_color(hwnd: HWND, initial: Color) -> Option<Color> {
             .then(|| Color::from_colorref(chooser.rgbResult.0))
     }
 }
+
+/// Test fixtures: the composed screen pixels (`0xRRGGBB`) of a rectangle.
+#[cfg(test)]
+pub fn capture_screen(left: i32, top: i32, width: i32, height: i32) -> Vec<u32> {
+    use windows::Win32::Graphics::Gdi::*;
+    unsafe {
+        let screen = GetDC(None);
+        let dc = CreateCompatibleDC(screen);
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits = std::ptr::null_mut();
+        let dib = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
+        let old = SelectObject(dc, dib);
+        BitBlt(
+            dc,
+            0,
+            0,
+            width,
+            height,
+            screen,
+            left,
+            top,
+            SRCCOPY | CAPTUREBLT,
+        )
+        .unwrap();
+        let _ = GdiFlush();
+        let pixels = std::slice::from_raw_parts(bits as *const u32, (width * height) as usize)
+            .iter()
+            .map(|p| p & 0xFFFFFF)
+            .collect();
+        SelectObject(dc, old);
+        let _ = DeleteObject(dib);
+        let _ = DeleteDC(dc);
+        ReleaseDC(None, screen);
+        pixels
+    }
+}
+
+/// Test fixtures: write `0xRRGGBB` pixels as a 24-bit top-down BMP.
+#[cfg(test)]
+pub fn write_bmp(path: &std::path::Path, width: i32, height: i32, pixels: &[u32]) {
+    let row_bytes = (width * 3 + 3) & !3;
+    let image_size = (row_bytes * height) as u32;
+    let mut bmp = Vec::new();
+    bmp.extend_from_slice(b"BM");
+    bmp.extend_from_slice(&(54 + image_size).to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    bmp.extend_from_slice(&54u32.to_le_bytes());
+    bmp.extend_from_slice(&40u32.to_le_bytes());
+    bmp.extend_from_slice(&width.to_le_bytes());
+    bmp.extend_from_slice(&(-height).to_le_bytes());
+    bmp.extend_from_slice(&1u16.to_le_bytes());
+    bmp.extend_from_slice(&24u16.to_le_bytes());
+    bmp.extend_from_slice(&[0u8; 24]);
+    for row in pixels.chunks(width as usize) {
+        for p in row {
+            bmp.extend_from_slice(&[*p as u8, (*p >> 8) as u8, (*p >> 16) as u8]);
+        }
+        bmp.extend(std::iter::repeat_n(0u8, (row_bytes - width * 3) as usize));
+    }
+    std::fs::write(path, bmp).unwrap();
+}

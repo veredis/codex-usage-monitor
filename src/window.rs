@@ -225,6 +225,7 @@ const IDM_COLOR_CLAUDE: u16 = 112;
 const IDM_COLOR_CODEX: u16 = 113;
 const IDM_COLOR_ANTIGRAVITY: u16 = 114;
 const IDM_CLAUDE_DESKTOP_SIGN_IN: u16 = 115;
+const IDM_PROVIDER_ICONS: u16 = 116;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 /// `WM_MOUSELEAVE`, requested with `TrackMouseEvent` for the hover popup.
@@ -661,15 +662,30 @@ impl ProviderColors {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 struct Appearance {
     palette: Palette,
     bar_style: BarStyle,
     bar_thickness: BarThickness,
     font_size: FontSize,
+    /// Provider marks beside the bars; hiding them reclaims their column.
+    show_provider_icons: bool,
     #[serde(skip_serializing_if = "provider_colors_are_default")]
     provider_colors: ProviderColors,
+}
+
+impl Default for Appearance {
+    fn default() -> Self {
+        Self {
+            palette: Palette::default(),
+            bar_style: BarStyle::default(),
+            bar_thickness: BarThickness::default(),
+            font_size: FontSize::default(),
+            show_provider_icons: true,
+            provider_colors: ProviderColors::default(),
+        }
+    }
 }
 
 fn provider_colors_are_default(colors: &ProviderColors) -> bool {
@@ -688,6 +704,7 @@ impl Appearance {
             bar_style: BarStyle::Continuous,
             bar_thickness: BarThickness::Slim,
             font_size: FontSize::Large,
+            show_provider_icons: self.show_provider_icons,
             provider_colors: self.provider_colors.clone(),
         }
     }
@@ -2855,12 +2872,28 @@ fn measure_text_width(text: &str) -> Option<i32> {
 /// Widget font size and weight from the current appearance, packed as
 /// `px << 16 | weight`; measurement and drawing both read it so widths match.
 static WIDGET_FONT_SPEC: AtomicU32 = AtomicU32::new((12 << 16) | 600);
+/// Whether provider marks take a column; read by layout and drawing alike.
+static SHOW_PROVIDER_ICONS: AtomicBool = AtomicBool::new(true);
 
 fn set_widget_font(appearance: &Appearance) {
     WIDGET_FONT_SPEC.store(
         ((appearance.font_px() as u32) << 16) | appearance.font_weight() as u32,
         Ordering::Relaxed,
     );
+    SHOW_PROVIDER_ICONS.store(appearance.show_provider_icons, Ordering::Relaxed);
+}
+
+/// Physical width of the provider-mark slot before each provider's bars.
+fn provider_icon_slot() -> i32 {
+    provider_icon_slot_for(SHOW_PROVIDER_ICONS.load(Ordering::Relaxed))
+}
+
+fn provider_icon_slot_for(shown: bool) -> i32 {
+    if shown {
+        sc(crate::provider_icons::SIZE + crate::provider_icons::RIGHT_MARGIN)
+    } else {
+        0
+    }
 }
 
 /// The widget font: Segoe UI at the appearance's size and weight (upstream
@@ -3391,6 +3424,7 @@ fn apply_appearance_command(state: &mut AppState, id: u16) {
         IDM_BAR_SLIM => appearance.bar_thickness = BarThickness::Slim,
         IDM_FONT_STANDARD => appearance.font_size = FontSize::Standard,
         IDM_FONT_LARGE => appearance.font_size = FontSize::Large,
+        IDM_PROVIDER_ICONS => appearance.show_provider_icons = !appearance.show_provider_icons,
         IDM_COLORS_DEFAULT => {
             appearance.provider_colors = ProviderColors::default();
             state.bar_color = None;
@@ -4055,7 +4089,6 @@ fn paint_content(
             antigravity_weekly_text,
         );
         let (label_width, text_width) = usage_layout_widths(language, &quota_texts);
-        let percent_width = quota_percent_column_width(&quota_texts);
         let layout_credit_text = if credit_panel_visible {
             credit_text
         } else {
@@ -4174,29 +4207,38 @@ fn paint_content(
             single_row_y + (row_height - icon_size) / 2
         };
         let mut icon_x = content_x + sc(label_width) + sc(HORIZONTAL_GUTTER);
-        for provider in &shown {
+        for provider in shown.iter().filter(|_| provider_icon_slot() > 0) {
             crate::provider_icons::draw(hdc, icon_x, icon_y, icon_size, *provider);
             icon_x += column_width;
         }
+        let value_for = |provider: Provider, session: bool| match (provider, session) {
+            (Provider::Claude, true) => (session_pct, session_text),
+            (Provider::Claude, false) => (weekly_pct, weekly_text),
+            (Provider::Codex, true) => (codex_session_pct, codex_session_text),
+            (Provider::Codex, false) => (codex_weekly_pct, codex_weekly_text),
+            (Provider::Antigravity, true) => (antigravity_session_pct, antigravity_session_text),
+            (Provider::Antigravity, false) => (antigravity_weekly_pct, antigravity_weekly_text),
+        };
+        // Each provider's percentage column fits its own visible rows, so the
+        // bar-to-text gap does not depend on another provider's `100%`; the
+        // shared text width still bounds the column, so the widget never grows.
+        let percent_width_for = |provider: Provider| {
+            let texts: Vec<&str> = [(true, show_session_window), (false, show_weekly_window)]
+                .into_iter()
+                .filter(|&(_, visible)| visible)
+                .map(|(session, _)| value_for(provider, session).1)
+                .collect();
+            quota_percent_column_width(&texts)
+        };
         let cells_for = |session: bool| {
             shown
                 .iter()
                 .map(|&provider| {
-                    let (percent, text) = match (provider, session) {
-                        (Provider::Claude, true) => (session_pct, session_text),
-                        (Provider::Claude, false) => (weekly_pct, weekly_text),
-                        (Provider::Codex, true) => (codex_session_pct, codex_session_text),
-                        (Provider::Codex, false) => (codex_weekly_pct, codex_weekly_text),
-                        (Provider::Antigravity, true) => {
-                            (antigravity_session_pct, antigravity_session_text)
-                        }
-                        (Provider::Antigravity, false) => {
-                            (antigravity_weekly_pct, antigravity_weekly_text)
-                        }
-                    };
+                    let (percent, text) = value_for(provider, session);
                     RowCell {
                         provider,
                         percent,
+                        percent_width: percent_width_for(provider),
                         text,
                         accent: provider_bar_color(
                             appearance,
@@ -4234,7 +4276,6 @@ fn paint_content(
                 track,
                 label_width,
                 text_width,
-                percent_width,
                 hover,
             );
         }
@@ -4256,7 +4297,6 @@ fn paint_content(
                 track,
                 label_width,
                 text_width,
-                percent_width,
                 hover,
             );
         }
@@ -5874,6 +5914,7 @@ unsafe extern "system" fn wnd_proc(
                 | IDM_BAR_SLIM
                 | IDM_FONT_STANDARD
                 | IDM_FONT_LARGE
+                | IDM_PROVIDER_ICONS
                 | IDM_COLORS_DEFAULT
                 | IDM_BAR_COLOR_WINDOWS_ACCENT => {
                     if let Some(s) = lock_state().as_mut() {
@@ -6864,6 +6905,16 @@ fn show_context_menu(hwnd: HWND) {
             font_menu,
             if chinese { "文字大小" } else { "Text size" },
         );
+        append_menu_choice(
+            appearance_menu,
+            IDM_PROVIDER_ICONS,
+            appearance.show_provider_icons,
+            if chinese {
+                "显示服务图标"
+            } else {
+                "Show provider icons"
+            },
+        );
 
         let colors_menu = CreatePopupMenu().unwrap();
         let no_explicit_colors =
@@ -7063,6 +7114,8 @@ fn show_context_menu(hwnd: HWND) {
             PCWSTR::from_raw(exit_str.as_ptr()),
         );
 
+        // Menus follow the widget's palette, like the hover popup.
+        crate::menu_theme::apply(appearance.is_dark(theme::is_dark_mode()));
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
         let _ = SetForegroundWindow(hwnd);
@@ -7355,7 +7408,12 @@ fn update_hover_popup(hwnd: HWND, point: POINT) {
                             .taskbar_hwnd
                             .and_then(native_interop::get_taskbar_rect)
                             .or_else(|| native_interop::get_window_rect_safe(hwnd));
-                        (text, region.rect, taskbar)
+                        (
+                            text,
+                            region.rect,
+                            taskbar,
+                            popup_theme(&s.appearance, s.is_dark),
+                        )
                     })
                 }
                 None => None,
@@ -7363,7 +7421,7 @@ fn update_hover_popup(hwnd: HWND, point: POINT) {
         }
     };
     match target {
-        Some((text, rect, Some(taskbar))) => unsafe {
+        Some((text, rect, Some(taskbar), theme)) => unsafe {
             let mut top_left = POINT {
                 x: rect.left,
                 y: rect.top,
@@ -7381,11 +7439,11 @@ fn update_hover_popup(hwnd: HWND, point: POINT) {
                 bottom: bottom_right.y,
             };
             crate::quota_popup::show(
-                hwnd,
                 &text,
                 anchor,
                 taskbar,
-                sc(crate::quota_popup::TASKBAR_GAP),
+                theme,
+                CURRENT_DPI.load(Ordering::Relaxed),
             );
             let mut track = windows::Win32::UI::Input::KeyboardAndMouse::TRACKMOUSEEVENT {
                 cbSize: std::mem::size_of::<
@@ -7401,6 +7459,18 @@ fn update_hover_popup(hwnd: HWND, point: POINT) {
     }
 }
 
+/// The popup and context menu follow the widget's palette: Follow system
+/// uses the taskbar's dark or light mode.
+fn popup_theme(appearance: &Appearance, system_is_dark: bool) -> crate::quota_popup::Theme {
+    use crate::quota_popup::Theme;
+    match appearance.palette {
+        Palette::System if system_is_dark => Theme::Dark,
+        Palette::System => Theme::Light,
+        Palette::HighContrastDark => Theme::HighContrastDark,
+        Palette::HighContrastLight => Theme::HighContrastLight,
+    }
+}
+
 fn dismiss_hover_popup() {
     if let Some(s) = lock_state().as_mut() {
         s.hovered_region = None;
@@ -7413,6 +7483,8 @@ fn dismiss_hover_popup() {
 struct RowCell<'a> {
     provider: crate::provider_icons::Provider,
     percent: f64,
+    /// Logical width of this provider's right-aligned percentage column.
+    percent_width: i32,
     text: &'a str,
     accent: Color,
     value_color: Color,
@@ -7441,7 +7513,6 @@ fn draw_row(
     track: &Color,
     label_width: i32,
     text_width: i32,
-    percent_width: i32,
     hover: &mut Vec<HoverRegion>,
 ) {
     let segment_count = row_bar_segment_count(cells.len().max(1) as i32);
@@ -7469,7 +7540,7 @@ fn draw_row(
     for cell in cells {
         // The provider mark sits left of the bars, centred across both rows
         // (drawn once per column by paint_content).
-        let bar_x = model_x + sc(crate::provider_icons::SIZE + crate::provider_icons::RIGHT_MARGIN);
+        let bar_x = model_x + provider_icon_slot();
         let text_rect = draw_usage_bar(
             hdc,
             bar_x,
@@ -7484,7 +7555,7 @@ fn draw_row(
             &cell.value_color,
             &reset_color,
             text_width,
-            percent_width,
+            cell.percent_width,
         );
         hover.push(HoverRegion {
             rect: text_rect,
@@ -7495,11 +7566,9 @@ fn draw_row(
     }
 }
 
-/// Logical-free physical width of one provider column: mark, bars and text.
+/// Physical width of one provider column: mark (when shown), bars and text.
 fn model_usage_width(segment_count: i32, text_width: i32) -> i32 {
-    sc(crate::provider_icons::SIZE + crate::provider_icons::RIGHT_MARGIN)
-        + (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * segment_count
-        - sc(SEGMENT_GAP)
+    provider_icon_slot() + (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * segment_count - sc(SEGMENT_GAP)
         + sc(HORIZONTAL_GUTTER)
         + sc(text_width)
 }
@@ -10368,6 +10437,62 @@ mod appearance_tests {
     use crate::provider_icons::Provider;
 
     #[test]
+    fn provider_icons_are_shown_by_default_and_hiding_them_reclaims_their_column() {
+        assert!(Appearance::default().show_provider_icons);
+        let older: SettingsFile =
+            serde_json::from_str(r#"{"appearance":{"palette":"high_contrast_dark"}}"#).unwrap();
+        assert!(
+            older.appearance.show_provider_icons,
+            "Build 13 settings keep marks"
+        );
+        let hidden: SettingsFile =
+            serde_json::from_str(r#"{"appearance":{"show_provider_icons":false}}"#).unwrap();
+        assert!(!hidden.appearance.show_provider_icons);
+        let saved = serde_json::to_value(&hidden.appearance).unwrap();
+        assert_eq!(saved["show_provider_icons"], false);
+
+        assert_eq!(provider_icon_slot_for(false), 0);
+        assert_eq!(
+            provider_icon_slot_for(true),
+            sc(crate::provider_icons::SIZE + crate::provider_icons::RIGHT_MARGIN)
+        );
+
+        let mut state = persisted_snapshot_tests::test_state();
+        state.appearance.show_provider_icons = false;
+        assert!(
+            !state
+                .appearance
+                .with_translucent_dark_preset()
+                .show_provider_icons
+        );
+        apply_appearance_command(&mut state, IDM_PROVIDER_ICONS);
+        assert!(
+            state.appearance.show_provider_icons,
+            "the menu item restores them"
+        );
+        apply_appearance_command(&mut state, IDM_PROVIDER_ICONS);
+        assert!(!state.appearance.show_provider_icons);
+    }
+
+    /// Owner's report: Claude `98%` sat further from its bar than Codex
+    /// `100%`, because one percentage column fit the widest value of any
+    /// provider. Per-provider columns give every provider the same gap.
+    #[test]
+    fn bar_to_percentage_gap_matches_across_providers() {
+        let gap = |texts: &[&str], widest: &str| {
+            quota_percent_column_width(texts) - measure_text_width(widest).unwrap()
+        };
+        let claude = gap(&["98% 3h03m", "24% 1d"], "98%");
+        let codex = gap(&["100% 3h09m", "44% 6d1h"], "100%");
+        let single_digit = gap(&["5% 3h41m", "8% 2d"], "5%");
+        assert!((claude - codex).abs() <= 1, "claude {claude} codex {codex}");
+        assert!((single_digit - codex).abs() <= 1, "{single_digit} {codex}");
+        // Never wider than the shared column the widget width is sized from.
+        let shared = quota_percent_column_width(&["98% 3h03m", "24% 1d", "100% 3h09m", "44% 6d1h"]);
+        assert!(quota_percent_column_width(&["98% 3h03m", "24% 1d"]) <= shared);
+    }
+
+    #[test]
     fn older_settings_get_factory_appearance_and_keep_explicit_colours() {
         let untouched: SettingsFile = serde_json::from_str("{}").unwrap();
         let untouched = normalize_settings(untouched);
@@ -10661,10 +10786,43 @@ mod appearance_tests {
                 96,
             ),
         ];
-        for (name, appearance, legacy, dark, dpi) in cases {
+        // The owner's Build 13 screenshot values (Claude 98%/24% used, Codex
+        // 100%/44% left), for bar-to-text spacing, with and without marks.
+        let no_icons = Appearance {
+            show_provider_icons: false,
+            ..Appearance::default()
+        };
+        let owner_cases = vec![
+            (
+                "owner-icons-dark-100",
+                Appearance::default(),
+                None,
+                true,
+                96,
+            ),
+            ("owner-no-icons-dark-100", no_icons.clone(), None, true, 96),
+            ("owner-no-icons-dark-150", no_icons, None, true, 144),
+        ];
+        let sample = [
+            (5.0, "5% 3h41m"),
+            (60.0, "60% 1d06h"),
+            (59.0, "41% 4h12m"),
+            (f64::NAN, "!--"),
+        ];
+        let owner = [
+            (98.0, "98% 3h03m"),
+            (24.0, "24% 1d"),
+            (0.0, "100% 3h09m"),
+            (56.0, "44% 6d1h"),
+        ];
+        let cases = cases
+            .into_iter()
+            .map(|case| (case, sample))
+            .chain(owner_cases.into_iter().map(|case| (case, owner)));
+        for ((name, appearance, legacy, dark, dpi), values) in cases {
             CURRENT_DPI.store(dpi, Ordering::Relaxed);
             set_widget_font(&appearance);
-            let texts = ["5% 3h41m", "60% 1d06h", "41% 4h12m", "!--", "--", "100% 6d"];
+            let texts = values.map(|(_, text)| text);
             let quota = quota_text_width_for(LanguageId::English, &texts);
             let width = total_widget_width_for(
                 2,
@@ -10707,14 +10865,14 @@ mod appearance_tests {
                     &track,
                     LanguageId::English,
                     LanguageId::English.strings(),
-                    5.0,
-                    "5% 3h41m",
-                    60.0,
-                    "60% 1d06h",
-                    59.0,
-                    "41% 4h12m",
-                    f64::NAN,
-                    "!--",
+                    values[0].0,
+                    values[0].1,
+                    values[1].0,
+                    values[1].1,
+                    values[2].0,
+                    values[2].1,
+                    values[3].0,
+                    values[3].1,
                     0.0,
                     "--",
                     100.0,
