@@ -14,7 +14,7 @@ use std::os::windows::process::CommandExt;
 
 use crate::diagnose;
 use crate::localization::Strings;
-use crate::models::{AppUsageData, CreditBalance, LunaReserveUsage, UsageData, UsageSection};
+use crate::models::{AppUsageData, CreditBalance, UsageData, UsageSection};
 use crate::native_interop;
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
@@ -109,25 +109,7 @@ struct CodexTokenData {
 #[derive(Deserialize)]
 struct CodexUsageResponse {
     rate_limit: Option<Option<Box<CodexRateLimitDetails>>>,
-    #[serde(default)]
-    ordinary_usage_allowed: Option<bool>,
     credits: Option<CodexCredits>,
-    #[serde(default)]
-    additional_rate_limits: Option<Vec<CodexAdditionalRateLimit>>,
-    #[serde(default)]
-    rate_limit_upsell: Option<CodexRateLimitUpsell>,
-}
-
-#[derive(Deserialize)]
-struct CodexRateLimitUpsell {
-    banner_type: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct CodexAdditionalRateLimit {
-    limit_name: Option<String>,
-    metered_feature: Option<String>,
-    rate_limit: Option<Option<Box<CodexRateLimitDetails>>>,
 }
 
 #[derive(Deserialize)]
@@ -145,10 +127,6 @@ enum CodexCreditBalanceValue {
 
 #[derive(Deserialize)]
 struct CodexRateLimitDetails {
-    #[serde(default)]
-    allowed: Option<bool>,
-    #[serde(default)]
-    limit_reached: Option<bool>,
     primary_window: Option<Option<Box<CodexRateLimitWindow>>>,
     secondary_window: Option<Option<Box<CodexRateLimitWindow>>>,
 }
@@ -385,16 +363,6 @@ fn log_codex_success(codex: &UsageData) {
         remaining_percentage(codex.weekly.percentage),
         reset(codex.weekly.resets_at),
     ));
-    if let Some(reserve) = codex.luna_reserve.as_ref() {
-        diagnose::log(format!(
-            "Codex Luna Reserve available={} active={:?} used={:.2}% remaining={:.2}% reset_unix={:?}",
-            reserve.available,
-            reserve.active,
-            reserve.section.percentage,
-            remaining_percentage(reserve.section.percentage),
-            reset(reserve.section.resets_at),
-        ));
-    }
 }
 
 fn poll_claude_code() -> Result<UsageData, PollError> {
@@ -931,58 +899,8 @@ fn codex_usage_from_response(response: CodexUsageResponse) -> Option<UsageData> 
     let mut data = UsageData::default();
     data.credits = parse_codex_credits(response.credits);
 
-    let ordinary_allowed = response.ordinary_usage_allowed.or_else(|| {
-        response
-            .rate_limit
-            .as_ref()
-            .and_then(|value| value.as_ref())
-            .and_then(|details| details.allowed)
-    });
-    let explicit_reserve_active = response
-        .rate_limit_upsell
-        .as_ref()
-        .and_then(|upsell| upsell.banner_type.as_deref())
-        .map(|banner| banner.eq_ignore_ascii_case("luna_reserve"));
-
-    if let Some(reserve) = response.additional_rate_limits.as_ref().and_then(|limits| {
-        limits.iter().find(|limit| {
-            limit
-                .limit_name
-                .as_deref()
-                .is_some_and(|name| name.eq_ignore_ascii_case("gpt-reserve"))
-                || limit
-                    .metered_feature
-                    .as_deref()
-                    .is_some_and(|name| name.eq_ignore_ascii_case("gpt-reserve"))
-        })
-    }) {
-        if let Some(details) = reserve.rate_limit.as_ref().and_then(|value| value.as_ref()) {
-            let window = details
-                .primary_window
-                .as_ref()
-                .and_then(|value| value.as_ref())
-                .or_else(|| {
-                    details
-                        .secondary_window
-                        .as_ref()
-                        .and_then(|value| value.as_ref())
-                });
-            if let Some(window) = window {
-                let available =
-                    details.allowed != Some(false) && details.limit_reached != Some(true);
-                let active = explicit_reserve_active
-                    .map(|is_reserve| is_reserve && ordinary_allowed == Some(false) && available);
-                data.luna_reserve = Some(LunaReserveUsage {
-                    section: codex_section_from_window(window),
-                    available,
-                    active,
-                });
-            }
-        }
-    }
-
     let Some(details) = response.rate_limit.flatten().map(|details| *details) else {
-        return (data.credits.is_some() || data.luna_reserve.is_some()).then_some(data);
+        return data.credits.is_some().then_some(data);
     };
     let mut has_session = false;
     let mut has_weekly = false;
@@ -2051,27 +1969,39 @@ mod tests {
     }
 
     #[test]
-    fn reserve_is_optional_on_every_successful_response() {
-        for present in [false, true, false, true] {
+    fn reserve_era_response_fields_are_ignored_without_affecting_usage() {
+        // Live responses may still carry additional buckets, upsell banners
+        // and ordinary-usage flags; none of them may break or change parsing.
+        for extra in [
+            serde_json::json!({}),
+            serde_json::json!({"additional_rate_limits": null}),
+            serde_json::json!({
+                "ordinary_usage_allowed": false,
+                "rate_limit_upsell": {"banner_type": "luna_reserve"},
+                "additional_rate_limits": [
+                    {"limit_name": "gpt-reserve", "metered_feature": "gpt-reserve",
+                     "normal_model_slug": "gpt-5.5",
+                     "rate_limit": {"allowed": false, "limit_reached": true,
+                        "primary_window": {"used_percent": 100, "reset_at": 2000000200, "limit_window_seconds": 604800}}},
+                    {"limit_name": "codex_other", "metered_feature": "codex_other", "rate_limit": null}
+                ]
+            }),
+        ] {
             let mut response = serde_json::json!({
-                "rate_limit": {"primary_window": {"used_percent": 10, "reset_at": 2000000000, "limit_window_seconds": 18000}},
-                "credits": {"balance": 333.704065}
+                "plan_type": "pro",
+                "rate_limit": {"allowed": false, "limit_reached": true,
+                    "primary_window": {"used_percent": 100, "reset_at": 2000000000, "limit_window_seconds": 18000},
+                    "secondary_window": {"used_percent": 16, "reset_at": 2000500000, "limit_window_seconds": 604800}},
+                "credits": {"has_credits": false, "unlimited": false, "balance": "0"}
             });
-            if present {
-                response["additional_rate_limits"] = serde_json::json!([{
-                    "limit_name": "gpt-reserve",
-                    "rate_limit": {"allowed": true, "primary_window": {"used_percent": 25, "reset_at": 2000000000}}
-                }]);
+            for (key, value) in extra.as_object().unwrap() {
+                response[key] = value.clone();
             }
             let data =
                 codex_usage_from_response(serde_json::from_value(response).unwrap()).unwrap();
-            assert_eq!(data.luna_reserve.is_some(), present);
-            assert_eq!(data.credits, Some(CreditBalance::Amount(333.704065)));
-            assert_eq!(data.session.percentage, 10.0);
-            if let Some(reserve) = data.luna_reserve {
-                assert_eq!(reserve.active, None);
-                assert_eq!(reserve.section.percentage, 25.0);
-            }
+            assert_eq!(data.credits, Some(CreditBalance::Amount(0.0)));
+            assert_eq!(data.session.percentage, 100.0);
+            assert_eq!(data.weekly.percentage, 16.0);
         }
     }
 
@@ -2246,58 +2176,6 @@ mod tests {
 
         assert_eq!(usage.session.percentage, 18.0);
         assert_eq!(usage.weekly.percentage, 33.0);
-    }
-
-    #[test]
-    fn codex_gpt_reserve_is_parsed_without_claiming_activation_unless_explicit() {
-        let response: CodexUsageResponse = serde_json::from_str(
-            r#"{
-                "rate_limit": {
-                    "allowed": false,
-                    "primary_window": {"used_percent": 100, "limit_window_seconds": 300, "reset_at": 2000000100}
-                },
-                "rate_limit_upsell": {"banner_type": "luna_reserve"},
-                "additional_rate_limits": [{
-                    "limit_name": "gpt-reserve",
-                    "metered_feature": "base_model_inference",
-                    "rate_limit": {
-                        "allowed": true,
-                        "limit_reached": false,
-                        "primary_window": {"used_percent": 25, "limit_window_seconds": 604800, "reset_at": 2000000200}
-                    }
-                }]
-            }"#,
-        )
-        .unwrap();
-        let usage = codex_usage_from_response(response).unwrap();
-        let reserve = usage
-            .luna_reserve
-            .expect("reserve bucket should be retained");
-        assert!(reserve.available);
-        assert_eq!(reserve.section.percentage, 25.0);
-        assert_eq!(reserve.active, Some(true));
-    }
-
-    #[test]
-    fn codex_reserve_without_activation_evidence_remains_unknown_active_state() {
-        let response: CodexUsageResponse = serde_json::from_str(
-            r#"{
-                "rate_limit": {"allowed": true, "primary_window": {"used_percent": 1, "limit_window_seconds": 300, "reset_at": 2000000100}},
-                "additional_rate_limits": [{
-                    "limit_name": "gpt-reserve",
-                    "rate_limit": {"allowed": true, "primary_window": {"used_percent": 0, "limit_window_seconds": 604800, "reset_at": 2000000200}}
-                }]
-            }"#,
-        )
-        .unwrap();
-        assert_eq!(
-            codex_usage_from_response(response)
-                .unwrap()
-                .luna_reserve
-                .unwrap()
-                .active,
-            None
-        );
     }
 
     #[test]

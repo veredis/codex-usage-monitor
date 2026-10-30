@@ -35,7 +35,7 @@ pub(super) const STRINGS: Strings = Strings {
     exit: "終了",
     show_widget: "ウィジェットを表示",
     credits: "クレジット",
-    credit_display: "クレジット / Luna Reserve",
+    credit_display: "クレジット",
     credit_always: "常に",
     credit_when_needed: "必要な場合",
     credit_off: "オフ",

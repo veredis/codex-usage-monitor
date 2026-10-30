@@ -33,13 +33,20 @@ Operational logging is always on and is written to:
 - application version, build and executable path, and the process ID on every record
 - each provider request with elapsed time, failure category, HTTP status and `Retry-After`
 - each provider's schedule (time until ready, retry count, server wait)
-- window creation, taskbar placement, and relaunch events
+- window creation, taskbar placement (with the notification-area boundary and applied offset), and relaunch events
+- `layout reconcile corrected widget ...` when a delayed check had to move the widget after a burst or a suppressed shell layout event
 
 The log does not include access tokens, refresh tokens, credential file contents, or API response bodies.
 
 ### The log seems not to update
 
 Tools that run inside an MSIX-packaged app (for example the Codex desktop app or an agent running in it) may see a private, virtualized copy at `%LOCALAPPDATA%\Packages\<package>\LocalCache\Local\CodexUsage\logs\` instead of the real file. That copy stops at whatever an earlier packaged launch wrote. Open the log with **Open log file** from the monitor's menu, or read it from a normal (unpackaged) PowerShell or Explorer window. Launch the monitor from Explorer, not from inside a packaged app, so its own writes are not redirected.
+
+## The widget covers Show hidden icons, the tray or the clock
+
+Every placement path (automatic, manual offset, dragging, dropping on another taskbar, width changes) stays left of the notification area's left edge. When the tray grows (a new tray icon, for example), the widget moves left immediately. A delayed check re-reads the final layout after bursts of shell events and after the monitor's own tray-icon updates. Each countdown tick runs it again as a periodic safety net. On taskbars that expose no notification window, such as some Windows 11 secondary taskbars, a clock-sized area at the right edge is reserved.
+
+If an overlap still appears, note the time and look in the log for `positioned embedded widget ... boundary=` and `layout reconcile corrected` lines around it. A saved manual offset is kept even when a smaller taskbar cannot hold it; the widget is clamped for that taskbar and returns to the saved offset when there is room again.
 
 ## Update failures
 

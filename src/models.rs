@@ -8,16 +8,6 @@ pub struct UsageSection {
     pub available: bool,
 }
 
-/// The optional model-fallback bucket exposed by Codex as `gpt-reserve`.
-/// `active` is deliberately optional because most usage responses do not
-/// identify which fallback is currently serving requests.
-#[derive(Clone, Debug, PartialEq)]
-pub struct LunaReserveUsage {
-    pub section: UsageSection,
-    pub available: bool,
-    pub active: Option<bool>,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub enum CreditBalance {
     Amount(f64),
@@ -29,7 +19,6 @@ pub struct UsageData {
     pub session: UsageSection,
     pub weekly: UsageSection,
     pub credits: Option<CreditBalance>,
-    pub luna_reserve: Option<LunaReserveUsage>,
 }
 
 #[derive(Clone, Debug, Default)]

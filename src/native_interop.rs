@@ -26,6 +26,7 @@ pub const TIMER_COUNTDOWN: usize = 2;
 pub const TIMER_RESET_POLL: usize = 3;
 pub const TIMER_UPDATE_CHECK: usize = 4;
 pub const TIMER_CREDENTIAL_WATCH: usize = 5;
+pub const TIMER_LAYOUT_RECONCILE: usize = 6;
 
 // Custom messages
 pub const WM_APP: u32 = 0x8000;
@@ -138,6 +139,81 @@ pub fn visible_child_window_rects(parent: HWND, exclude: Option<HWND>) -> Vec<RE
         );
     }
     collection.rectangles
+}
+
+/// Union of the visible notification-area windows on a taskbar, including
+/// nested descendants (secondary taskbars may expose only a clock). Adapted
+/// from upstream PR #25 (diogomrpr).
+pub fn taskbar_notification_rect(taskbar_hwnd: HWND) -> Option<RECT> {
+    struct Search {
+        taskbar: RECT,
+        notification: Option<RECT>,
+    }
+
+    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let search = &mut *(lparam.0 as *mut Search);
+        if !IsWindowVisible(hwnd).as_bool() {
+            return BOOL(1);
+        }
+        let mut class_name = [0u16; 128];
+        let len = GetClassNameW(hwnd, &mut class_name);
+        if len > 0 {
+            let class_name = String::from_utf16_lossy(&class_name[..len as usize]);
+            if let Some(rect) = get_window_rect_safe(hwnd).and_then(|rect| {
+                crate::taskbar_layout::notification_candidate_rect(
+                    search.taskbar,
+                    &class_name,
+                    rect,
+                )
+            }) {
+                search.notification = Some(match search.notification {
+                    Some(previous) => crate::taskbar_layout::union_rect(previous, rect),
+                    None => rect,
+                });
+            }
+        }
+        BOOL(1)
+    }
+
+    let mut search = Search {
+        taskbar: get_window_rect_safe(taskbar_hwnd)?,
+        notification: None,
+    };
+    unsafe {
+        // EnumChildWindows visits descendants as well as direct children.
+        let _ = EnumChildWindows(
+            taskbar_hwnd,
+            Some(enum_proc),
+            LPARAM(&mut search as *mut Search as isize),
+        );
+    }
+    search.notification
+}
+
+/// Width and height of the primary taskbar's notification area, used to size
+/// the reservation on taskbars that expose no notification window.
+pub fn primary_notification_area() -> Option<(i32, i32)> {
+    let primary = find_taskbars()
+        .into_iter()
+        .find(|taskbar| class_name_of(taskbar.hwnd).as_deref() == Some("Shell_TrayWnd"))?;
+    let area = find_child_window(primary.hwnd, "TrayNotifyWnd").and_then(get_window_rect_safe)?;
+    let height = primary.rect.bottom - primary.rect.top;
+    (area.right > area.left && height > 0).then_some((area.right - area.left, height))
+}
+
+fn class_name_of(hwnd: HWND) -> Option<String> {
+    let mut class_name = [0u16; 128];
+    let len = unsafe { GetClassNameW(hwnd, &mut class_name) };
+    (len > 0).then(|| String::from_utf16_lossy(&class_name[..len as usize]))
+}
+
+pub fn is_window(hwnd: HWND) -> bool {
+    unsafe { IsWindow(hwnd).as_bool() }
+}
+
+/// True for the taskbar itself or any of its descendant windows.
+pub fn is_taskbar_or_descendant(taskbar: HWND, hwnd: HWND) -> bool {
+    hwnd == taskbar || unsafe { IsChild(taskbar, hwnd).as_bool() }
 }
 
 /// Get taskbar position via SHAppBarMessage

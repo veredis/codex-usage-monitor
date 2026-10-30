@@ -35,7 +35,7 @@ pub(super) const STRINGS: Strings = Strings {
     exit: "結束",
     show_widget: "顯示小工具",
     credits: "點數",
-    credit_display: "點數 / Luna Reserve",
+    credit_display: "點數",
     credit_always: "一律",
     credit_when_needed: "需要時",
     credit_off: "關閉",

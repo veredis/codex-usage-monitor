@@ -35,7 +35,7 @@ pub(super) const STRINGS: Strings = Strings {
     exit: "Salir",
     show_widget: "Mostrar widget",
     credits: "Créditos",
-    credit_display: "Créditos / Luna Reserve",
+    credit_display: "Créditos",
     credit_always: "Siempre",
     credit_when_needed: "Cuando sea necesario",
     credit_off: "Desactivado",

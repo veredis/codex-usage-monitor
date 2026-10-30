@@ -19,17 +19,17 @@ The release is portable: download `codex-usage.exe` and run it directly. No inst
 ## Features
 
 - Compact 5-hour and weekly Codex usage in the Windows taskbar.
-- Remaining or Used display modes, with Remaining as the default.
+- Default (Mixed), Remaining or Used display modes.
 - Dynamic sizing that follows the displayed quota text without wasting space.
 - Local reset countdowns, including day-and-hour values such as `1d23h`.
 - Selectable remaining-quota alerts at 2%, 5%, 10%, 20%, and 30%; multiple thresholds can be enabled together.
 - A separate one-time 0% exhaustion alert for enabled quota windows.
-- Optional Credits / Luna Reserve auxiliary display with Left or Right placement.
+- Optional Credits display with Left or Right placement.
 - Credits or approximate USD display (`~$13.40`) using the raw balance for conversion.
 - Windows accent-colored bars or a custom color selected with the native color picker.
 - Fixed polling intervals from 30 seconds to 1 hour, plus optional Adaptive polling.
 - Optional compact 2x3 drag handle and persistent widget positioning.
-- Safer default and Reset position placement around discoverable taskbar widgets and occupied areas.
+- Automatic, manual and dragged positions all stay left of the notification area (Show hidden icons, tray icons and clock); taskbar layout changes are always reconciled, even when they arrive in bursts.
 - Multi-monitor taskbar placement, notification-area integration, and Start with Windows support.
 - Optional Claude Code and Google Antigravity monitoring where their local applications and credentials are available.
 
@@ -37,14 +37,14 @@ The release is portable: download `codex-usage.exe` and run it directly. No inst
 
 1. Download and run `codex-usage.exe`.
 2. Right-click the taskbar widget or notification-area icon to open Settings.
-3. Configure display, polling, alert, provider, Credits / Luna Reserve, and positioning options from the menus.
+3. Configure display, polling, alert, provider, Credits, and positioning options from the menus.
 
 Important defaults and settings:
 
-- **Usage display:** Remaining. Used shows the portion already consumed.
+- **Usage display:** **Default (Mixed)** shows Codex as Remaining (falling toward 0%, like Codex `/status` "% left") and Claude as Used (rising toward 100%, like Claude's "% used"); Antigravity shows Remaining. **Remaining** and **Used** apply one direction to every provider. New installations start with Default (Mixed); existing settings keep their saved choice, and settings saved before this option existed keep Remaining. The setting changes only text and bars. Alerts, Adaptive polling and MCP always use the underlying quota values.
 - **Update frequency:** Fixed choices are 30 seconds, 1 minute, 5 minutes, 15 minutes, and 1 hour. Adaptive uses 5 minutes above 30% remaining, 1 minute from above 10% through 30%, and 30 seconds at 10% or below. Claude usage requests are spaced at least 2 minutes apart at every setting (a current design decision, see below). Countdown movement is local and does not create extra provider requests.
 - **Quota alerts:** Off by default. Select any combination of 2%, 5%, 10%, 20%, and 30% remaining. Each selected threshold alerts once per genuine quota window; an enabled window can also send one separate alert at 0% remaining.
-- **Credits / Luna Reserve:** Credits visibility is **Always** by default, with **Always**, **When needed**, and **Off** options. **When needed** shows the auxiliary area when an included Codex quota reaches 0%. The area can be placed **Left** or **Right**, independently of visibility. Choose **Credits** or **USD** value format. Finite Credits use the precise underlying balance for USD estimates and display whole Credits rounded to the nearest whole credit; known zero, unlimited, and unknown data remain distinct. Luna Reserve is shown only when supported data indicates it is the appropriate fallback. It is optional and may be absent for an account.
+- **Credits:** Credits visibility is **Always** by default, with **Always**, **When needed**, and **Off** options. **When needed** shows the auxiliary area when an included Codex quota reaches 0%. The area can be placed **Left** or **Right**, independently of visibility. Choose **Credits** or **USD** value format. Finite Credits use the precise underlying balance for USD estimates and display whole Credits rounded to the nearest whole credit; known zero, unlimited, and unknown data remain distinct.
 - **Taskbar placement:** **Show drag handle** is off by default. Reset Position computes a safe default without forgetting a manually saved position.
 - **MCP integration:** Enable **Enable MCP integration** to expose the local read-only usage tools described below.
 
@@ -69,7 +69,7 @@ It exposes two separate read-only tools:
 - `get_codex_usage`
 - `get_claude_usage`
 
-The tools return the latest cached provider snapshot, including quota windows, freshness, polling metadata, Credits where available, and Luna Reserve data where the Codex backend exposes it. A tool call never starts a provider poll, authentication flow, model task, or credential operation.
+The tools return the latest cached provider snapshot, including quota windows, freshness, polling metadata, and Credits where available. A tool call never starts a provider poll, authentication flow, model task, or credential operation.
 
 For Codex, add the following to the Codex configuration if you want Codex to discover the server:
 
@@ -79,7 +79,13 @@ url = "http://127.0.0.1:46827/mcp"
 enabled = true
 ```
 
-The monitor does not edit Codex or Claude configuration automatically. Claude client configuration varies by client; use that client's current MCP documentation when connecting it to the same loopback URL.
+For Claude Code, register it once at user scope (the monitor never edits client configuration itself):
+
+```powershell
+claude mcp add --transport http --scope user codex_usage_monitor http://127.0.0.1:46827/mcp
+```
+
+Start a new Claude Code session afterwards; `/mcp` lists the server and its two tools.
 
 For an agent using the tools, query usage at meaningful milestones rather than continuously. Check before starting another large work phase, and if a quota is low, finish or preserve the current coherent unit instead of blindly starting a large new phase.
 
@@ -137,7 +143,7 @@ Preferences are stored in:
 %APPDATA%\CodexUsage\settings.json
 ```
 
-The settings file includes display modes, bar color, polling, alerts, provider selection, Credits / Luna Reserve visibility and placement, language, widget position, startup behavior, and the MCP preference. Older settings files remain compatible; missing newer fields use safe defaults.
+The settings file includes display modes, bar color, polling, alerts, provider selection, Credits visibility and placement, language, widget position, startup behavior, and the MCP preference. Older settings files remain compatible; missing newer fields use safe defaults.
 
 ## Privacy
 
@@ -153,4 +159,4 @@ Released under the [MIT License](LICENSE).
 
 ## Current version
 
-The public fork release is `1.9.1-veredis.7`. The current binary identifies itself as `1.9.1-veredis.7 (Build 4)`; the Build number is an informational candidate identifier and does not change update ordering.
+The public fork release is `1.9.1-veredis.7`. The current development binary identifies itself as `1.9.1-veredis.7 (Build 8)`; the Build number is an informational candidate identifier and does not change update ordering.

@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -24,11 +24,12 @@ use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
 use crate::models::{AppUsageData, CreditBalance};
 use crate::native_interop::{
-    self, Color, TIMER_COUNTDOWN, TIMER_CREDENTIAL_WATCH, TIMER_POLL, TIMER_RESET_POLL,
-    TIMER_UPDATE_CHECK, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
+    self, Color, TIMER_COUNTDOWN, TIMER_CREDENTIAL_WATCH, TIMER_LAYOUT_RECONCILE, TIMER_POLL,
+    TIMER_RESET_POLL, TIMER_UPDATE_CHECK, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
 };
 use crate::poller;
 use crate::provider_schedule::{self, CLAUDE, CODEX};
+use crate::taskbar_layout::{self, LayoutAction, LayoutEventGate};
 use crate::theme;
 use crate::tray_icon;
 use crate::updater::{self, ReleaseDescriptor, UpdateCheckResult};
@@ -176,6 +177,7 @@ const IDM_ALERT_OFF: u16 = 80;
 const IDM_ALERT_2: u16 = 85;
 const IDM_USAGE_DISPLAY_REMAINING: u16 = 73;
 const IDM_USAGE_DISPLAY_USED: u16 = 74;
+const IDM_USAGE_DISPLAY_MIXED: u16 = 77;
 const IDM_BAR_COLOR_WINDOWS_ACCENT: u16 = 75;
 const IDM_BAR_COLOR_CUSTOM: u16 = 76;
 const IDM_ALERT_5: u16 = 81;
@@ -202,7 +204,12 @@ const TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS: u64 = 750;
 /// recreates the taskbar and wipes our tray-icon registration).
 const TASKBAR_WATCH_INTERVAL_SECS: u64 = 2;
 
-static SUPPRESS_TRAY_REPOSITION_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
+/// Coalesces shell layout events so none is dropped; see taskbar_layout.
+static LAYOUT_GATE: Mutex<LayoutEventGate> = Mutex::new(LayoutEventGate::new());
+/// Set only by the Exit command. Any other WM_DESTROY means Windows destroyed
+/// our parent taskbar (for example a disconnected display); the message loop
+/// then stays alive for watchdog recovery (adapted from upstream PR #27, ddddyyyy).
+static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Current system DPI (96 = 100% scaling, 144 = 150%, 192 = 200%, etc.)
 static CURRENT_DPI: AtomicU32 = AtomicU32::new(96);
@@ -309,10 +316,17 @@ fn spawn_taskbar_watchdog() {
             continue;
         };
         let taskbars = native_interop::find_taskbars();
-        if !taskbars.is_empty() && !taskbars.iter().any(|taskbar| taskbar.hwnd == old) {
+        let widget_alive = {
+            let state = lock_state();
+            state.as_ref().map(|s| s.hwnd.to_hwnd())
+        }
+        .is_some_and(native_interop::is_window);
+        if !taskbars.is_empty()
+            && (!widget_alive || !taskbars.iter().any(|taskbar| taskbar.hwnd == old))
+        {
             let new = taskbars[0].hwnd;
             diagnose::log(format!(
-                "watchdog: taskbar changed old={:?} new={:?} -> relaunching",
+                "watchdog: widget_alive={widget_alive} taskbar old={:?} new={:?} -> relaunching",
                 old.0, new.0
             ));
             relaunch_self();
@@ -458,7 +472,7 @@ impl Default for SettingsFile {
             show_weekly_window: true,
             show_drag_handle: false,
             enable_codex_mcp: false,
-            usage_display: default_usage_display(),
+            usage_display: new_install_usage_display(),
             credit_display: default_credit_display(),
             credit_position: default_credit_position(),
             credit_value_mode: default_credit_value_mode(),
@@ -475,8 +489,14 @@ fn default_poll_interval() -> u32 {
     POLL_15_MIN
 }
 
+/// Existing settings files that predate the field keep Remaining, the value
+/// they were already displaying; only brand-new installations start Mixed.
 fn default_usage_display() -> String {
     "remaining".to_string()
+}
+
+fn new_install_usage_display() -> String {
+    "mixed".to_string()
 }
 
 fn default_credit_display() -> String {
@@ -491,27 +511,65 @@ fn default_credit_value_mode() -> String {
     "credits".to_string()
 }
 
+/// Presentation only: quota text and bars. Alerts, adaptive
+/// polling, Credits selection and MCP always use normalized used/remaining.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UsageDisplayMode {
+    /// Provider-specific directions; see `DisplayDirections::MIXED`.
+    Mixed,
     Remaining,
     Used,
+}
+
+/// `true` shows remaining quota (falling toward 0%) for that provider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DisplayDirections {
+    claude: bool,
+    codex: bool,
+    antigravity: bool,
+}
+
+impl DisplayDirections {
+    /// Default (Mixed): Codex shows Remaining (falling toward 0%), matching
+    /// Codex `/status` "% left"; Claude shows Used (rising toward 100%),
+    /// matching Claude's "% used". Antigravity keeps the Remaining default.
+    const MIXED: Self = Self {
+        claude: false,
+        codex: true,
+        antigravity: true,
+    };
+
+    const fn uniform(remaining: bool) -> Self {
+        Self {
+            claude: remaining,
+            codex: remaining,
+            antigravity: remaining,
+        }
+    }
 }
 
 impl UsageDisplayMode {
     fn from_setting(value: &str) -> Self {
         if value.eq_ignore_ascii_case("used") {
             Self::Used
+        } else if value.eq_ignore_ascii_case("mixed") {
+            Self::Mixed
         } else {
             Self::Remaining
         }
     }
 
-    fn displays_remaining(self) -> bool {
-        matches!(self, Self::Remaining)
+    fn directions(self) -> DisplayDirections {
+        match self {
+            Self::Mixed => DisplayDirections::MIXED,
+            Self::Remaining => DisplayDirections::uniform(true),
+            Self::Used => DisplayDirections::uniform(false),
+        }
     }
 
     fn as_setting(self) -> &'static str {
         match self {
+            Self::Mixed => "mixed",
             Self::Remaining => "remaining",
             Self::Used => "used",
         }
@@ -572,12 +630,6 @@ impl CreditPosition {
 enum CreditValueMode {
     Credits,
     UsdEstimate,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ExtraUsageDisplay {
-    Credits,
-    LunaReserve,
 }
 
 impl CreditValueMode {
@@ -754,7 +806,7 @@ fn normalize_settings(mut settings: SettingsFile) -> SettingsFile {
     }
     if !matches!(
         settings.usage_display.to_ascii_lowercase().as_str(),
-        "remaining" | "used"
+        "mixed" | "remaining" | "used"
     ) {
         settings.usage_display = default_usage_display();
     } else {
@@ -1359,10 +1411,11 @@ fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
         diagnose::log("TrayNotifyWnd not found");
     }
 
-    let hook = tray_notify.and_then(|tray_hwnd| {
-        let thread_id = native_interop::get_window_thread_id(tray_hwnd);
-        native_interop::set_tray_event_hook(thread_id, on_tray_location_changed)
-    });
+    // Watch the taskbar's own thread so taskbars without a TrayNotifyWnd (a
+    // secondary taskbar's nested clock) still report layout changes. The
+    // callback filters to this taskbar and its descendants.
+    let thread_id = native_interop::get_window_thread_id(taskbar.hwnd);
+    let hook = native_interop::set_tray_event_hook(thread_id, on_tray_location_changed);
     if hook.is_some() {
         diagnose::log("tray event hook installed");
     } else {
@@ -1392,34 +1445,21 @@ fn taskbar_at_point(pt: POINT) -> Option<(usize, native_interop::TaskbarWindow)>
         })
 }
 
+/// Left edge of the notification area (Show hidden icons, tray icons, clock),
+/// shared by every placement path. Taskbars without a discoverable
+/// notification window reserve a scaled clock area instead of assuming the
+/// right edge is free.
 fn tray_left_for_taskbar(taskbar_hwnd: HWND, taskbar_rect: RECT) -> i32 {
-    let mut tray_left = taskbar_rect.right;
-    if let Some(tray_hwnd) = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd") {
-        if let Some(tray_rect) = native_interop::get_window_rect_safe(tray_hwnd) {
-            tray_left = tray_rect.left;
-        }
-    }
-    tray_left
-}
-
-fn safe_taskbar_anchor_left(taskbar_rect: RECT, tray_left: i32, occupied: &[RECT]) -> i32 {
-    let midpoint = taskbar_rect.left + (taskbar_rect.right - taskbar_rect.left) / 2;
-    let taskbar_width = (taskbar_rect.right - taskbar_rect.left).max(1);
-    occupied
-        .iter()
-        .filter(|rect| {
-            let width = rect.right - rect.left;
-            rect.left >= midpoint
-                && rect.right <= taskbar_rect.right
-                && rect.right > rect.left
-                && width <= taskbar_width * 3 / 4
-        })
-        .map(|rect| rect.left)
-        .chain(std::iter::once(tray_left))
-        .filter(|left| *left > taskbar_rect.left)
-        .min()
-        .unwrap_or(taskbar_rect.right)
-        .max(taskbar_rect.left)
+    let notification = native_interop::taskbar_notification_rect(taskbar_hwnd);
+    let reserve = if notification.is_some() {
+        0
+    } else {
+        taskbar_layout::fallback_notification_width(
+            taskbar_rect.bottom - taskbar_rect.top,
+            native_interop::primary_notification_area(),
+        )
+    };
+    taskbar_layout::notification_boundary(taskbar_rect, notification, reserve)
 }
 
 fn position_anchor_left(
@@ -1431,14 +1471,8 @@ fn position_anchor_left(
     if manual {
         tray_left
     } else {
-        safe_taskbar_anchor_left(taskbar_rect, tray_left, occupied)
+        taskbar_layout::safe_anchor_left(taskbar_rect, tray_left, occupied)
     }
-}
-
-fn clamp_offset_for_taskbar(taskbar_hwnd: HWND, taskbar_rect: RECT, offset: i32) -> i32 {
-    let tray_left = tray_left_for_taskbar(taskbar_hwnd, taskbar_rect);
-    let max_offset = (tray_left - taskbar_rect.left - total_widget_width()).max(0);
-    offset.clamp(0, max_offset)
 }
 
 fn offset_for_drop_point(
@@ -1448,9 +1482,10 @@ fn offset_for_drop_point(
     drag_start_client_x: i32,
 ) -> i32 {
     let tray_left = tray_left_for_taskbar(taskbar_hwnd, taskbar_rect);
-    let desired_left = pt.x - taskbar_rect.left - drag_start_client_x;
-    let offset = tray_left - taskbar_rect.left - total_widget_width() - desired_left;
-    clamp_offset_for_taskbar(taskbar_hwnd, taskbar_rect, offset)
+    let width = total_widget_width();
+    let offset = taskbar_layout::offset_for_left(tray_left, width, pt.x - drag_start_client_x);
+    taskbar_layout::compute_placement(taskbar_rect, tray_left, width, sc(WIDGET_HEIGHT), offset)
+        .offset
 }
 
 fn now_unix_secs() -> u64 {
@@ -1503,7 +1538,7 @@ fn refresh_usage_texts(state: &mut AppState) {
 
     let strings = state.language.strings();
     let is_simplified_chinese = state.language == LanguageId::SimplifiedChinese;
-    let display_remaining = state.usage_display.displays_remaining();
+    let directions = state.usage_display.directions();
     let Some(data) = state.data.as_ref() else {
         return;
     };
@@ -1513,14 +1548,14 @@ fn refresh_usage_texts(state: &mut AppState) {
             &claude_code.session,
             strings,
             is_simplified_chinese,
-            display_remaining,
+            directions.claude,
             poller::UsageWindowKind::Session,
         );
         state.weekly_text = poller::format_line(
             &claude_code.weekly,
             strings,
             is_simplified_chinese,
-            display_remaining,
+            directions.claude,
             poller::UsageWindowKind::Weekly,
         );
     } else if state.show_claude_code {
@@ -1539,14 +1574,14 @@ fn refresh_usage_texts(state: &mut AppState) {
             &codex.session,
             strings,
             is_simplified_chinese,
-            display_remaining,
+            directions.codex,
             poller::UsageWindowKind::Session,
         );
         state.codex_weekly_text = poller::format_line(
             &codex.weekly,
             strings,
             is_simplified_chinese,
-            display_remaining,
+            directions.codex,
             poller::UsageWindowKind::Weekly,
         );
     } else if state.show_codex {
@@ -1563,7 +1598,7 @@ fn refresh_usage_texts(state: &mut AppState) {
             &antigravity.session,
             strings,
             is_simplified_chinese,
-            display_remaining,
+            directions.antigravity,
             poller::UsageWindowKind::Session,
         );
         state.antigravity_weekly_text =
@@ -1574,7 +1609,7 @@ fn refresh_usage_texts(state: &mut AppState) {
                     &antigravity.weekly,
                     strings,
                     is_simplified_chinese,
-                    display_remaining,
+                    directions.antigravity,
                     poller::UsageWindowKind::Weekly,
                 )
             };
@@ -2330,7 +2365,6 @@ fn format_credit_value(balance: &CreditBalance, mode: CreditValueMode) -> String
     }
 }
 
-#[cfg(test)]
 fn codex_credit_panel_visible(
     show_codex: bool,
     display: CreditDisplayMode,
@@ -2348,70 +2382,17 @@ fn codex_credit_panel_visible(
 
     match display {
         CreditDisplayMode::Always => true,
-        CreditDisplayMode::WhenNeeded => {
-            let session_empty =
-                poller::remaining_percentage(codex.session.percentage).round() == 0.0;
-            let weekly_empty = poller::remaining_percentage(codex.weekly.percentage).round() == 0.0;
-            session_empty || weekly_empty
-        }
+        CreditDisplayMode::WhenNeeded => codex_included_usage_exhausted(codex),
         CreditDisplayMode::Off => false,
     }
 }
 
-fn codex_extra_usage_display(
-    show_codex: bool,
-    display: CreditDisplayMode,
-    data: Option<&AppUsageData>,
-) -> Option<ExtraUsageDisplay> {
-    if !show_codex || display == CreditDisplayMode::Off {
-        return None;
-    }
-    let codex = data.and_then(|data| data.codex.as_ref())?;
-    let credits = codex.credits.as_ref();
-    let reserve = codex
-        .luna_reserve
-        .as_ref()
-        .filter(|reserve| reserve.available && reserve.section.available);
-    let reserve_active = reserve.is_some_and(|reserve| reserve.active == Some(true));
-    let included_exhausted = poller::remaining_percentage(codex.session.percentage).round() == 0.0
-        || poller::remaining_percentage(codex.weekly.percentage).round() == 0.0;
-
-    match display {
-        CreditDisplayMode::Off => None,
-        CreditDisplayMode::Always => {
-            if reserve_active {
-                Some(ExtraUsageDisplay::LunaReserve)
-            } else if credits.is_some() {
-                Some(ExtraUsageDisplay::Credits)
-            } else if reserve.is_some() {
-                Some(ExtraUsageDisplay::LunaReserve)
-            } else {
-                None
-            }
-        }
-        CreditDisplayMode::WhenNeeded => {
-            if reserve_active {
-                Some(ExtraUsageDisplay::LunaReserve)
-            } else if !included_exhausted {
-                None
-            } else {
-                let credits_available = credits.is_some_and(|balance| match balance {
-                    CreditBalance::Amount(amount) => *amount > 0.0,
-                    CreditBalance::Unlimited => true,
-                });
-                if credits_available || (credits.is_some() && reserve.is_none()) {
-                    Some(ExtraUsageDisplay::Credits)
-                } else if reserve.is_some() {
-                    Some(ExtraUsageDisplay::LunaReserve)
-                } else {
-                    None
-                }
-            }
-        }
-    }
+fn codex_included_usage_exhausted(codex: &crate::models::UsageData) -> bool {
+    poller::remaining_percentage(codex.session.percentage).round() == 0.0
+        || poller::remaining_percentage(codex.weekly.percentage).round() == 0.0
 }
 
-fn extra_usage_display_reason(
+fn credit_panel_reason(
     show_codex: bool,
     display: CreditDisplayMode,
     data: Option<&AppUsageData>,
@@ -2422,27 +2403,14 @@ fn extra_usage_display_reason(
     let Some(codex) = data.and_then(|data| data.codex.as_ref()) else {
         return "codex_unavailable";
     };
-    let reserve = codex
-        .luna_reserve
-        .as_ref()
-        .filter(|reserve| reserve.available && reserve.section.available);
-    if reserve.is_some_and(|reserve| reserve.active == Some(true)) {
-        return "explicit_reserve_active";
-    }
-    let included_exhausted = poller::remaining_percentage(codex.session.percentage).round() == 0.0
-        || poller::remaining_percentage(codex.weekly.percentage).round() == 0.0;
-    if display == CreditDisplayMode::WhenNeeded && !included_exhausted {
+    if display == CreditDisplayMode::WhenNeeded && !codex_included_usage_exhausted(codex) {
         return "included_usage_available";
     }
     match codex.credits.as_ref() {
         Some(CreditBalance::Amount(amount)) if *amount > 0.0 => "finite_credits_available",
         Some(CreditBalance::Unlimited) => "unlimited_credits_available",
-        Some(CreditBalance::Amount(_)) if reserve.is_some() => {
-            "credits_exhausted_reserve_available"
-        }
-        None if reserve.is_some() => "credits_unknown_reserve_available",
         Some(CreditBalance::Amount(_)) => "credits_exhausted",
-        None => "no_extra_usage_available",
+        None => "credits_unknown",
     }
 }
 
@@ -2481,8 +2449,7 @@ fn total_widget_width_for_state(state: &AppState) -> i32 {
         ),
         state.language,
         state.show_drag_handle,
-        codex_extra_usage_display(state.show_codex, state.credit_display, state.data.as_ref())
-            .is_some(),
+        codex_credit_panel_visible(state.show_codex, state.credit_display, state.data.as_ref()),
         state.credit_value_mode,
         &state.codex_credit_text,
         quota_text_width_for(state.language, &quota_texts),
@@ -2937,9 +2904,8 @@ fn render_layered() {
         show_session_window,
         show_weekly_window,
         show_drag_handle,
-        display_remaining,
-        extra_display,
-        codex_luna_reserve_percent,
+        directions,
+        credit_panel_visible,
         credit_position,
         credit_value_mode,
         codex_credit_text,
@@ -2971,13 +2937,8 @@ fn render_layered() {
                 s.show_session_window,
                 s.show_weekly_window,
                 s.show_drag_handle,
-                s.usage_display.displays_remaining(),
-                codex_extra_usage_display(s.show_codex, s.credit_display, s.data.as_ref()),
-                s.data
-                    .as_ref()
-                    .and_then(|data| data.codex.as_ref())
-                    .and_then(|codex| codex.luna_reserve.as_ref())
-                    .map(|reserve| reserve.section.percentage),
+                s.usage_display.directions(),
+                codex_credit_panel_visible(s.show_codex, s.credit_display, s.data.as_ref()),
                 s.credit_position,
                 s.credit_value_mode,
                 s.codex_credit_text.clone(),
@@ -3011,10 +2972,10 @@ fn render_layered() {
         &antigravity_weekly_text,
     );
     let text_width = quota_text_width_for(language, &quota_texts);
-    let credit_panel_visible = extra_display.is_some();
-    let layout_credit_text = match extra_display {
-        Some(ExtraUsageDisplay::Credits) => codex_credit_text.as_str(),
-        Some(ExtraUsageDisplay::LunaReserve) | None => "",
+    let layout_credit_text = if credit_panel_visible {
+        codex_credit_text.as_str()
+    } else {
+        ""
     };
     let width = total_widget_width_for(
         active_model_count(show_claude_code, show_codex, show_antigravity),
@@ -3114,10 +3075,8 @@ fn render_layered() {
             show_session_window,
             show_weekly_window,
             show_drag_handle,
-            display_remaining,
+            directions,
             credit_panel_visible,
-            extra_display,
-            codex_luna_reserve_percent,
             credit_position,
             credit_value_mode,
             &codex_credit_text,
@@ -3199,23 +3158,21 @@ fn paint_content(
     show_session_window: bool,
     show_weekly_window: bool,
     show_drag_handle: bool,
-    display_remaining: bool,
+    directions: DisplayDirections,
     credit_panel_visible: bool,
-    extra_display: Option<ExtraUsageDisplay>,
-    codex_luna_reserve_percent: Option<f64>,
     credit_position: CreditPosition,
     credit_value_mode: CreditValueMode,
     credit_text: &str,
 ) {
     unsafe {
-        let session_pct = usage_percent_for_display(display_remaining, session_pct);
-        let weekly_pct = usage_percent_for_display(display_remaining, weekly_pct);
-        let codex_session_pct = usage_percent_for_display(display_remaining, codex_session_pct);
-        let codex_weekly_pct = usage_percent_for_display(display_remaining, codex_weekly_pct);
+        let session_pct = usage_percent_for_display(directions.claude, session_pct);
+        let weekly_pct = usage_percent_for_display(directions.claude, weekly_pct);
+        let codex_session_pct = usage_percent_for_display(directions.codex, codex_session_pct);
+        let codex_weekly_pct = usage_percent_for_display(directions.codex, codex_weekly_pct);
         let antigravity_session_pct =
-            usage_percent_for_display(display_remaining, antigravity_session_pct);
+            usage_percent_for_display(directions.antigravity, antigravity_session_pct);
         let antigravity_weekly_pct =
-            usage_percent_for_display(display_remaining, antigravity_weekly_pct);
+            usage_percent_for_display(directions.antigravity, antigravity_weekly_pct);
         let quota_texts = quota_texts_for_values(
             show_claude_code,
             show_codex,
@@ -3230,9 +3187,10 @@ fn paint_content(
             antigravity_weekly_text,
         );
         let (label_width, text_width) = usage_layout_widths(language, &quota_texts);
-        let layout_credit_text = match extra_display {
-            Some(ExtraUsageDisplay::Credits) => credit_text,
-            Some(ExtraUsageDisplay::LunaReserve) | None => "",
+        let layout_credit_text = if credit_panel_visible {
+            credit_text
+        } else {
+            ""
         };
         let (credit_header_width, credit_value_width) =
             credit_layout_widths(strings, layout_credit_text);
@@ -3322,33 +3280,18 @@ fn paint_content(
 
         if let Some(credit_x) = credit_x {
             let (credit_header_y, credit_value_y) = credit_panel_y_positions(height);
-            match extra_display {
-                Some(ExtraUsageDisplay::Credits) => draw_credit_panel(
-                    hdc,
-                    credit_x,
-                    credit_header_y,
-                    credit_value_y,
-                    strings.credits,
-                    credit_text,
-                    text_color,
-                    credit_header_width,
-                    credit_value_width,
-                    credit_position,
-                ),
-                Some(ExtraUsageDisplay::LunaReserve) => draw_luna_reserve_gauge(
-                    hdc,
-                    credit_x,
-                    height,
-                    codex_luna_reserve_percent.unwrap_or(0.0),
-                    display_remaining,
-                    bg,
-                    text_color,
-                    bar_color,
-                    track,
-                    credit_header_width,
-                ),
-                None => {}
-            }
+            draw_credit_panel(
+                hdc,
+                credit_x,
+                credit_header_y,
+                credit_value_y,
+                strings.credits,
+                credit_text,
+                text_color,
+                credit_header_width,
+                credit_value_width,
+                credit_position,
+            );
         }
 
         if show_session_window {
@@ -3904,8 +3847,8 @@ fn apply_provider_poll(hwnd: HWND, id: usize, generation: u64, result: poller::P
             return;
         }
         let width_before = total_widget_width_for_state(state);
-        let extra_display_before =
-            codex_extra_usage_display(state.show_codex, state.credit_display, state.data.as_ref());
+        let credit_panel_before =
+            codex_credit_panel_visible(state.show_codex, state.credit_display, state.data.as_ref());
 
         let previous_error = state.provider_health[id].error;
         let invalidate =
@@ -4013,21 +3956,17 @@ fn apply_provider_poll(hwnd: HWND, id: usize, generation: u64, result: poller::P
             );
         }
 
-        let extra_display_after =
-            codex_extra_usage_display(state.show_codex, state.credit_display, state.data.as_ref());
-        if extra_display_before != extra_display_after {
+        let credit_panel_after =
+            codex_credit_panel_visible(state.show_codex, state.credit_display, state.data.as_ref());
+        if credit_panel_before != credit_panel_after {
             diagnose::log(format!(
-                "extra_usage_display changed from {:?} to {:?} reason={}",
-                extra_display_before,
-                extra_display_after,
-                extra_usage_display_reason(
-                    state.show_codex,
-                    state.credit_display,
-                    state.data.as_ref(),
-                )
+                "credit panel visibility changed from {} to {} reason={}",
+                credit_panel_before,
+                credit_panel_after,
+                credit_panel_reason(state.show_codex, state.credit_display, state.data.as_ref(),)
             ));
         }
-        reposition = extra_display_before != extra_display_after
+        reposition = credit_panel_before != credit_panel_after
             || width_before != total_widget_width_for_state(state);
         polling_metadata = (state.adaptive_polling, base_interval);
     }
@@ -4185,26 +4124,43 @@ fn update_display() {
     refresh_usage_texts(s);
 }
 
-fn suppress_tray_reposition_for(duration: Duration) {
-    let mut until = SUPPRESS_TRAY_REPOSITION_UNTIL
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    *until = Some(Instant::now() + duration);
+fn layout_gate() -> MutexGuard<'static, LayoutEventGate> {
+    LAYOUT_GATE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn tray_reposition_is_suppressed() -> bool {
-    let now = Instant::now();
-    let mut until = SUPPRESS_TRAY_REPOSITION_UNTIL
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+/// Arm the one-shot reconciliation timer (UI thread only).
+fn arm_layout_reconcile(hwnd: HWND, delay_ms: u32) {
+    unsafe {
+        SetTimer(hwnd, TIMER_LAYOUT_RECONCILE, delay_ms.max(1), None);
+    }
+}
 
-    match *until {
-        Some(deadline) if now < deadline => true,
-        Some(_) => {
-            *until = None;
-            false
+/// Our own tray-icon update makes Explorer relayout the tray; ignore the
+/// transient geometry, then re-read the settled geometry once it ends.
+fn suppress_tray_reposition_for(hwnd: HWND, duration: Duration) {
+    let delay = layout_gate().suppress(Instant::now(), duration);
+    arm_layout_reconcile(hwnd, delay);
+}
+
+/// TIMER_LAYOUT_RECONCILE: re-read the final shell geometry after events that
+/// were deferred, throttled or may have reported intermediate geometry.
+fn reconcile_taskbar_layout(hwnd: HWND) {
+    unsafe {
+        let _ = KillTimer(hwnd, TIMER_LAYOUT_RECONCILE);
+    }
+    let due = layout_gate().take_due(Instant::now());
+    match due {
+        Err(delay) => arm_layout_reconcile(hwnd, delay),
+        Ok(()) => {
+            refresh_dpi();
+            if let Some((from, to)) = position_at_taskbar_with_width(total_widget_width()) {
+                diagnose::log(format!(
+                    "layout reconcile corrected widget from left={} right={} to left={} right={}",
+                    from.left, from.right, to.left, to.right
+                ));
+                render_layered();
+            }
         }
-        None => false,
     }
 }
 
@@ -4213,26 +4169,28 @@ fn position_at_taskbar() {
     position_at_taskbar_with_width(total_widget_width());
 }
 
-fn position_at_taskbar_with_width(widget_width: i32) {
+/// Place the widget against the shared notification-area boundary. Returns
+/// the previous and new desktop rectangles when the widget actually moved.
+fn position_at_taskbar_with_width(widget_width: i32) -> Option<(RECT, RECT)> {
     // Drop the app-state lock before any Win32 call that may synchronously
     // re-enter our window procedure.
     let (hwnd, embedded, tray_offset, manual_position, taskbar_hwnd) = {
         let state = lock_state();
         let s = match state.as_ref() {
             Some(s) => s,
-            None => return,
+            None => return None,
         };
 
         // Don't fight the user's drag
         if s.dragging {
-            return;
+            return None;
         }
 
         let taskbar_hwnd = match s.taskbar_hwnd {
             Some(h) => h,
             None => {
                 diagnose::log("position_at_taskbar skipped: no taskbar handle");
-                return;
+                return None;
             }
         };
 
@@ -4249,116 +4207,100 @@ fn position_at_taskbar_with_width(widget_width: i32) {
         Some(r) => r,
         None => {
             diagnose::log("position_at_taskbar skipped: unable to query taskbar rect");
-            return;
+            return None;
         }
     };
 
-    let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
-    let mut tray_left = taskbar_rect.right;
-    let anchor_top = taskbar_rect.top;
-    let anchor_height = taskbar_height;
-
-    if let Some(tray_hwnd) = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd") {
-        if let Some(tray_rect) = native_interop::get_window_rect_safe(tray_hwnd) {
-            tray_left = tray_rect.left;
-        }
-    }
+    let tray_left = tray_left_for_taskbar(taskbar_hwnd, taskbar_rect);
     let occupied = native_interop::visible_child_window_rects(taskbar_hwnd, Some(hwnd));
-    let safe_anchor = position_anchor_left(taskbar_rect, tray_left, &occupied, manual_position);
-    if safe_anchor != tray_left {
-        diagnose::log(format!(
-            "taskbar anchor adjusted for occupied shell geometry from {tray_left} to {safe_anchor}"
-        ));
-        tray_left = safe_anchor;
-    }
-
-    let max_offset = (tray_left - taskbar_rect.left - widget_width).max(0);
-    let tray_offset = tray_offset.clamp(0, max_offset);
-    let offset_changed = {
-        let mut state = lock_state();
-        if let Some(s) = state.as_mut() {
-            if s.tray_offset != tray_offset {
-                s.tray_offset = tray_offset;
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        }
-    };
-    if offset_changed {
-        save_state_settings();
-    }
-
+    let anchor = position_anchor_left(taskbar_rect, tray_left, &occupied, manual_position);
     let widget_height = sc(WIDGET_HEIGHT);
-    let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
+    // The saved offset stays the user's preference; only the applied offset
+    // is clamped, so a temporarily narrower taskbar cannot erase it.
+    let placement = taskbar_layout::compute_placement(
+        taskbar_rect,
+        anchor,
+        widget_width,
+        widget_height,
+        tray_offset,
+    );
+    let target = placement.rect;
+    let current = native_interop::get_window_rect_safe(hwnd);
+    if current == Some(target) {
+        return None;
+    }
+
+    if anchor != tray_left {
+        diagnose::log(format!(
+            "taskbar anchor adjusted for occupied shell geometry from {tray_left} to {anchor}"
+        ));
+    }
     if embedded {
         // Child window: coordinates relative to parent (taskbar)
-        let x = tray_left - taskbar_rect.left - widget_width - tray_offset;
-        native_interop::move_window(hwnd, x, y - taskbar_rect.top, widget_width, widget_height);
+        let x = target.left - taskbar_rect.left;
+        let y = target.top - taskbar_rect.top;
+        native_interop::move_window(hwnd, x, y, widget_width, widget_height);
         diagnose::log(format!(
-            "positioned embedded widget at x={x} y={} w={widget_width} h={widget_height}",
-            y - taskbar_rect.top
+            "positioned embedded widget at x={x} y={y} w={widget_width} h={widget_height} boundary={} offset={}",
+            tray_left - taskbar_rect.left,
+            placement.offset
         ));
     } else {
         // Topmost popup: screen coordinates
-        let x = tray_left - widget_width - tray_offset;
-        native_interop::move_window(hwnd, x, y, widget_width, widget_height);
+        native_interop::move_window(hwnd, target.left, target.top, widget_width, widget_height);
         diagnose::log(format!(
-            "positioned fallback widget at x={x} y={y} w={widget_width} h={widget_height}"
+            "positioned fallback widget at x={} y={} w={widget_width} h={widget_height} boundary={tray_left} offset={}",
+            target.left, target.top, placement.offset
         ));
     }
+    current.map(|from| (from, target))
 }
 
-fn compute_anchor_y(anchor_top: i32, anchor_height: i32, widget_height: i32) -> i32 {
-    let anchor_bottom = anchor_top + anchor_height;
-    (anchor_bottom - widget_height).max(anchor_top)
-}
-
-/// WinEvent callback for tray icon location changes
+/// WinEvent callback for taskbar layout changes (tray growth, a new tray
+/// icon, clock or taskbar resizes). Every relevant event either repositions
+/// now or leaves a pending reconciliation; none is dropped.
 unsafe extern "system" fn on_tray_location_changed(
     _hook: HWINEVENTHOOK,
     _event: u32,
     hwnd: HWND,
-    _id_object: i32,
+    id_object: i32,
     _id_child: i32,
     _thread: u32,
     _time: u32,
 ) {
-    static LAST_REPOSITION: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-
-    let is_tray = {
+    // Window moves only; caret and cursor location events are irrelevant.
+    if id_object != OBJID_WINDOW.0 || hwnd == HWND::default() {
+        return;
+    }
+    let target = {
         let state = lock_state();
-        state
-            .as_ref()
-            .and_then(|s| s.tray_notify_hwnd)
-            .map(|h| h == hwnd)
-            .unwrap_or(false)
+        state.as_ref().and_then(|s| {
+            let widget = s.hwnd.to_hwnd();
+            let taskbar = s.taskbar_hwnd?;
+            (hwnd != widget
+                && (s.tray_notify_hwnd == Some(hwnd)
+                    || native_interop::is_taskbar_or_descendant(taskbar, hwnd)))
+            .then_some(widget)
+        })
+    };
+    let Some(widget) = target else {
+        return;
     };
 
-    if is_tray {
-        if tray_reposition_is_suppressed() {
-            return;
-        }
-
-        let should_reposition = {
-            let mut last = LAST_REPOSITION.lock().unwrap_or_else(|e| e.into_inner());
-            let now = std::time::Instant::now();
-            if last
-                .map(|t| now.duration_since(t).as_millis() > 500)
-                .unwrap_or(true)
+    let action = layout_gate().on_shell_event(Instant::now());
+    match action {
+        LayoutAction::Immediate { reconcile_ms } => {
+            if position_at_taskbar_with_width({
+                refresh_dpi();
+                total_widget_width()
+            })
+            .is_some()
             {
-                *last = Some(now);
-                true
-            } else {
-                false
+                render_layered();
             }
-        };
-        if should_reposition {
-            position_at_taskbar();
-            render_layered();
+            arm_layout_reconcile(widget, reconcile_ms);
         }
+        LayoutAction::Deferred { reconcile_ms } => arm_layout_reconcile(widget, reconcile_ms),
     }
 }
 
@@ -4444,7 +4386,10 @@ unsafe extern "system" fn wnd_proc(
                 TIMER_COUNTDOWN => {
                     let width_before = total_widget_width();
                     update_display();
-                    if width_before != total_widget_width() {
+                    // Also a periodic geometry check: a shell change that
+                    // raised no event is corrected within one countdown tick.
+                    let suppressed = layout_gate().is_suppressed(Instant::now());
+                    if width_before != total_widget_width() || !suppressed {
                         position_at_taskbar();
                     }
                     render_layered();
@@ -4457,6 +4402,7 @@ unsafe extern "system" fn wnd_proc(
                 TIMER_UPDATE_CHECK => {
                     begin_update_check(hwnd, false);
                 }
+                TIMER_LAYOUT_RECONCILE => reconcile_taskbar_layout(hwnd),
                 _ => {}
             }
             LRESULT(0)
@@ -4466,9 +4412,10 @@ unsafe extern "system" fn wnd_proc(
             check_language_change();
             render_layered();
             schedule_countdown_timer();
-            suppress_tray_reposition_for(Duration::from_millis(
-                TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS,
-            ));
+            suppress_tray_reposition_for(
+                hwnd,
+                Duration::from_millis(TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS),
+            );
             sync_tray_icons(hwnd);
             LRESULT(0)
         }
@@ -4512,14 +4459,14 @@ unsafe extern "system" fn wnd_proc(
             let _ = GetCursorPos(&mut pt);
             let mut state = lock_state();
             if let Some(s) = state.as_mut() {
-                if !s.manual_position {
-                    if let (Some(taskbar), Some(rect)) =
-                        (s.taskbar_hwnd, native_interop::get_window_rect_safe(hwnd))
-                    {
-                        if let Some(taskbar_rect) = native_interop::get_taskbar_rect(taskbar) {
-                            s.tray_offset =
-                                (tray_left_for_taskbar(taskbar, taskbar_rect) - rect.right).max(0);
-                        }
+                // Start from the applied position, which may differ from a
+                // saved offset the current taskbar cannot hold.
+                if let (Some(taskbar), Some(rect)) =
+                    (s.taskbar_hwnd, native_interop::get_window_rect_safe(hwnd))
+                {
+                    if let Some(taskbar_rect) = native_interop::get_taskbar_rect(taskbar) {
+                        s.tray_offset =
+                            (tray_left_for_taskbar(taskbar, taskbar_rect) - rect.right).max(0);
                     }
                 }
                 s.manual_position = true;
@@ -4548,80 +4495,55 @@ unsafe extern "system" fn wnd_proc(
 
                     // Moving mouse left = positive delta = larger offset (further left)
                     let delta = s.drag_start_mouse_x - pt.x;
-                    let mut new_offset = s.drag_start_offset + delta;
+                    let requested_offset = s.drag_start_offset + delta;
 
-                    // Clamp: offset >= 0 (can't go right of default)
-                    if new_offset < 0 {
-                        new_offset = 0;
-                    }
-
-                    let taskbar_hwnd = s.taskbar_hwnd;
                     let embedded = s.embedded;
                     let hwnd_val = s.hwnd.to_hwnd();
+                    let widget_width = total_widget_width_for_state(s);
 
-                    // Clamp: don't go past left edge of taskbar
-                    if let Some(taskbar_hwnd) = taskbar_hwnd {
-                        if let Some(taskbar_rect) = native_interop::get_taskbar_rect(taskbar_hwnd) {
-                            let mut tray_left = taskbar_rect.right;
-                            if let Some(tray_hwnd) =
-                                native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd")
-                            {
-                                if let Some(tray_rect) =
-                                    native_interop::get_window_rect_safe(tray_hwnd)
-                                {
-                                    tray_left = tray_rect.left;
-                                }
-                            }
-                            let widget_width = total_widget_width_for_state(s);
-                            let max_offset = (tray_left - taskbar_rect.left - widget_width).max(0);
-                            if new_offset > max_offset {
-                                new_offset = max_offset;
-                            }
-
-                            s.tray_offset = new_offset;
-
-                            let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
-                            let anchor_top = taskbar_rect.top;
-                            let anchor_height = taskbar_height;
-                            let widget_height = sc(WIDGET_HEIGHT);
-                            let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
-                            let x = if embedded {
-                                tray_left - taskbar_rect.left - widget_width - new_offset
-                            } else {
-                                tray_left - widget_width - new_offset
-                            };
-                            Some((
-                                hwnd_val,
-                                embedded,
-                                x,
-                                y,
-                                taskbar_rect.top,
+                    // The same notification-area clamp as automatic layout,
+                    // so a drag can never cover Show hidden icons or the clock.
+                    let placement = s.taskbar_hwnd.and_then(|taskbar_hwnd| {
+                        let taskbar_rect = native_interop::get_taskbar_rect(taskbar_hwnd)?;
+                        let tray_left = tray_left_for_taskbar(taskbar_hwnd, taskbar_rect);
+                        Some((
+                            taskbar_rect,
+                            taskbar_layout::compute_placement(
+                                taskbar_rect,
+                                tray_left,
                                 widget_width,
-                                widget_height,
-                            ))
-                        } else {
-                            s.tray_offset = new_offset;
-                            None
-                        }
-                    } else {
-                        s.tray_offset = new_offset;
-                        None
-                    }
+                                sc(WIDGET_HEIGHT),
+                                requested_offset,
+                            ),
+                        ))
+                    });
+                    s.tray_offset = placement
+                        .map(|(_, placement)| placement.offset)
+                        .unwrap_or(requested_offset.max(0));
+                    placement.map(|(taskbar_rect, placement)| {
+                        (hwnd_val, embedded, taskbar_rect, placement.rect)
+                    })
                 };
 
-                if let Some((hwnd_val, embedded, x, y, taskbar_top, widget_width, widget_height)) =
-                    move_target
-                {
+                if let Some((hwnd_val, embedded, taskbar_rect, target)) = move_target {
+                    let width = target.right - target.left;
+                    let height = target.bottom - target.top;
                     if embedded {
                         native_interop::move_window(
                             hwnd_val,
-                            x,
-                            y - taskbar_top,
-                            widget_width,
-                            widget_height,
+                            target.left - taskbar_rect.left,
+                            target.top - taskbar_rect.top,
+                            width,
+                            height,
                         );
                     } else {
-                        native_interop::move_window(hwnd_val, x, y, widget_width, widget_height);
+                        native_interop::move_window(
+                            hwnd_val,
+                            target.left,
+                            target.top,
+                            width,
+                            height,
+                        );
                     }
                 }
             }
@@ -4707,6 +4629,7 @@ unsafe extern "system" fn wnd_proc(
                     }
                 }
                 2 => {
+                    EXIT_REQUESTED.store(true, Ordering::Relaxed);
                     let hook = {
                         let state = lock_state();
                         state.as_ref().and_then(|s| s.win_event_hook)
@@ -4792,14 +4715,14 @@ unsafe extern "system" fn wnd_proc(
                     ));
                     spawn_poll(SendHwnd::from_hwnd(hwnd), PollTrigger::Reconfigure);
                 }
-                IDM_USAGE_DISPLAY_REMAINING | IDM_USAGE_DISPLAY_USED => {
+                IDM_USAGE_DISPLAY_MIXED | IDM_USAGE_DISPLAY_REMAINING | IDM_USAGE_DISPLAY_USED => {
                     {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
-                            s.usage_display = if id == IDM_USAGE_DISPLAY_USED {
-                                UsageDisplayMode::Used
-                            } else {
-                                UsageDisplayMode::Remaining
+                            s.usage_display = match id {
+                                IDM_USAGE_DISPLAY_MIXED => UsageDisplayMode::Mixed,
+                                IDM_USAGE_DISPLAY_USED => UsageDisplayMode::Used,
+                                _ => UsageDisplayMode::Remaining,
                             };
                             refresh_usage_texts(s);
                         }
@@ -4815,24 +4738,22 @@ unsafe extern "system" fn wnd_proc(
                     let visibility_changed = {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
-                            let was_visible = codex_extra_usage_display(
+                            let was_visible = codex_credit_panel_visible(
                                 s.show_codex,
                                 s.credit_display,
                                 s.data.as_ref(),
-                            )
-                            .is_some();
+                            );
                             s.credit_display = match id {
                                 IDM_CREDIT_DISPLAY_WHEN_NEEDED => CreditDisplayMode::WhenNeeded,
                                 IDM_CREDIT_DISPLAY_OFF => CreditDisplayMode::Off,
                                 _ => CreditDisplayMode::Always,
                             };
                             was_visible
-                                != codex_extra_usage_display(
+                                != codex_credit_panel_visible(
                                     s.show_codex,
                                     s.credit_display,
                                     s.data.as_ref(),
                                 )
-                                .is_some()
                         } else {
                             false
                         }
@@ -5107,7 +5028,16 @@ unsafe extern "system" fn wnd_proc(
                 native_interop::unhook_win_event(h);
             }
             tray_icon::remove_all(hwnd);
-            PostQuitMessage(0);
+            if EXIT_REQUESTED.load(Ordering::Relaxed) {
+                PostQuitMessage(0);
+            } else {
+                // Disconnecting a display destroys its taskbar and our child
+                // window. Keep the message loop alive so the watchdog can
+                // relaunch the widget on a remaining taskbar.
+                diagnose::log(
+                    "widget window destroyed unexpectedly; waiting for watchdog recovery",
+                );
+            }
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -5422,6 +5352,22 @@ fn show_context_menu(hwnd: HWND) {
             PCWSTR::from_raw(weekly_label.as_ptr()),
         );
         let _ = AppendMenuW(usage_menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let mixed_label = native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
+            "默认（混合）"
+        } else {
+            "Default (Mixed)"
+        });
+        let mixed_flags = if usage_display == UsageDisplayMode::Mixed {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let _ = AppendMenuW(
+            usage_menu,
+            mixed_flags,
+            IDM_USAGE_DISPLAY_MIXED as usize,
+            PCWSTR::from_raw(mixed_label.as_ptr()),
+        );
         let remaining_label =
             native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
                 "剩余"
@@ -5863,9 +5809,8 @@ fn paint(hdc: HDC, hwnd: HWND) {
         show_session_window,
         show_weekly_window,
         show_drag_handle,
-        display_remaining,
-        extra_display,
-        codex_luna_reserve_percent,
+        directions,
+        credit_panel_visible,
         credit_position,
         credit_value_mode,
         codex_credit_text,
@@ -5895,13 +5840,8 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.show_session_window,
                 s.show_weekly_window,
                 s.show_drag_handle,
-                s.usage_display.displays_remaining(),
-                codex_extra_usage_display(s.show_codex, s.credit_display, s.data.as_ref()),
-                s.data
-                    .as_ref()
-                    .and_then(|data| data.codex.as_ref())
-                    .and_then(|codex| codex.luna_reserve.as_ref())
-                    .map(|reserve| reserve.section.percentage),
+                s.usage_display.directions(),
+                codex_credit_panel_visible(s.show_codex, s.credit_display, s.data.as_ref()),
                 s.credit_position,
                 s.credit_value_mode,
                 s.codex_credit_text.clone(),
@@ -5971,10 +5911,8 @@ fn paint(hdc: HDC, hwnd: HWND) {
             show_session_window,
             show_weekly_window,
             show_drag_handle,
-            display_remaining,
-            extra_display.is_some(),
-            extra_display,
-            codex_luna_reserve_percent,
+            directions,
+            credit_panel_visible,
             credit_position,
             credit_value_mode,
             &codex_credit_text,
@@ -6021,89 +5959,6 @@ fn draw_credit_panel(
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE,
             );
         }
-    }
-}
-
-fn draw_luna_reserve_gauge(
-    hdc: HDC,
-    x: i32,
-    height: i32,
-    used_percentage: f64,
-    display_remaining: bool,
-    bg: &Color,
-    text_color: &Color,
-    bar_color: &Color,
-    track: &Color,
-    header_width: i32,
-) {
-    unsafe {
-        let diameter = sc(28).min(height.saturating_sub(sc(6))).max(sc(16));
-        let left = x + (sc(header_width) - diameter) / 2;
-        let top = (height - diameter) / 2;
-        let right = left + diameter;
-        let bottom = top + diameter;
-
-        let track_brush = CreateSolidBrush(COLORREF(track.to_colorref()));
-        let old_brush = SelectObject(hdc, track_brush);
-        let _ = Ellipse(hdc, left, top, right, bottom);
-        SelectObject(hdc, old_brush);
-        let _ = DeleteObject(track_brush);
-
-        let inner = sc(3).max(1);
-        let bg_brush = CreateSolidBrush(COLORREF(bg.to_colorref()));
-        let old_brush = SelectObject(hdc, bg_brush);
-        let _ = Ellipse(
-            hdc,
-            left + inner,
-            top + inner,
-            right - inner,
-            bottom - inner,
-        );
-        SelectObject(hdc, old_brush);
-
-        let displayed_percentage =
-            usage_percent_for_display(display_remaining, used_percentage).clamp(0.0, 100.0);
-        let pen = CreatePen(PS_SOLID, sc(3).max(1), COLORREF(bar_color.to_colorref()));
-        let old_pen = SelectObject(hdc, pen);
-        if displayed_percentage >= 99.95 {
-            let old_brush = SelectObject(hdc, bg_brush);
-            let _ = Ellipse(hdc, left, top, right, bottom);
-            SelectObject(hdc, old_brush);
-        } else if displayed_percentage > 0.0 {
-            let center_x = (left + right) / 2;
-            let center_y = (top + bottom) / 2;
-            let radius = (diameter - 1) as f64 / 2.0;
-            let angle =
-                -std::f64::consts::FRAC_PI_2 + std::f64::consts::TAU * displayed_percentage / 100.0;
-            let end_x = center_x + (radius * angle.cos()).round() as i32;
-            let end_y = center_y + (radius * angle.sin()).round() as i32;
-            // Endpoint angles increase clockwise in screen coordinates.
-            let old_direction = SetArcDirection(hdc, AD_CLOCKWISE);
-            let _ = Arc(hdc, left, top, right, bottom, center_x, top, end_x, end_y);
-            if old_direction != 0 {
-                SetArcDirection(hdc, ARC_DIRECTION(old_direction));
-            }
-        }
-        SelectObject(hdc, old_pen);
-        let _ = DeleteObject(pen);
-
-        let displayed_text = format!("{displayed_percentage:.0}%");
-        let mut text_wide: Vec<u16> = displayed_text.encode_utf16().collect();
-        let mut text_rect = RECT {
-            left,
-            top,
-            right,
-            bottom,
-        };
-        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
-        let _ = DrawTextW(
-            hdc,
-            &mut text_wide,
-            &mut text_rect,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-        );
-
-        let _ = DeleteObject(bg_brush);
     }
 }
 
@@ -6492,50 +6347,6 @@ mod tests {
     }
 
     #[test]
-    fn reserve_ring_renders_the_selected_percentage_in_both_modes() {
-        unsafe {
-            let screen = GetDC(HWND::default());
-            let dc = CreateCompatibleDC(screen);
-            let bitmap = CreateCompatibleBitmap(screen, sc(64), sc(46));
-            assert!(!bitmap.is_invalid());
-            let previous = SelectObject(dc, bitmap);
-            let accent = Color::from_hex("CC33FF");
-            let bg = Color::from_hex("101010");
-            let track = Color::from_hex("404040");
-            // Top-right is filled at 25%; bottom-left is filled only at 75%.
-            for (remaining, expected_bottom_left) in [(false, false), (true, true)] {
-                let old_direction = GetArcDirection(dc);
-                draw_luna_reserve_gauge(
-                    dc,
-                    sc(4),
-                    sc(46),
-                    25.0,
-                    remaining,
-                    &bg,
-                    &bg,
-                    &accent,
-                    &track,
-                    40,
-                );
-                let has_accent_near = |x: i32, y: i32| {
-                    (-1..=1).any(|dx| {
-                        (-1..=1).any(|dy| {
-                            GetPixel(dc, sc(x) + dx, sc(y) + dy).0 == accent.to_colorref()
-                        })
-                    })
-                };
-                assert!(has_accent_near(33, 13));
-                assert_eq!(has_accent_near(14, 32), expected_bottom_left);
-                assert_eq!(GetArcDirection(dc), old_direction);
-            }
-            SelectObject(dc, previous);
-            let _ = DeleteObject(bitmap);
-            let _ = DeleteDC(dc);
-            ReleaseDC(HWND::default(), screen);
-        }
-    }
-
-    #[test]
     fn poll_timer_rearm_releases_state_before_layout() {
         rearm_poll_timer(HWND::default());
         assert!(
@@ -6573,40 +6384,6 @@ mod tests {
         let legacy: SettingsFile = serde_json::from_str(r#"{"tray_offset":321}"#).unwrap();
         assert!(legacy.manual_position.unwrap_or(legacy.tray_offset != 0));
     }
-
-    #[test]
-    fn reserve_disappearance_restores_credits_without_changing_quota_state() {
-        let mut data = test_codex_data(Some(CreditBalance::Amount(12.345)), 0.0, 25.0);
-        let original = data.codex.clone().unwrap();
-        for present in [false, true, false, true] {
-            let mut fresh = original.clone();
-            if present {
-                fresh.luna_reserve = Some(LunaReserveUsage {
-                    section: UsageSection {
-                        percentage: 25.0,
-                        available: true,
-                        ..Default::default()
-                    },
-                    available: true,
-                    active: Some(true),
-                });
-            }
-            merge_provider_result(&mut data, CODEX, Some(fresh), false);
-            assert_eq!(
-                codex_extra_usage_display(true, CreditDisplayMode::Always, Some(&data)),
-                Some(if present {
-                    ExtraUsageDisplay::LunaReserve
-                } else {
-                    ExtraUsageDisplay::Credits
-                })
-            );
-            let current = data.codex.as_ref().unwrap();
-            assert_eq!(current.session, original.session);
-            assert_eq!(current.weekly, original.weekly);
-            assert_eq!(current.credits, original.credits);
-        }
-    }
-    use crate::models::{LunaReserveUsage, UsageSection};
 
     fn decode_nul_terminated_wide(value: &[u16]) -> String {
         assert_eq!(value.last(), Some(&0));
@@ -6762,7 +6539,6 @@ mod tests {
                     available: true,
                 },
                 credits,
-                luna_reserve: None,
             }),
             ..AppUsageData::default()
         }
@@ -6962,6 +6738,210 @@ mod tests {
     fn usage_display_percentage_complements_used_percentage() {
         assert_eq!(usage_percent_for_display(true, 18.0), 82.0);
         assert_eq!(usage_percent_for_display(false, 18.0), 18.0);
+    }
+
+    #[test]
+    fn mixed_usage_display_maps_each_provider_direction() {
+        let mixed = UsageDisplayMode::Mixed.directions();
+        assert!(
+            mixed.codex,
+            "Mixed shows Codex remaining, falling toward 0%"
+        );
+        assert!(!mixed.claude, "Mixed shows Claude used, rising toward 100%");
+        assert!(mixed.antigravity, "Antigravity keeps the Remaining default");
+        assert_eq!(
+            UsageDisplayMode::Remaining.directions(),
+            DisplayDirections::uniform(true)
+        );
+        assert_eq!(
+            UsageDisplayMode::Used.directions(),
+            DisplayDirections::uniform(false)
+        );
+
+        // Bars and labels use the same direction, including 0% and 100%.
+        let strings = LanguageId::English.strings();
+        for (used, codex_label, claude_label) in [
+            (0.0, "100%", "0%"),
+            (100.0, "0%", "100%"),
+            (98.0, "2%", "98%"),
+            (37.0, "63%", "37%"),
+        ] {
+            let section = crate::models::UsageSection {
+                percentage: used,
+                resets_at: None,
+                available: true,
+            };
+            let codex = poller::format_codex_line(
+                &section,
+                strings,
+                false,
+                mixed.codex,
+                poller::UsageWindowKind::Session,
+            );
+            let claude = poller::format_line(
+                &section,
+                strings,
+                false,
+                mixed.claude,
+                poller::UsageWindowKind::Session,
+            );
+            assert_eq!(codex, codex_label);
+            assert_eq!(claude, claude_label);
+            assert_eq!(
+                usage_percent_for_display(mixed.codex, used),
+                codex_label.trim_end_matches('%').parse::<f64>().unwrap()
+            );
+            assert_eq!(
+                usage_percent_for_display(mixed.claude, used),
+                claude_label.trim_end_matches('%').parse::<f64>().unwrap()
+            );
+        }
+
+        // Simplified Chinese keeps its own labels for each direction.
+        let section = crate::models::UsageSection {
+            percentage: 30.0,
+            resets_at: None,
+            available: true,
+        };
+        let chinese = LanguageId::SimplifiedChinese.strings();
+        let codex = poller::format_line(
+            &section,
+            chinese,
+            true,
+            mixed.codex,
+            poller::UsageWindowKind::Weekly,
+        );
+        let claude = poller::format_line(
+            &section,
+            chinese,
+            true,
+            mixed.claude,
+            poller::UsageWindowKind::Weekly,
+        );
+        assert!(codex.contains("剩余") && codex.contains("70%"));
+        assert!(claude.contains("已用") && claude.contains("30%"));
+
+        // Stale markers keep their prefix whatever the direction.
+        let claude_stale = crate::provider_health::stale_text(
+            &poller::format_line(
+                &crate::models::UsageSection {
+                    percentage: 88.0,
+                    resets_at: None,
+                    available: true,
+                },
+                strings,
+                false,
+                mixed.claude,
+                poller::UsageWindowKind::Session,
+            ),
+            true,
+        );
+        assert_eq!(claude_stale, "!88%");
+    }
+
+    #[test]
+    fn mixed_display_keeps_stale_prefix_and_stable_widths() {
+        // Mixed introduces no new text shapes: each provider's label is one
+        // of the shapes Remaining or Used already produce.
+        for text in ["98% 1h04m", "2% 1d23h", "100% 5h", "0% 12m"] {
+            let fresh = quota_text_width_for(LanguageId::English, &[text]);
+            let stale = quota_text_width_for(LanguageId::English, &[&format!("!{text}")]);
+            assert_eq!(fresh, stale);
+        }
+        assert_eq!(
+            crate::provider_health::stale_text("98% 1h04m", true),
+            "!98% 1h04m"
+        );
+        assert_eq!(
+            crate::provider_health::stale_text("2% 1d23h", false),
+            "2% 1d23h"
+        );
+    }
+
+    #[test]
+    fn alerts_use_normalized_remaining_in_every_display_mode() {
+        // Alerts take normalized usage data; the display mode is not an
+        // input. Codex at 98% used (Mixed shows "2%") alerts at 2% remaining;
+        // Claude at 98% used (Mixed shows "98%") is still 2% remaining.
+        for mode in [
+            UsageDisplayMode::Mixed,
+            UsageDisplayMode::Remaining,
+            UsageDisplayMode::Used,
+        ] {
+            let mut alerts = Vec::new();
+            let mut notified = BTreeSet::new();
+            append_test_codex_session_alerts(&mut alerts, &mut notified, &[2, 5, 30], 2.0, 0);
+            assert_eq!(alerts.len(), 1, "{mode:?}");
+            assert!(alerts[0].message.contains("2%"), "{mode:?}");
+            assert!(notified.iter().any(|key| key.contains(":threshold:2:")));
+            let directions = mode.directions();
+            let (codex, claude) = match mode {
+                UsageDisplayMode::Mixed => (2.0, 98.0),
+                UsageDisplayMode::Remaining => (2.0, 2.0),
+                UsageDisplayMode::Used => (98.0, 98.0),
+            };
+            assert_eq!(usage_percent_for_display(directions.codex, 98.0), codex);
+            assert_eq!(usage_percent_for_display(directions.claude, 98.0), claude);
+            assert_eq!(
+                usage_percent_for_display(directions.antigravity, 98.0),
+                if mode == UsageDisplayMode::Used {
+                    98.0
+                } else {
+                    2.0
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn usage_display_settings_keep_existing_choices_and_default_new_installs_to_mixed() {
+        // Brand-new installation (no settings file) starts Mixed.
+        let dir =
+            std::env::temp_dir().join(format!("codex-usage-mixed-default-{}", std::process::id()));
+        let (fresh, source) =
+            load_settings_from_paths(&dir.join("missing.json"), &dir.join("missing-legacy.json"));
+        assert!(source == SettingsSource::Defaults);
+        assert_eq!(normalize_settings(fresh).usage_display, "mixed");
+
+        // Files written before the field existed keep Remaining.
+        let legacy: SettingsFile = serde_json::from_str(r#"{"tray_offset":0}"#).unwrap();
+        assert_eq!(normalize_settings(legacy).usage_display, "remaining");
+
+        // Settings written by Reserve-era builds, including any stray Reserve
+        // keys, still load with their Credits and display choices intact.
+        let reserve_era: SettingsFile = serde_json::from_str(
+            r#"{"usage_display":"mixed","credit_display":"when_needed","credit_position":"right",
+                "credit_value_mode":"usd_estimate","show_luna_reserve":true,
+                "luna_reserve":{"enabled":true},"reserve_display":"ring"}"#,
+        )
+        .unwrap();
+        let reserve_era = normalize_settings(reserve_era);
+        assert_eq!(reserve_era.usage_display, "mixed");
+        assert_eq!(reserve_era.credit_display, "when_needed");
+        assert_eq!(reserve_era.credit_position, "right");
+        assert_eq!(reserve_era.credit_value_mode, "usd_estimate");
+        let saved = serde_json::to_string(&reserve_era).unwrap();
+        assert!(!saved.contains("reserve"));
+
+        for (stored, expected) in [
+            ("remaining", "remaining"),
+            ("used", "used"),
+            ("USED", "used"),
+            ("mixed", "mixed"),
+            ("Mixed", "mixed"),
+            ("sideways", "remaining"),
+        ] {
+            let settings: SettingsFile =
+                serde_json::from_str(&format!(r#"{{"usage_display":"{stored}"}}"#)).unwrap();
+            let settings = normalize_settings(settings);
+            assert_eq!(settings.usage_display, expected, "{stored}");
+            let round_trip: SettingsFile =
+                serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+            assert_eq!(
+                UsageDisplayMode::from_setting(&round_trip.usage_display).as_setting(),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -7813,54 +7793,67 @@ mod tests {
     }
 
     #[test]
-    fn extra_usage_display_selects_credits_or_reserve_conservatively() {
+    fn credit_panel_selection_follows_display_mode_and_exhaustion() {
         let mut credits = test_codex_data(Some(CreditBalance::Amount(12.0)), 0.0, 25.0);
+        for (mode, visible) in [
+            (CreditDisplayMode::Always, true),
+            (CreditDisplayMode::WhenNeeded, true),
+            (CreditDisplayMode::Off, false),
+        ] {
+            assert_eq!(
+                codex_credit_panel_visible(true, mode, Some(&credits)),
+                visible
+            );
+        }
         assert_eq!(
-            codex_extra_usage_display(true, CreditDisplayMode::WhenNeeded, Some(&credits)),
-            Some(ExtraUsageDisplay::Credits)
+            credit_panel_reason(true, CreditDisplayMode::WhenNeeded, Some(&credits)),
+            "finite_credits_available"
         );
 
+        // A known zero balance is still shown, as the real exhaustion test did.
         credits.codex.as_mut().unwrap().credits = Some(CreditBalance::Amount(0.0));
-        credits.codex.as_mut().unwrap().luna_reserve = Some(LunaReserveUsage {
-            section: UsageSection {
-                percentage: 50.0,
-                resets_at: None,
-                available: true,
-            },
-            available: true,
-            active: None,
-        });
+        assert!(codex_credit_panel_visible(
+            true,
+            CreditDisplayMode::WhenNeeded,
+            Some(&credits)
+        ));
         assert_eq!(
-            codex_extra_usage_display(true, CreditDisplayMode::WhenNeeded, Some(&credits)),
-            Some(ExtraUsageDisplay::LunaReserve)
-        );
-        assert_eq!(
-            codex_extra_usage_display(true, CreditDisplayMode::Off, Some(&credits)),
-            None
+            credit_panel_reason(true, CreditDisplayMode::WhenNeeded, Some(&credits)),
+            "credits_exhausted"
         );
 
-        credits
-            .codex
-            .as_mut()
-            .unwrap()
-            .luna_reserve
-            .as_mut()
-            .unwrap()
-            .active = Some(true);
-        credits.codex.as_mut().unwrap().session.percentage = 0.0;
+        // When needed hides Credits while included usage remains.
+        credits.codex.as_mut().unwrap().session.percentage = 40.0;
+        assert!(!codex_credit_panel_visible(
+            true,
+            CreditDisplayMode::WhenNeeded,
+            Some(&credits)
+        ));
+        assert!(codex_credit_panel_visible(
+            true,
+            CreditDisplayMode::Always,
+            Some(&credits)
+        ));
         assert_eq!(
-            usage_percent_for_display(true, 50.0),
-            50.0,
-            "remaining mode keeps Reserve semantics"
+            credit_panel_reason(true, CreditDisplayMode::WhenNeeded, Some(&credits)),
+            "included_usage_available"
         );
+
+        // Unknown Credits never show a panel; hidden Codex never does.
+        credits.codex.as_mut().unwrap().credits = None;
+        assert!(!codex_credit_panel_visible(
+            true,
+            CreditDisplayMode::Always,
+            Some(&credits)
+        ));
+        assert!(!codex_credit_panel_visible(
+            false,
+            CreditDisplayMode::Always,
+            Some(&credits)
+        ));
         assert_eq!(
-            usage_percent_for_display(false, 50.0),
-            50.0,
-            "used mode keeps Reserve semantics"
-        );
-        assert_eq!(
-            codex_extra_usage_display(true, CreditDisplayMode::Always, Some(&credits)),
-            Some(ExtraUsageDisplay::LunaReserve)
+            credit_panel_reason(false, CreditDisplayMode::Always, Some(&credits)),
+            "disabled"
         );
     }
 
@@ -8308,8 +8301,11 @@ mod tests {
             right: 840,
             bottom: 46,
         };
-        assert_eq!(safe_taskbar_anchor_left(taskbar, 900, &[weather]), 760);
-        assert_eq!(safe_taskbar_anchor_left(taskbar, 900, &[]), 900);
+        assert_eq!(
+            taskbar_layout::safe_anchor_left(taskbar, 900, &[weather]),
+            760
+        );
+        assert_eq!(taskbar_layout::safe_anchor_left(taskbar, 900, &[]), 900);
     }
 
     #[test]
@@ -8334,14 +8330,17 @@ mod tests {
                 bottom: 46,
             },
         ];
-        assert_eq!(safe_taskbar_anchor_left(taskbar, 1_100, &widgets), 760);
+        assert_eq!(
+            taskbar_layout::safe_anchor_left(taskbar, 1_100, &widgets),
+            760
+        );
         let narrow = RECT {
             left: 0,
             top: 0,
             right: 320,
             bottom: 46,
         };
-        assert_eq!(safe_taskbar_anchor_left(narrow, 300, &[]), 300);
+        assert_eq!(taskbar_layout::safe_anchor_left(narrow, 300, &[]), 300);
     }
 
     #[test]

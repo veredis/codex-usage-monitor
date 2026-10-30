@@ -10,6 +10,7 @@ mod poller;
 mod provider_health;
 mod provider_schedule;
 mod retry_after;
+mod taskbar_layout;
 mod theme;
 mod tray_icon;
 mod updater;

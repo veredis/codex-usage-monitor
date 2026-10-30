@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 
 use crate::diagnose;
-use crate::models::{CreditBalance, LunaReserveUsage, UsageData, UsageSection};
+use crate::models::{CreditBalance, UsageData, UsageSection};
 use crate::poller::remaining_percentage;
 
 pub const MCP_PORT: u16 = 46827;
@@ -568,7 +568,6 @@ fn usage_snapshot_result(
             "five_hour": null,
             "weekly": null,
             "credits": {"state":"unknown"},
-            "luna_reserve": null,
             "lowest_remaining_percent": null,
             "limiting_window": null,
             "updated_at": null,
@@ -590,12 +589,6 @@ fn usage_snapshot_result(
         Some(CreditBalance::Unlimited) => json!({"state":"unlimited"}),
         None => json!({"state":"unknown"}),
     };
-    let luna_reserve = snapshot
-        .data
-        .luna_reserve
-        .as_ref()
-        .map(luna_reserve_json)
-        .unwrap_or(Value::Null);
     let updated_at = snapshot
         .updated_at
         .duration_since(UNIX_EPOCH)
@@ -605,7 +598,6 @@ fn usage_snapshot_result(
         "five_hour": section_json(&snapshot.data.session),
         "weekly": section_json(&snapshot.data.weekly),
         "credits": credits,
-        "luna_reserve": luna_reserve,
         "lowest_remaining_percent": lowest,
         "limiting_window": limiting_window,
         "updated_at": updated_at,
@@ -613,25 +605,6 @@ fn usage_snapshot_result(
         "polling_mode": polling.mode,
         "effective_poll_interval_seconds": effective_interval,
         "status": if age > stale_after_seconds as u64 { "stale" } else { "ok" }
-    })
-}
-
-fn luna_reserve_json(reserve: &LunaReserveUsage) -> Value {
-    if !reserve.available || !reserve.section.available {
-        return json!({"available":false,"active":reserve.active});
-    }
-    let used = reserve.section.percentage.clamp(0.0, 100.0);
-    let reset = reserve
-        .section
-        .resets_at
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs());
-    json!({
-        "available": true,
-        "active": reserve.active,
-        "used_percent": used,
-        "remaining_percent": remaining_percentage(used),
-        "resets_at": reset
     })
 }
 
@@ -789,32 +762,43 @@ mod tests {
     }
 
     #[test]
-    fn successful_snapshots_replace_reserve_object_with_null_and_back() {
+    fn usage_results_keep_a_stable_field_set_without_reserve() {
+        // Both tools share this schema; clients (Codex, Claude Code) rely on
+        // these keys. The experimental luna_reserve field is gone.
+        const KEYS: [&str; 10] = [
+            "age_seconds",
+            "credits",
+            "effective_poll_interval_seconds",
+            "five_hour",
+            "limiting_window",
+            "lowest_remaining_percent",
+            "polling_mode",
+            "status",
+            "updated_at",
+            "weekly",
+        ];
         let mut shared = SharedUsage::default();
         shared.set_monitoring_enabled(true, false);
-        for present in [false, true, false, true] {
-            let mut data = test_data(10.0, 20.0);
-            data.credits = Some(CreditBalance::Amount(333.704065));
-            if present {
-                data.luna_reserve = Some(LunaReserveUsage {
-                    section: UsageSection {
-                        percentage: 25.0,
-                        available: true,
-                        ..Default::default()
-                    },
-                    available: true,
-                    active: None,
-                });
-            }
-            shared.publish(data, false);
-            let result =
-                usage_snapshot_result(shared.snapshot.as_ref(), &shared.polling, SystemTime::now());
-            assert_eq!(result["luna_reserve"].is_object(), present);
-            assert_eq!(result["luna_reserve"].is_null(), !present);
-            assert_eq!(result["credits"]["balance"], 333.704065);
-            assert_eq!(result["five_hour"]["used_percent"], 10.0);
-            assert_eq!(result["status"], "ok");
+        let empty = usage_snapshot_result(None, &shared.polling, SystemTime::now());
+        let mut data = test_data(10.0, 20.0);
+        data.credits = Some(CreditBalance::Amount(0.0));
+        shared.publish(data, false);
+        let result =
+            usage_snapshot_result(shared.snapshot.as_ref(), &shared.polling, SystemTime::now());
+        for value in [&empty, &result] {
+            let mut keys: Vec<&str> = value
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(keys, KEYS);
+            assert!(value.get("luna_reserve").is_none());
         }
+        assert_eq!(result["credits"], json!({"state":"amount","balance":0.0}));
+        assert_eq!(result["five_hour"]["used_percent"], 10.0);
+        assert_eq!(result["status"], "ok");
     }
 
     fn cached(data: UsageData, age: Duration) -> CachedSnapshot {
@@ -837,7 +821,6 @@ mod tests {
                 available: true,
             },
             credits: None,
-            luna_reserve: None,
         }
     }
 
@@ -914,29 +897,6 @@ mod tests {
             );
             assert_eq!(result["credits"]["state"], expected);
         }
-    }
-
-    #[test]
-    fn exposes_luna_reserve_without_promoting_unknown_active_state() {
-        let mut data = test_data(100.0, 100.0);
-        data.luna_reserve = Some(LunaReserveUsage {
-            section: UsageSection {
-                percentage: 50.0,
-                resets_at: Some(UNIX_EPOCH + Duration::from_secs(2_000_300_000)),
-                available: true,
-            },
-            available: true,
-            active: None,
-        });
-        let result = usage_snapshot_result(
-            Some(&cached(data, Duration::ZERO)),
-            &PollingMetadata::default(),
-            UNIX_EPOCH + Duration::from_secs(2_000_000_000),
-        );
-        assert_eq!(result["luna_reserve"]["available"], true);
-        assert_eq!(result["luna_reserve"]["used_percent"], 50.0);
-        assert_eq!(result["luna_reserve"]["remaining_percent"], 50.0);
-        assert_eq!(result["luna_reserve"]["active"], Value::Null);
     }
 
     #[test]
