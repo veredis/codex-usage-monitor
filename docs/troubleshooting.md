@@ -14,7 +14,7 @@ Codex Usage keeps authentication failures separate from transient service failur
 
 A leading `!` before a percentage (for example `!88% 1h04m`) means that provider's last value is stale: its latest request failed, it has not succeeded within twice its own polling interval, or it was restored from the snapshot saved before the last restart and has not been refreshed yet. Other providers are unaffected; each provider has its own schedule and backoff.
 
-`!--` means the window's reset time has passed since the last value was observed, so the old percentage no longer applies and the new one is not known yet. The bar is empty until the next successful refresh.
+When a window's countdown reaches zero, its last confirmed value stays visible for up to five minutes, marked `!` and without a countdown, until the next refresh brings the new value (Claude is refreshed at most every two minutes). Hovering it shows the reset time. If no fresh value arrives in that time, the row shows `!--`: the reset has passed, so the old percentage no longer applies and the new one is not known yet, and the bar stays empty until the next successful refresh. Plain `--` always means the provider does not report that window. The MCP tools report a window whose reset has passed as `null` immediately.
 
 Rejected Claude credentials are not resent until the credential file changes, preventing repeated login notifications. Transient failures back off per provider (never faster than the selected frequency, up to 30 minutes) and honor any server `Retry-After` deadline, including on **Refresh**.
 

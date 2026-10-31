@@ -188,4 +188,4 @@ Released under the [MIT License](LICENSE).
 
 ## Current version
 
-The public fork release is `1.9.1-veredis.7`. The current development binary identifies itself as `1.9.1-veredis.7 (Build 16)`; the Build number is an informational candidate identifier and does not change update ordering.
+The public fork release is `1.9.1-veredis.7`. The current development binary identifies itself as `1.9.1-veredis.7 (Build 17)`; the Build number is an informational candidate identifier and does not change update ordering.

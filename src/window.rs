@@ -2134,6 +2134,7 @@ fn refresh_usage_texts(state: &mut AppState) {
         ],
     ]
     .map(|row| row.map(f64::is_nan));
+    let resets = window_reset_states(state, now);
     for (id, session, weekly) in [
         (0, &mut state.session_text, &mut state.weekly_text),
         (
@@ -2149,38 +2150,61 @@ fn refresh_usage_texts(state: &mut AppState) {
     ] {
         let interval = provider_schedule::provider_interval_ms(id, base_interval);
         let stale = state.provider_health[id].stale(now, interval);
-        for (text, unknown) in [(session, unknown[id][0]), (weekly, unknown[id][1])] {
-            *text = if unknown {
-                // The old value predates a reset that has passed: unknown,
-                // never a guessed post-reset value.
-                if stale { "!--" } else { "--" }.to_string()
-            } else {
-                crate::provider_health::stale_text(text, stale)
+        for (window, text) in [session, weekly].into_iter().enumerate() {
+            use crate::provider_health::ResetState;
+            *text = match (resets[id][window], unknown[id][window]) {
+                // Just reset, next refresh pending: the last confirmed value,
+                // marked stale, without the countdown that has run out.
+                (ResetState::Rollover, false) => {
+                    crate::provider_health::stale_text(quota_text_parts(text).0, true)
+                }
+                // The reset passed and no refresh came: unknown, never a
+                // guessed post-reset value.
+                (ResetState::Passed, _) => "!--".to_string(),
+                (_, true) => if stale { "!--" } else { "--" }.to_string(),
+                _ => crate::provider_health::stale_text(text, stale),
             };
         }
     }
 }
 
-/// Bar values follow the shown data. A window the provider did not report,
-/// or whose reset passed after the observation, is unknown: NaN draws an
-/// empty track in either direction and the text shows `--`, never a 0%-used
-/// (or 100%-remaining) value the provider did not send.
-fn sync_provider_percents(state: &mut AppState, now: SystemTime) {
-    for id in 0..provider_schedule::PROVIDERS {
+/// Each provider's session and weekly reset state against its last success.
+fn window_reset_states(
+    state: &AppState,
+    now: SystemTime,
+) -> [[crate::provider_health::ResetState; 2]; provider_schedule::PROVIDERS] {
+    std::array::from_fn(|id| {
         let updated = state.provider_health[id].updated_at();
+        state
+            .data
+            .as_ref()
+            .and_then(|data| provider_usage(data, id))
+            .map_or([crate::provider_health::ResetState::Current; 2], |usage| {
+                [&usage.session, &usage.weekly].map(|section| {
+                    crate::provider_health::reset_state(section.resets_at, updated, now)
+                })
+            })
+    })
+}
+
+/// Bar values follow the shown data. A window the provider did not report,
+/// or whose reset passed longer than the rollover grace ago, is unknown: NaN
+/// draws an empty track in either direction and the text shows `--`/`!--`,
+/// never a 0%-used (or 100%-remaining) value the provider did not send.
+/// During the rollover grace the last confirmed value keeps its bar.
+fn sync_provider_percents(state: &mut AppState, now: SystemTime) {
+    let resets = window_reset_states(state, now);
+    for id in 0..provider_schedule::PROVIDERS {
         let values = state
             .data
             .as_ref()
             .and_then(|data| provider_usage(data, id))
             .map(|usage| {
+                let mut window = 0;
                 [&usage.session, &usage.weekly].map(|section| {
-                    if !section.available
-                        || crate::provider_health::window_reset_since(
-                            section.resets_at,
-                            updated,
-                            now,
-                        )
-                    {
+                    let passed = resets[id][window] == crate::provider_health::ResetState::Passed;
+                    window += 1;
+                    if !section.available || passed {
                         f64::NAN
                     } else {
                         section.percentage
@@ -7403,7 +7427,18 @@ fn hover_text(state: &AppState, region: &HoverRegion, now: SystemTime) -> Option
     let reset_text = section
         .resets_at
         .and_then(native_interop::format_local_datetime);
-    if crate::provider_health::window_reset_since(section.resets_at, updated, now) {
+    let reset_state = crate::provider_health::reset_state(section.resets_at, updated, now);
+    if reset_state == crate::provider_health::ResetState::Rollover {
+        let at = reset_text.unwrap_or_default();
+        return Some(if chinese {
+            format!("{name} {window}：已于 {at} 重置。\n! 表示显示的是重置前的最后数值，下次刷新后更新。")
+        } else {
+            format!(
+                "{name} {window}: reset at {at}.\n! shows the last value from before the reset until the next refresh."
+            )
+        });
+    }
+    if reset_state == crate::provider_health::ResetState::Passed {
         let at = reset_text.unwrap_or_default();
         return Some(if chinese {
             format!("{name} {window}：已于 {at} 重置。\n!-- 表示新数值未知，下次成功刷新后显示。")
@@ -10362,12 +10397,111 @@ mod persisted_snapshot_tests {
         );
     }
 
+    /// The owner's Build 16 report, for Claude and Codex alike: the 5h
+    /// countdown reached zero and the row went empty (`--`) until the next
+    /// poll. Now the last confirmed value stays, marked stale and without a
+    /// countdown, for a bounded grace; nothing new is invented.
+    #[test]
+    fn five_hour_rollover_keeps_the_last_value_stale_until_fresh_data() {
+        let now = SystemTime::now();
+        let secs = Duration::from_secs;
+        let day = secs(86_400);
+        let mut state = state();
+        let observed =
+            |state: &mut AppState, id: usize, data: Option<UsageData>, at: SystemTime| {
+                let invalidate = state.provider_health[id].record(Some("account".into()), None, at);
+                merge_provider_result(
+                    state.data.get_or_insert_with(Default::default),
+                    id,
+                    data,
+                    invalidate,
+                );
+            };
+        // Claude polled 60 s ago (used 72%), its 5h window reset 30 s ago;
+        // Codex polled 20 s ago (98% used, 2% left), its reset passed 10 s ago.
+        observed(
+            &mut state,
+            CLAUDE,
+            Some(usage(72.0, now - secs(30), 85.0, now + day)),
+            now - secs(60),
+        );
+        observed(
+            &mut state,
+            CODEX,
+            Some(usage(98.0, now - secs(10), 71.0, now + 5 * day)),
+            now - secs(20),
+        );
+        state.last_poll_ok = true;
+        refresh_usage_texts(&mut state);
+        assert_eq!(
+            state.session_text, "!72%",
+            "last value, stale, no countdown"
+        );
+        assert_eq!(state.session_percent, 72.0, "its bar stays");
+        assert_eq!(state.codex_session_text, "!2%");
+        assert_eq!(state.codex_session_percent, 98.0);
+        // Unrelated windows are untouched and current.
+        assert!(
+            state.weekly_text.starts_with("85% "),
+            "{}",
+            state.weekly_text
+        );
+        assert!(
+            state.codex_weekly_text.starts_with("29% "),
+            "{}",
+            state.codex_weekly_text
+        );
+        // Both still ask for a prompt refresh at the boundary.
+        assert_eq!(reset_poll_pending(&state, now), [true, true, false]);
+
+        // A failed refresh keeps the stale value within the grace; no new
+        // reset time or percentage appears.
+        apply(
+            &mut state,
+            CLAUDE,
+            None,
+            Some(PollError::NetworkUnavailable),
+        );
+        refresh_usage_texts(&mut state);
+        assert_eq!(state.session_text, "!72%");
+
+        // Fresh data after the reset replaces it (0% used, new countdown).
+        apply(
+            &mut state,
+            CLAUDE,
+            Some(usage(0.0, now + secs(18_000), 85.0, now + day)),
+            None,
+        );
+        refresh_usage_texts(&mut state);
+        assert!(
+            state.session_text.starts_with("0% "),
+            "{}",
+            state.session_text
+        );
+        assert_eq!(state.session_percent, 0.0);
+
+        // An authoritative response without a 5h window shows `--`, with the
+        // weekly row intact.
+        let mut absent = usage(0.0, now + secs(18_000), 71.0, now + 5 * day);
+        absent.session.available = false;
+        absent.session.resets_at = None;
+        apply(&mut state, CODEX, Some(absent), None);
+        refresh_usage_texts(&mut state);
+        assert_eq!(state.codex_session_text, "--");
+        assert!(state.codex_session_percent.is_nan());
+        assert!(
+            state.codex_weekly_text.starts_with("29% "),
+            "{}",
+            state.codex_weekly_text
+        );
+    }
+
     #[test]
     fn a_reset_that_passed_since_the_snapshot_is_unknown_not_the_old_value() {
         let now = SystemTime::now();
         let day = Duration::from_secs(86_400);
         let mut state = state();
-        let before_reset = usage(80.0, now - Duration::from_secs(60), 35.0, now + day);
+        let before_reset = usage(80.0, now - Duration::from_secs(400), 35.0, now + day);
         restore(
             &mut state,
             CLAUDE,
@@ -10778,12 +10912,14 @@ mod appearance_tests {
             hover_text(&state, &region(CODEX, poller::UsageWindowKind::Weekly), now).unwrap();
         assert!(weekly.contains("not reported"), "{weekly}");
 
-        let passed = hover_text(
-            &state,
-            &region(CLAUDE, poller::UsageWindowKind::Session),
-            now,
-        )
-        .unwrap();
+        let claude_session = region(CLAUDE, poller::UsageWindowKind::Session);
+        let rollover = hover_text(&state, &claude_session, now).unwrap();
+        assert!(
+            rollover.contains("last value from before the reset"),
+            "{rollover}"
+        );
+        let later = now + crate::provider_health::ROLLOVER_GRACE + Duration::from_secs(60);
+        let passed = hover_text(&state, &claude_session, later).unwrap();
         assert!(passed.contains("!--"), "{passed}");
 
         let unavailable = hover_text(

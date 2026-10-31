@@ -84,6 +84,41 @@ pub fn window_reset_since(
     resets_at.is_some_and(|reset| reset <= now && updated_at.is_none_or(|u| u < reset))
 }
 
+/// How long after a passed reset the last confirmed value stays on screen,
+/// marked stale and without a countdown, while the next refresh is due. It
+/// covers Claude's 120 s request spacing plus one retry, so an ordinary
+/// rollover never empties the row; afterwards the row shows `!--`.
+pub const ROLLOVER_GRACE: Duration = Duration::from_secs(300);
+
+/// A window's shown value relative to its reset time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResetState {
+    /// No reset has passed since the value was observed.
+    Current,
+    /// The reset passed after the observation, within [`ROLLOVER_GRACE`]:
+    /// the last confirmed value is shown stale (`!`), never a guessed one.
+    Rollover,
+    /// The reset passed longer ago: the old value is unknown (`!--`).
+    Passed,
+}
+
+pub fn reset_state(
+    resets_at: Option<SystemTime>,
+    updated_at: Option<SystemTime>,
+    now: SystemTime,
+) -> ResetState {
+    match resets_at {
+        Some(reset) if window_reset_since(resets_at, updated_at, now) => {
+            if now.duration_since(reset).unwrap_or_default() < ROLLOVER_GRACE {
+                ResetState::Rollover
+            } else {
+                ResetState::Passed
+            }
+        }
+        _ => ResetState::Current,
+    }
+}
+
 #[derive(Default)]
 pub struct RejectedCredential {
     rejected: Option<String>,
@@ -185,6 +220,40 @@ mod tests {
         );
         let mut unscoped = ProviderHealth::default();
         assert!(!unscoped.adopt_observation(now));
+    }
+
+    #[test]
+    fn a_reset_rolls_over_briefly_then_becomes_unknown() {
+        let t = |s| SystemTime::UNIX_EPOCH + Duration::from_secs(s);
+        let grace = ROLLOVER_GRACE.as_secs();
+        // Counting down: current.
+        assert_eq!(
+            reset_state(Some(t(1000)), Some(t(900)), t(999)),
+            ResetState::Current
+        );
+        // Reaching zero and waiting for the next snapshot: last value, stale.
+        assert_eq!(
+            reset_state(Some(t(1000)), Some(t(900)), t(1000)),
+            ResetState::Rollover
+        );
+        assert_eq!(
+            reset_state(Some(t(1000)), Some(t(900)), t(1000 + grace - 1)),
+            ResetState::Rollover
+        );
+        // A delayed or failed refresh: the old value is no longer shown.
+        assert_eq!(
+            reset_state(Some(t(1000)), Some(t(900)), t(1000 + grace)),
+            ResetState::Passed
+        );
+        // Observed after the reset, or no reset time: current.
+        assert_eq!(
+            reset_state(Some(t(1000)), Some(t(1010)), t(1020)),
+            ResetState::Current
+        );
+        assert_eq!(
+            reset_state(None, Some(t(900)), t(5000)),
+            ResetState::Current
+        );
     }
 
     #[test]
