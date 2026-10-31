@@ -58,8 +58,7 @@ Important defaults and settings:
 - **Quota alerts:** Off by default. Select any combination of 2%, 5%, 10%, 20%, and 30% remaining. Each selected threshold alerts once per genuine quota window; an enabled window can also send one separate alert at 0% remaining.
 - **Credits:** Credits visibility is **Always** by default, with **Always**, **When needed**, and **Off** options. **When needed** shows the auxiliary area when an included Codex quota reaches 0%. The area can be placed **Left** or **Right**, independently of visibility. Choose **Credits** or **USD** value format. Finite Credits use the precise underlying balance for USD estimates and display whole Credits rounded to the nearest whole credit; known zero, unlimited, and unknown data remain distinct.
 - **Appearance:** **Settings > Appearance** offers:
-  - the translucent-dark-taskbar preset
-  - **Reset appearance**, which keeps your colors
+  - two profiles: **Solid Dark** (a solid dark backdrop with slim bars and larger text, for translucent taskbars) and **Taskbar Blend** (the standard look, blending into the taskbar). Both keep your colors and provider-icon choice; the active one is ticked.
   - contrast, bar style and thickness, text size, provider icons and colors
 
   An explicitly chosen color always wins over a palette, and a color saved by an earlier version keeps applying to every bar.
@@ -189,4 +188,4 @@ Released under the [MIT License](LICENSE).
 
 ## Current version
 
-The public fork release is `1.9.1-veredis.7`. The current development binary identifies itself as `1.9.1-veredis.7 (Build 14)`; the Build number is an informational candidate identifier and does not change update ordering.
+The public fork release is `1.9.1-veredis.7`. The current development binary identifies itself as `1.9.1-veredis.7 (Build 15)`; the Build number is an informational candidate identifier and does not change update ordering.

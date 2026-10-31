@@ -209,8 +209,8 @@ const IDM_CREDIT_VALUE_USD: u16 = 92;
 const IDM_ENABLE_CODEX_MCP: u16 = 93;
 const IDM_OPEN_LOG_FILE: u16 = 94;
 // Appearance (upstream #7 layout) and colours (this fork).
-const IDM_APPEARANCE_RECOMMENDED: u16 = 100;
-const IDM_APPEARANCE_RESET: u16 = 101;
+const IDM_PROFILE_SOLID_DARK: u16 = 100;
+const IDM_PROFILE_TASKBAR_BLEND: u16 = 101;
 const IDM_PALETTE_SYSTEM: u16 = 102;
 const IDM_PALETTE_DARK: u16 = 103;
 const IDM_PALETTE_LIGHT: u16 = 104;
@@ -697,8 +697,10 @@ fn provider_colors_are_default(colors: &ProviderColors) -> bool {
 const BAR_COLOR_WINDOWS_ACCENT: &str = "windows-accent";
 
 impl Appearance {
-    /// Upstream's preset for translucent dark taskbars; colours are untouched.
-    fn with_translucent_dark_preset(&self) -> Self {
+    /// Solid Dark profile: upstream's preset for translucent dark taskbars
+    /// (solid high-contrast backdrop, slim bars, larger text). Colours and
+    /// the provider-icon choice are untouched.
+    fn with_solid_dark_profile(&self) -> Self {
         Self {
             palette: Palette::HighContrastDark,
             bar_style: BarStyle::Continuous,
@@ -709,19 +711,26 @@ impl Appearance {
         }
     }
 
-    fn is_translucent_dark_preset(&self) -> bool {
+    fn is_solid_dark_profile(&self) -> bool {
         self.palette == Palette::HighContrastDark
             && self.bar_style == BarStyle::Continuous
             && self.bar_thickness == BarThickness::Slim
             && self.font_size == FontSize::Large
     }
 
-    /// Layout and palette back to factory; explicit colours are kept.
-    fn layout_reset(&self) -> Self {
+    /// Taskbar Blend profile: the factory look, blending into the taskbar
+    /// (system palette, standard bars and text). Colours and the
+    /// provider-icon choice are untouched.
+    fn with_taskbar_blend_profile(&self) -> Self {
         Self {
             provider_colors: self.provider_colors.clone(),
+            show_provider_icons: self.show_provider_icons,
             ..Self::default()
         }
+    }
+
+    fn is_taskbar_blend_profile(&self) -> bool {
+        *self == self.with_taskbar_blend_profile()
     }
 
     fn is_dark(&self, system_is_dark: bool) -> bool {
@@ -2772,6 +2781,13 @@ const SIMPLIFIED_CHINESE_LABEL_WIDTH: i32 = 20;
 const SIMPLIFIED_CHINESE_TEXT_WIDTH_FALLBACK: i32 = 126;
 const RIGHT_MARGIN: i32 = 6;
 const HORIZONTAL_GUTTER: i32 = 4;
+// Quota row spacing rules (logical px). Inside a provider group, one element
+// gap separates the label, provider mark, bar and text; a percentage and its
+// countdown sit a word space apart; provider groups are a double gap apart.
+// Every column is sized from its own provider's text, so these are the gaps
+// actually seen, not minimums plus slack.
+const ELEMENT_GAP: i32 = 6;
+const GROUP_GAP: i32 = 2 * ELEMENT_GAP;
 const CREDIT_TEXT_FALLBACK_WIDTH: i32 = 60;
 const CREDIT_VERTICAL_GAP: i32 = 2;
 const WIDGET_HEIGHT: i32 = 46;
@@ -2890,7 +2906,7 @@ fn provider_icon_slot() -> i32 {
 
 fn provider_icon_slot_for(shown: bool) -> i32 {
     if shown {
-        sc(crate::provider_icons::SIZE + crate::provider_icons::RIGHT_MARGIN)
+        sc(crate::provider_icons::SIZE + ELEMENT_GAP)
     } else {
         0
     }
@@ -2946,52 +2962,76 @@ fn quota_text_width_fallback(language: LanguageId) -> i32 {
 /// Gap between the percentage column and its countdown, logical pixels.
 const QUOTA_COLUMN_GAP: i32 = 4;
 
-/// Width of the right-aligned percentage column (e.g. `!100%`), logical.
-fn quota_percent_column_width(texts: &[&str]) -> i32 {
-    let widest_digit = widest_measured_quota_digit();
-    let values: Vec<String> = texts
-        .iter()
-        .filter(|text| !quota_text_parts(text).1.is_empty())
-        .map(|text| {
-            let value = normalize_quota_text_shape(quota_text_parts(text).0, Some(widest_digit));
-            format!("!{}", value.trim_start_matches('!'))
-        })
-        .collect();
-    let refs: Vec<&str> = values.iter().map(String::as_str).collect();
-    measured_column_width(&refs, 0)
-}
-
-fn quota_text_width_for(language: LanguageId, texts: &[&str]) -> i32 {
+/// Logical widths of one provider's text columns: its values (`98%`, `--`,
+/// `429`), drawn right-aligned so digits and `%` line up across rows, and its
+/// countdowns, drawn left-aligned (0 when it has none). Digits are measured
+/// at the widest digit, so the columns do not move as values tick. A stale
+/// `!` is not measured: it hangs into the gap before the value.
+fn quota_text_columns(language: LanguageId, texts: &[&str]) -> (i32, i32) {
     let widest_digit = texts
         .iter()
         .any(|text| text.chars().any(|ch| ch.is_ascii_digit()))
         .then(widest_measured_quota_digit);
-    let stable_shapes: Vec<String> = texts
-        .iter()
-        .map(|text| {
-            let shape = normalize_quota_text_shape(text.trim_start_matches('!'), widest_digit);
-            if text.contains('%') {
-                format!("!{shape}")
-            } else {
-                shape
-            }
-        })
-        .collect();
-    let stable_shape_refs: Vec<&str> = stable_shapes.iter().map(String::as_str).collect();
-    let whole = measured_column_width(&stable_shape_refs, quota_text_width_fallback(language));
-    // Column layout: percentage column, gap, widest countdown.
-    let resets: Vec<String> = texts
-        .iter()
-        .map(|text| normalize_quota_text_shape(quota_text_parts(text).1, widest_digit))
-        .filter(|reset| !reset.is_empty())
-        .collect();
-    let columns = if resets.is_empty() {
+    let shapes = |part: fn(&str) -> &str| -> Vec<String> {
+        texts
+            .iter()
+            .map(|text| normalize_quota_text_shape(part(text), widest_digit))
+            .filter(|shape| !shape.is_empty())
+            .collect()
+    };
+    let values = shapes(|text| quota_text_parts(text).0.trim_start_matches('!'));
+    let resets = shapes(|text| quota_text_parts(text).1);
+    let width = |shapes: &[String], fallback| {
+        let refs: Vec<&str> = shapes.iter().map(String::as_str).collect();
+        measured_column_width(&refs, fallback)
+    };
+    let value_width = if values.is_empty() {
+        quota_text_width_fallback(language)
+    } else {
+        width(&values, quota_text_width_fallback(language))
+    };
+    let reset_width = if resets.is_empty() {
         0
     } else {
-        let refs: Vec<&str> = resets.iter().map(String::as_str).collect();
-        quota_percent_column_width(texts) + QUOTA_COLUMN_GAP + measured_column_width(&refs, 0)
+        width(&resets, 0)
     };
-    whole.max(columns) + 1
+    (value_width, reset_width)
+}
+
+/// Logical width of one provider's text area: value column, word space,
+/// countdown column, plus a pixel for ClearType overhang.
+fn quota_text_width_for(language: LanguageId, texts: &[&str]) -> i32 {
+    let (value_width, reset_width) = quota_text_columns(language, texts);
+    let countdown = if reset_width > 0 {
+        QUOTA_COLUMN_GAP + reset_width
+    } else {
+        0
+    };
+    value_width + countdown + 1
+}
+
+/// Each visible provider's texts from `quota_texts_for_values` (row-major:
+/// every provider's 5h value, then every provider's 7d value).
+fn provider_text_groups<'a>(texts: &[&'a str], providers: usize) -> Vec<Vec<&'a str>> {
+    let providers = providers.max(1);
+    (0..providers)
+        .map(|provider| {
+            texts
+                .iter()
+                .skip(provider)
+                .step_by(providers)
+                .copied()
+                .collect()
+        })
+        .collect()
+}
+
+/// One text-area width per visible provider column.
+fn quota_text_widths_for(language: LanguageId, texts: &[&str], providers: i32) -> Vec<i32> {
+    provider_text_groups(texts, providers as usize)
+        .iter()
+        .map(|group| quota_text_width_for(language, group))
+        .collect()
 }
 
 fn widest_measured_quota_digit() -> char {
@@ -3040,13 +3080,6 @@ fn usage_label_width(language: LanguageId) -> i32 {
     )
 }
 
-fn usage_layout_widths(language: LanguageId, quota_texts: &[&str]) -> (i32, i32) {
-    (
-        usage_label_width(language),
-        quota_text_width_for(language, quota_texts),
-    )
-}
-
 fn credit_layout_widths(strings: Strings, current_value: &str) -> (i32, i32) {
     let header_width = measured_column_width(&[strings.credits], CREDIT_TEXT_FALLBACK_WIDTH);
     let actual_value_width = if current_value.is_empty() {
@@ -3088,15 +3121,27 @@ fn credit_panel_y_positions(height: i32) -> (i32, i32) {
     (header_y, header_y + segment_height + gap)
 }
 
-fn quota_area_width_for(active_models: i32, language: LanguageId, text_width: i32) -> i32 {
-    let bar_segments = row_bar_segment_count(active_models);
-    let label_width = usage_label_width(language);
-    let model_width = model_usage_width(bar_segments, text_width);
+/// Text-area width of provider column `index`; a single width applies to
+/// every column.
+fn column_text_width(text_widths: &[i32], index: usize) -> i32 {
+    text_widths
+        .get(index)
+        .or(text_widths.last())
+        .copied()
+        .unwrap_or(TEXT_WIDTH_FALLBACK)
+}
 
-    sc(label_width)
-        + sc(HORIZONTAL_GUTTER)
-        + model_width * active_models
-        + sc(HORIZONTAL_GUTTER) * (active_models - 1)
+/// Physical width of the quota rows: label, element gap, then each provider
+/// group, groups a group gap apart.
+fn quota_area_width_for(active_models: i32, language: LanguageId, text_widths: &[i32]) -> i32 {
+    let bar_segments = row_bar_segment_count(active_models);
+    let groups: i32 = (0..active_models.max(1) as usize)
+        .map(|index| model_usage_width(bar_segments, column_text_width(text_widths, index)))
+        .sum();
+    sc(usage_label_width(language))
+        + sc(ELEMENT_GAP)
+        + groups
+        + sc(GROUP_GAP) * (active_models.max(1) - 1)
 }
 
 fn widget_content_positions_for(
@@ -3107,7 +3152,7 @@ fn widget_content_positions_for(
     credit_position: CreditPosition,
     _credit_value_mode: CreditValueMode,
     credit_text: &str,
-    text_width: i32,
+    text_widths: &[i32],
 ) -> (i32, Option<i32>) {
     let mut base_content_x = drag_handle_reserved_width(show_drag_handle) + sc(HORIZONTAL_GUTTER);
     if !credit_panel_visible {
@@ -3122,7 +3167,7 @@ fn widget_content_positions_for(
         // the outermost drag grip stays at x=0.
         base_content_x += overflow;
     }
-    let quota_area_width = quota_area_width_for(active_models, language, text_width);
+    let quota_area_width = quota_area_width_for(active_models, language, text_widths);
     match credit_position {
         CreditPosition::Left => (
             base_content_x + sc(credit_outer_width(header_width)),
@@ -3218,9 +3263,9 @@ fn total_widget_width_for(
     credit_panel_visible: bool,
     _credit_value_mode: CreditValueMode,
     credit_text: &str,
-    text_width: i32,
+    text_widths: &[i32],
 ) -> i32 {
-    let quota_area_width = quota_area_width_for(active_models, language, text_width);
+    let quota_area_width = quota_area_width_for(active_models, language, text_widths);
 
     let credits_width = if credit_panel_visible {
         let (header_width, value_width) = credit_layout_widths(language.strings(), credit_text);
@@ -3238,18 +3283,19 @@ fn total_widget_width_for(
 
 fn total_widget_width_for_state(state: &AppState) -> i32 {
     let quota_texts = quota_texts_for_state(state);
+    let active_models = active_model_count(
+        state.show_claude_code,
+        state.show_codex,
+        state.show_antigravity,
+    );
     total_widget_width_for(
-        active_model_count(
-            state.show_claude_code,
-            state.show_codex,
-            state.show_antigravity,
-        ),
+        active_models,
         state.language,
         state.show_drag_handle,
         codex_credit_panel_visible(state.show_codex, state.credit_display, state.data.as_ref()),
         state.credit_value_mode,
         &state.codex_credit_text,
-        quota_text_width_for(state.language, &quota_texts),
+        &quota_text_widths_for(state.language, &quota_texts, active_models),
     )
 }
 
@@ -3264,7 +3310,7 @@ fn total_widget_width() -> i32 {
             false,
             CreditValueMode::Credits,
             "",
-            quota_text_width_fallback(LanguageId::English),
+            &[quota_text_width_fallback(LanguageId::English)],
         ),
     }
 }
@@ -3413,8 +3459,8 @@ Enable it?",
 fn apply_appearance_command(state: &mut AppState, id: u16) {
     let appearance = &mut state.appearance;
     match id {
-        IDM_APPEARANCE_RECOMMENDED => *appearance = appearance.with_translucent_dark_preset(),
-        IDM_APPEARANCE_RESET => *appearance = appearance.layout_reset(),
+        IDM_PROFILE_SOLID_DARK => *appearance = appearance.with_solid_dark_profile(),
+        IDM_PROFILE_TASKBAR_BLEND => *appearance = appearance.with_taskbar_blend_profile(),
         IDM_PALETTE_SYSTEM => appearance.palette = Palette::System,
         IDM_PALETTE_DARK => appearance.palette = Palette::HighContrastDark,
         IDM_PALETTE_LIGHT => appearance.palette = Palette::HighContrastLight,
@@ -3580,7 +3626,7 @@ pub fn run() {
                 false,
                 CreditValueMode::Credits,
                 "",
-                quota_text_width_for(language, &["--"]),
+                &[quota_text_width_for(language, &["--"])],
             ),
             sc(WIDGET_HEIGHT),
             HWND::default(),
@@ -3876,20 +3922,21 @@ fn render_layered() {
         &antigravity_session_text,
         &antigravity_weekly_text,
     );
-    let text_width = quota_text_width_for(language, &quota_texts);
+    let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
+    let text_widths = quota_text_widths_for(language, &quota_texts, active_models);
     let layout_credit_text = if credit_panel_visible {
         codex_credit_text.as_str()
     } else {
         ""
     };
     let width = total_widget_width_for(
-        active_model_count(show_claude_code, show_codex, show_antigravity),
+        active_models,
         language,
         show_drag_handle,
         credit_panel_visible,
         credit_value_mode,
         layout_credit_text,
-        text_width,
+        &text_widths,
     );
     if native_interop::get_window_rect_safe(hwnd)
         .is_some_and(|rect| rect.right - rect.left != width)
@@ -4088,7 +4135,13 @@ fn paint_content(
             antigravity_session_text,
             antigravity_weekly_text,
         );
-        let (label_width, text_width) = usage_layout_widths(language, &quota_texts);
+        let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
+        let label_width = usage_label_width(language);
+        let text_groups = provider_text_groups(&quota_texts, active_models as usize);
+        let text_widths: Vec<i32> = text_groups
+            .iter()
+            .map(|texts| quota_text_width_for(language, texts))
+            .collect();
         let layout_credit_text = if credit_panel_visible {
             credit_text
         } else {
@@ -4143,7 +4196,6 @@ fn paint_content(
             let _ = DeleteObject(grip_brush);
         }
 
-        let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
         let (content_x, credit_x) = widget_content_positions_for(
             active_models,
             language,
@@ -4152,7 +4204,7 @@ fn paint_content(
             credit_position,
             credit_value_mode,
             layout_credit_text,
-            text_width,
+            &text_widths,
         );
         let row_height = appearance.row_height();
         let row_gap = if height < sc(WIDGET_HEIGHT) {
@@ -4187,7 +4239,9 @@ fn paint_content(
         }
 
         // One provider mark per column, centred across the visible rows
-        // (upstream's layout), then each row's bars and text.
+        // (upstream's layout), then each row's bars and text. Every column
+        // is sized from its own provider's texts and placed a group gap
+        // after the previous one, the same arithmetic as the widget width.
         use crate::provider_icons::Provider;
         let palette_dark = appearance.is_dark(is_dark);
         let shown: Vec<Provider> = [
@@ -4199,17 +4253,26 @@ fn paint_content(
         .filter_map(|(provider, shown)| shown.then_some(provider))
         .collect();
         let segment_count = row_bar_segment_count(active_models);
-        let column_width = model_usage_width(segment_count, text_width) + sc(HORIZONTAL_GUTTER);
+        let mut column_x = content_x + sc(label_width) + sc(ELEMENT_GAP);
+        let columns: Vec<(i32, i32, i32)> = text_groups
+            .iter()
+            .zip(&text_widths)
+            .map(|(texts, &text_width)| {
+                let x = column_x;
+                column_x += model_usage_width(segment_count, text_width) + sc(GROUP_GAP);
+                (x, text_width, quota_text_columns(language, texts).0)
+            })
+            .collect();
         let icon_size = sc(crate::provider_icons::SIZE);
         let icon_y = if show_session_window && show_weekly_window {
             (row1_y + row2_y + row_height - icon_size) / 2
         } else {
             single_row_y + (row_height - icon_size) / 2
         };
-        let mut icon_x = content_x + sc(label_width) + sc(HORIZONTAL_GUTTER);
-        for provider in shown.iter().filter(|_| provider_icon_slot() > 0) {
-            crate::provider_icons::draw(hdc, icon_x, icon_y, icon_size, *provider);
-            icon_x += column_width;
+        if provider_icon_slot() > 0 {
+            for (provider, &(x, _, _)) in shown.iter().zip(&columns) {
+                crate::provider_icons::draw(hdc, x, icon_y, icon_size, *provider);
+            }
         }
         let value_for = |provider: Provider, session: bool| match (provider, session) {
             (Provider::Claude, true) => (session_pct, session_text),
@@ -4219,26 +4282,18 @@ fn paint_content(
             (Provider::Antigravity, true) => (antigravity_session_pct, antigravity_session_text),
             (Provider::Antigravity, false) => (antigravity_weekly_pct, antigravity_weekly_text),
         };
-        // Each provider's percentage column fits its own visible rows, so the
-        // bar-to-text gap does not depend on another provider's `100%`; the
-        // shared text width still bounds the column, so the widget never grows.
-        let percent_width_for = |provider: Provider| {
-            let texts: Vec<&str> = [(true, show_session_window), (false, show_weekly_window)]
-                .into_iter()
-                .filter(|&(_, visible)| visible)
-                .map(|(session, _)| value_for(provider, session).1)
-                .collect();
-            quota_percent_column_width(&texts)
-        };
         let cells_for = |session: bool| {
             shown
                 .iter()
-                .map(|&provider| {
+                .zip(&columns)
+                .map(|(&provider, &(x, text_width, value_width))| {
                     let (percent, text) = value_for(provider, session);
                     RowCell {
                         provider,
+                        x,
+                        text_width,
+                        value_width,
                         percent,
-                        percent_width: percent_width_for(provider),
                         text,
                         accent: provider_bar_color(
                             appearance,
@@ -4275,7 +4330,6 @@ fn paint_content(
                 poller::UsageWindowKind::Session,
                 track,
                 label_width,
-                text_width,
                 hover,
             );
         }
@@ -4296,7 +4350,6 @@ fn paint_content(
                 poller::UsageWindowKind::Weekly,
                 track,
                 label_width,
-                text_width,
                 hover,
             );
         }
@@ -5903,8 +5956,8 @@ unsafe extern "system" fn wnd_proc(
                         save_state_settings();
                     }
                 }
-                IDM_APPEARANCE_RECOMMENDED
-                | IDM_APPEARANCE_RESET
+                IDM_PROFILE_SOLID_DARK
+                | IDM_PROFILE_TASKBAR_BLEND
                 | IDM_PALETTE_SYSTEM
                 | IDM_PALETTE_DARK
                 | IDM_PALETTE_LIGHT
@@ -6784,27 +6837,28 @@ fn show_context_menu(hwnd: HWND) {
             );
         }
 
-        // Appearance (upstream #7 menu layout) with this fork's colour choices.
+        // Appearance: the Solid Dark and Taskbar Blend profiles (upstream #7's
+        // preset and factory look), individual choices, then this fork's colours.
         let chinese = language == LanguageId::SimplifiedChinese;
         let appearance_menu = CreatePopupMenu().unwrap();
         append_menu_choice(
             appearance_menu,
-            IDM_APPEARANCE_RECOMMENDED,
-            appearance.is_translucent_dark_preset(),
+            IDM_PROFILE_SOLID_DARK,
+            appearance.is_solid_dark_profile(),
             if chinese {
-                "推荐：半透明深色任务栏"
+                "纯色深色"
             } else {
-                "Recommended: translucent dark taskbar"
+                "Solid Dark"
             },
         );
         append_menu_choice(
             appearance_menu,
-            IDM_APPEARANCE_RESET,
-            appearance.layout_reset() == appearance,
+            IDM_PROFILE_TASKBAR_BLEND,
+            appearance.is_taskbar_blend_profile(),
             if chinese {
-                "恢复默认外观"
+                "融入任务栏"
             } else {
-                "Reset appearance"
+                "Taskbar Blend"
             },
         );
         let _ = AppendMenuW(appearance_menu, MF_SEPARATOR, 0, PCWSTR::null());
@@ -7478,13 +7532,16 @@ fn dismiss_hover_popup() {
     crate::quota_popup::hide();
 }
 
-/// One provider's column within a row: its percentage (display direction
-/// applied), text and colours.
+/// One provider's column within a row: where it starts, its text geometry,
+/// its percentage (display direction applied), text and colours.
 struct RowCell<'a> {
     provider: crate::provider_icons::Provider,
+    /// Physical x of the column (the provider mark, or the bar without it).
+    x: i32,
+    /// Logical widths of the provider's text area and right-aligned values.
+    text_width: i32,
+    value_width: i32,
     percent: f64,
-    /// Logical width of this provider's right-aligned percentage column.
-    percent_width: i32,
     text: &'a str,
     accent: Color,
     value_color: Color,
@@ -7512,7 +7569,6 @@ fn draw_row(
     window: poller::UsageWindowKind,
     track: &Color,
     label_width: i32,
-    text_width: i32,
     hover: &mut Vec<HoverRegion>,
 ) {
     let segment_count = row_bar_segment_count(cells.len().max(1) as i32);
@@ -7536,14 +7592,12 @@ fn draw_row(
         );
     }
 
-    let mut model_x = x + sc(label_width) + sc(HORIZONTAL_GUTTER);
     for cell in cells {
         // The provider mark sits left of the bars, centred across both rows
         // (drawn once per column by paint_content).
-        let bar_x = model_x + provider_icon_slot();
         let text_rect = draw_usage_bar(
             hdc,
-            bar_x,
+            cell.x + provider_icon_slot(),
             y,
             row_height,
             segment_count,
@@ -7554,22 +7608,22 @@ fn draw_row(
             track,
             &cell.value_color,
             &reset_color,
-            text_width,
-            cell.percent_width,
+            cell.text_width,
+            cell.value_width,
         );
         hover.push(HoverRegion {
             rect: text_rect,
             provider: cell.provider as usize,
             window,
         });
-        model_x += model_usage_width(segment_count, text_width) + sc(HORIZONTAL_GUTTER);
     }
 }
 
-/// Physical width of one provider column: mark (when shown), bars and text.
+/// Physical width of one provider group: mark and its gap (when shown),
+/// bars, element gap and text.
 fn model_usage_width(segment_count: i32, text_width: i32) -> i32 {
     provider_icon_slot() + (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * segment_count - sc(SEGMENT_GAP)
-        + sc(HORIZONTAL_GUTTER)
+        + sc(ELEMENT_GAP)
         + sc(text_width)
 }
 
@@ -7584,6 +7638,9 @@ fn quota_text_parts(text: &str) -> (&str, &str) {
 }
 
 /// Draws the bar and its text; returns the text cell for hover tooltips.
+/// Values are right-aligned in the provider's value column (`98%`, `--`,
+/// `429`), countdowns start one word space after it, and a stale `!` hangs
+/// into the element gap so it never shifts the value.
 #[allow(clippy::too_many_arguments)]
 fn draw_usage_bar(
     hdc: HDC,
@@ -7599,7 +7656,7 @@ fn draw_usage_bar(
     value_color: &Color,
     reset_color: &Color,
     text_width: i32,
-    percent_width: i32,
+    value_width: i32,
 ) -> RECT {
     let seg_w = sc(SEGMENT_W);
     let seg_gap = sc(SEGMENT_GAP);
@@ -7634,7 +7691,7 @@ fn draw_usage_bar(
         crate::rounded_bars::draw(hdc, rect, fill / 100.0, track, accent);
     }
 
-    let text_x = bar_x + bar_width + sc(HORIZONTAL_GUTTER);
+    let text_x = bar_x + bar_width + sc(ELEMENT_GAP);
     let cell = RECT {
         left: text_x,
         top: y,
@@ -7642,36 +7699,45 @@ fn draw_usage_bar(
         bottom: y + row_height,
     };
     let (value, reset) = quota_text_parts(text);
+    let core = match value.trim_start_matches('!') {
+        "" => value,
+        core => core,
+    };
+    let marker = &value[..value.len() - core.len()];
     unsafe {
-        let _ = SetTextColor(hdc, COLORREF(value_color.to_colorref()));
-        let mut value_wide: Vec<u16> = value.encode_utf16().collect();
-        let mut value_rect = RECT {
-            right: if reset.is_empty() {
-                cell.right
-            } else {
-                text_x + sc(percent_width)
-            },
-            ..cell
-        };
-        let flags = if reset.is_empty() { DT_LEFT } else { DT_RIGHT };
-        let _ = DrawTextW(
-            hdc,
-            &mut value_wide,
-            &mut value_rect,
-            flags | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-        );
-        if !reset.is_empty() {
-            let _ = SetTextColor(hdc, COLORREF(reset_color.to_colorref()));
-            let mut reset_wide: Vec<u16> = reset.encode_utf16().collect();
-            let mut reset_rect = RECT {
-                left: text_x + sc(percent_width + QUOTA_COLUMN_GAP),
+        let draw = |text: &str, left: i32, right: i32, align: DRAW_TEXT_FORMAT| {
+            let mut wide: Vec<u16> = text.encode_utf16().collect();
+            let mut rect = RECT {
+                left,
+                right,
                 ..cell
             };
             let _ = DrawTextW(
                 hdc,
-                &mut reset_wide,
-                &mut reset_rect,
-                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                &mut wide,
+                &mut rect,
+                align | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP,
+            );
+        };
+        let width_of = |text: &str| {
+            let wide: Vec<u16> = text.encode_utf16().collect();
+            let mut size = SIZE::default();
+            let _ = GetTextExtentPoint32W(hdc, &wide, &mut size);
+            size.cx
+        };
+        let _ = SetTextColor(hdc, COLORREF(value_color.to_colorref()));
+        let core_left = text_x + (sc(value_width) - width_of(core)).max(0);
+        draw(core, core_left, cell.right, DT_LEFT);
+        if !marker.is_empty() {
+            draw(marker, core_left - sc(ELEMENT_GAP), core_left, DT_RIGHT);
+        }
+        if !reset.is_empty() {
+            let _ = SetTextColor(hdc, COLORREF(reset_color.to_colorref()));
+            draw(
+                reset,
+                text_x + sc(value_width + QUOTA_COLUMN_GAP),
+                cell.right,
+                DT_LEFT,
             );
         }
     }
@@ -7704,7 +7770,7 @@ mod tests {
                                 side,
                                 CreditValueMode::Credits,
                                 "360",
-                                fresh
+                                &[fresh]
                             ),
                             widget_content_positions_for(
                                 2,
@@ -7714,7 +7780,7 @@ mod tests {
                                 side,
                                 CreditValueMode::Credits,
                                 "360",
-                                stale
+                                &[stale]
                             )
                         );
                     }
@@ -9596,7 +9662,7 @@ mod tests {
             false,
             CreditValueMode::Credits,
             "",
-            text_width,
+            &[text_width],
         );
         let with_credits = total_widget_width_for(
             1,
@@ -9605,7 +9671,7 @@ mod tests {
             true,
             CreditValueMode::Credits,
             "351",
-            text_width,
+            &[text_width],
         );
         let (credit_header_width, _) = credit_layout_widths(LanguageId::English.strings(), "351");
         let credit_panel_width = credit_outer_width(credit_header_width);
@@ -9622,8 +9688,8 @@ mod tests {
         assert!(long > short);
         assert_eq!(row_bar_segment_count(1), SEGMENT_COUNT);
         assert!(
-            quota_area_width_for(1, LanguageId::English, long)
-                > quota_area_width_for(1, LanguageId::English, short)
+            quota_area_width_for(1, LanguageId::English, &[long])
+                > quota_area_width_for(1, LanguageId::English, &[short])
         );
     }
 
@@ -9669,7 +9735,7 @@ mod tests {
                         credit_position,
                         CreditValueMode::Credits,
                         "361",
-                        before_text,
+                        &[before_text],
                     );
                     let after_layout = widget_content_positions_for(
                         1,
@@ -9679,7 +9745,7 @@ mod tests {
                         credit_position,
                         CreditValueMode::Credits,
                         "361",
-                        after_text,
+                        &[after_text],
                     );
                     assert_eq!(before_layout, after_layout);
 
@@ -9690,7 +9756,7 @@ mod tests {
                         true,
                         CreditValueMode::Credits,
                         "361",
-                        before_text,
+                        &[before_text],
                     );
                     let after_width = total_widget_width_for(
                         1,
@@ -9699,7 +9765,7 @@ mod tests {
                         true,
                         CreditValueMode::Credits,
                         "361",
-                        after_text,
+                        &[after_text],
                     );
                     assert_eq!(
                         scale_logical_at_dpi(before_width, dpi),
@@ -9724,8 +9790,8 @@ mod tests {
         let long_text = quota_text_width_for(LanguageId::English, &["100% 4h58m"]);
         assert!(long_text > short_text);
         assert!(
-            quota_area_width_for(1, LanguageId::English, long_text)
-                > quota_area_width_for(1, LanguageId::English, short_text)
+            quota_area_width_for(1, LanguageId::English, &[long_text])
+                > quota_area_width_for(1, LanguageId::English, &[short_text])
         );
     }
 
@@ -9764,7 +9830,7 @@ mod tests {
                         credit_position,
                         CreditValueMode::Credits,
                         "361",
-                        widest,
+                        &[widest],
                     );
                     assert!(quota_x >= drag_handle_reserved_width(show_drag_handle));
                     match credit_position {
@@ -9787,8 +9853,8 @@ mod tests {
                             true,
                             CreditValueMode::Credits,
                             "361",
-                            widest,
-                        ) > quota_area_width_for(model_count, LanguageId::English, widest)
+                            &[widest],
+                        ) > quota_area_width_for(model_count, LanguageId::English, &[widest])
                     );
                 }
             }
@@ -9805,7 +9871,7 @@ mod tests {
         assert!(overflow > 0);
 
         let text_width = quota_text_width_for(LanguageId::English, &["--"]);
-        let quota_width = quota_area_width_for(1, LanguageId::English, text_width);
+        let quota_width = quota_area_width_for(1, LanguageId::English, &[text_width]);
         let quota_gutter = sc(HORIZONTAL_GUTTER);
         assert_eq!(credit_outer_width(credits.0), credit_outer_width(usd.0));
         for show_drag_handle in [false, true] {
@@ -9819,7 +9885,7 @@ mod tests {
                     true,
                     CreditValueMode::Credits,
                     "351",
-                    text_width,
+                    &[text_width],
                 );
                 let new_total = total_widget_width_for(
                     1,
@@ -9828,7 +9894,7 @@ mod tests {
                     true,
                     CreditValueMode::UsdEstimate,
                     "~$1234.56",
-                    text_width,
+                    &[text_width],
                 );
                 assert_eq!(new_total - old_total, sc(overflow));
 
@@ -9840,7 +9906,7 @@ mod tests {
                     position,
                     CreditValueMode::Credits,
                     "351",
-                    text_width,
+                    &[text_width],
                 );
                 let (new_quota_x, new_credit_x) = widget_content_positions_for(
                     1,
@@ -9850,7 +9916,7 @@ mod tests {
                     position,
                     CreditValueMode::UsdEstimate,
                     "~$1234.56",
-                    text_width,
+                    &[text_width],
                 );
                 let old_credit_x = old_credit_x.unwrap();
                 let new_credit_x = new_credit_x.unwrap();
@@ -9931,7 +9997,7 @@ mod tests {
             CreditPosition::Left,
             CreditValueMode::Credits,
             "351",
-            text_width,
+            &[text_width],
         );
         let (right_quota_x, right_credit_x) = widget_content_positions_for(
             1,
@@ -9941,7 +10007,7 @@ mod tests {
             CreditPosition::Right,
             CreditValueMode::Credits,
             "351",
-            text_width,
+            &[text_width],
         );
 
         assert!(left_credit_x.unwrap() < left_quota_x);
@@ -9949,7 +10015,7 @@ mod tests {
         let base_content_x = sc(DRAG_HANDLE_HIT_W) + sc(HORIZONTAL_GUTTER);
         let (credit_header_width, _) = credit_layout_widths(LanguageId::English.strings(), "351");
         let credit_panel_width = credit_outer_width(credit_header_width);
-        let quota_area_width = quota_area_width_for(1, LanguageId::English, text_width);
+        let quota_area_width = quota_area_width_for(1, LanguageId::English, &[text_width]);
         let total_width = total_widget_width_for(
             1,
             LanguageId::English,
@@ -9957,7 +10023,7 @@ mod tests {
             true,
             CreditValueMode::Credits,
             "351",
-            text_width,
+            &[text_width],
         );
         assert_eq!(left_credit_x.unwrap(), base_content_x);
         assert_eq!(
@@ -10064,7 +10130,7 @@ mod tests {
             false,
             CreditValueMode::Credits,
             "",
-            text_width,
+            &[text_width],
         );
         let shown_width = total_widget_width_for(
             1,
@@ -10073,7 +10139,7 @@ mod tests {
             false,
             CreditValueMode::Credits,
             "",
-            text_width,
+            &[text_width],
         );
         assert_eq!(shown_width - hidden_width, sc(DRAG_HANDLE_HIT_W));
 
@@ -10085,7 +10151,7 @@ mod tests {
             CreditPosition::Left,
             CreditValueMode::Credits,
             "",
-            text_width,
+            &[text_width],
         );
         let (shown_quota_x, _) = widget_content_positions_for(
             1,
@@ -10095,7 +10161,7 @@ mod tests {
             CreditPosition::Left,
             CreditValueMode::Credits,
             "",
-            text_width,
+            &[text_width],
         );
         assert_eq!(hidden_quota_x, sc(HORIZONTAL_GUTTER));
         assert_eq!(
@@ -10454,7 +10520,7 @@ mod appearance_tests {
         assert_eq!(provider_icon_slot_for(false), 0);
         assert_eq!(
             provider_icon_slot_for(true),
-            sc(crate::provider_icons::SIZE + crate::provider_icons::RIGHT_MARGIN)
+            sc(crate::provider_icons::SIZE + ELEMENT_GAP)
         );
 
         let mut state = persisted_snapshot_tests::test_state();
@@ -10462,7 +10528,7 @@ mod appearance_tests {
         assert!(
             !state
                 .appearance
-                .with_translucent_dark_preset()
+                .with_solid_dark_profile()
                 .show_provider_icons
         );
         apply_appearance_command(&mut state, IDM_PROVIDER_ICONS);
@@ -10472,24 +10538,6 @@ mod appearance_tests {
         );
         apply_appearance_command(&mut state, IDM_PROVIDER_ICONS);
         assert!(!state.appearance.show_provider_icons);
-    }
-
-    /// Owner's report: Claude `98%` sat further from its bar than Codex
-    /// `100%`, because one percentage column fit the widest value of any
-    /// provider. Per-provider columns give every provider the same gap.
-    #[test]
-    fn bar_to_percentage_gap_matches_across_providers() {
-        let gap = |texts: &[&str], widest: &str| {
-            quota_percent_column_width(texts) - measure_text_width(widest).unwrap()
-        };
-        let claude = gap(&["98% 3h03m", "24% 1d"], "98%");
-        let codex = gap(&["100% 3h09m", "44% 6d1h"], "100%");
-        let single_digit = gap(&["5% 3h41m", "8% 2d"], "5%");
-        assert!((claude - codex).abs() <= 1, "claude {claude} codex {codex}");
-        assert!((single_digit - codex).abs() <= 1, "{single_digit} {codex}");
-        // Never wider than the shared column the widget width is sized from.
-        let shared = quota_percent_column_width(&["98% 3h03m", "24% 1d", "100% 3h09m", "44% 6d1h"]);
-        assert!(quota_percent_column_width(&["98% 3h03m", "24% 1d"]) <= shared);
     }
 
     #[test]
@@ -10592,18 +10640,50 @@ mod appearance_tests {
         );
     }
 
+    /// The owner's saved appearance (factory look, icons hidden) is the
+    /// Taskbar Blend profile; switching profiles keeps the icon choice and
+    /// exactly one profile is ticked.
+    #[test]
+    fn appearance_profiles_are_exclusive_and_keep_the_icon_choice() {
+        let owner: SettingsFile = serde_json::from_str(
+            r#"{"appearance":{"palette":"system","bar_style":"continuous","bar_thickness":"standard","font_size":"standard","show_provider_icons":false}}"#,
+        )
+        .unwrap();
+        let mut state = persisted_snapshot_tests::test_state();
+        state.appearance = owner.appearance;
+        assert!(state.appearance.is_taskbar_blend_profile());
+        assert!(!state.appearance.is_solid_dark_profile());
+        apply_appearance_command(&mut state, IDM_PROFILE_SOLID_DARK);
+        assert!(state.appearance.is_solid_dark_profile());
+        assert!(!state.appearance.is_taskbar_blend_profile());
+        assert!(!state.appearance.show_provider_icons, "icon choice kept");
+        assert_eq!(
+            state.appearance.font_size,
+            FontSize::Large,
+            "preset effects kept"
+        );
+        assert_eq!(state.appearance.bar_thickness, BarThickness::Slim);
+        apply_appearance_command(&mut state, IDM_PROFILE_TASKBAR_BLEND);
+        assert!(state.appearance.is_taskbar_blend_profile());
+        assert!(!state.appearance.show_provider_icons, "icon choice kept");
+        // A customised look is neither profile.
+        apply_appearance_command(&mut state, IDM_BAR_SEGMENTED);
+        assert!(!state.appearance.is_taskbar_blend_profile());
+        assert!(!state.appearance.is_solid_dark_profile());
+    }
+
     #[test]
     fn appearance_commands_keep_or_clear_colours_predictably() {
         let mut state = persisted_snapshot_tests_state();
         state.appearance.provider_colors.claude = Some("#123456".into());
         state.bar_color = Some("#654321".into());
-        apply_appearance_command(&mut state, IDM_APPEARANCE_RECOMMENDED);
-        assert!(state.appearance.is_translucent_dark_preset());
+        apply_appearance_command(&mut state, IDM_PROFILE_SOLID_DARK);
+        assert!(state.appearance.is_solid_dark_profile());
         assert_eq!(
             state.appearance.provider_colors.claude.as_deref(),
             Some("#123456")
         );
-        apply_appearance_command(&mut state, IDM_APPEARANCE_RESET);
+        apply_appearance_command(&mut state, IDM_PROFILE_TASKBAR_BLEND);
         assert_eq!(state.appearance.palette, Palette::System);
         assert_eq!(
             state.appearance.provider_colors.claude.as_deref(),
@@ -10612,7 +10692,7 @@ mod appearance_tests {
         assert_eq!(
             state.bar_color.as_deref(),
             Some("#654321"),
-            "reset keeps colours"
+            "Taskbar Blend keeps colours"
         );
         apply_appearance_command(&mut state, IDM_BAR_COLOR_WINDOWS_ACCENT);
         assert_eq!(state.bar_color.as_deref(), Some(BAR_COLOR_WINDOWS_ACCENT));
@@ -10731,10 +10811,179 @@ mod appearance_tests {
         assert!(chinese.contains("重置于"), "{chinese}");
     }
 
+    /// Fixture quota texts: Claude 5h, Claude 7d, Codex 5h, Codex 7d, with
+    /// the used percentages the painter takes for the bars.
+    type Values = [(f64, &'static str); 4];
+    const SAMPLE: Values = [
+        (5.0, "5% 3h41m"),
+        (60.0, "60% 1d06h"),
+        (59.0, "41% 4h12m"),
+        (f64::NAN, "!--"),
+    ];
+    /// The owner's screenshot: Claude 98%/24% used, Codex 100%/44% left.
+    const OWNER: Values = [
+        (98.0, "98% 3h03m"),
+        (24.0, "24% 1d"),
+        (0.0, "100% 3h09m"),
+        (56.0, "44% 6d1h"),
+    ];
+    /// One- and two-digit values, short and long countdowns.
+    const DIGITS: Values = [
+        (4.0, "4% 4h59m"),
+        (0.0, "0% 6d23h"),
+        (78.0, "22% 59m"),
+        (18.0, "82% 1d"),
+    ];
+    /// Stale and missing values.
+    const STALE: Values = [
+        (98.0, "!98% 3h03m"),
+        (f64::NAN, "!--"),
+        (f64::NAN, "--"),
+        (0.0, "100% 6d23h"),
+    ];
+
+    /// Paint Claude and Codex, both rows, offscreen with the real painter
+    /// at the current DPI; returns `0xRRGGBB` pixels, size and the key colour.
+    fn render_widget(
+        appearance: &Appearance,
+        legacy: Option<&str>,
+        dark: bool,
+        values: Values,
+    ) -> (Vec<u32>, i32, i32, u32) {
+        set_widget_font(appearance);
+        let rows = [values[0].1, values[2].1, values[1].1, values[3].1];
+        let text_widths = quota_text_widths_for(LanguageId::English, &rows, 2);
+        let width = total_widget_width_for(
+            2,
+            LanguageId::English,
+            true,
+            false,
+            CreditValueMode::Credits,
+            "",
+            &text_widths,
+        );
+        let height = sc(WIDGET_HEIGHT);
+        let (bg, text, track) = appearance_colors(appearance, dark);
+        let mut hover = Vec::new();
+        let pixels = unsafe {
+            let screen = GetDC(HWND::default());
+            let dc = CreateCompatibleDC(screen);
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: width,
+                    biHeight: -height,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits = std::ptr::null_mut();
+            let dib = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
+            let old = SelectObject(dc, dib);
+            paint_content(
+                dc,
+                width,
+                height,
+                dark,
+                &bg,
+                &text,
+                appearance,
+                legacy,
+                &track,
+                LanguageId::English,
+                LanguageId::English.strings(),
+                values[0].0,
+                values[0].1,
+                values[1].0,
+                values[1].1,
+                values[2].0,
+                values[2].1,
+                values[3].0,
+                values[3].1,
+                0.0,
+                "--",
+                100.0,
+                "100% 6d",
+                true,
+                true,
+                false,
+                true,
+                true,
+                true,
+                DisplayDirections::MIXED,
+                false,
+                CreditPosition::Left,
+                CreditValueMode::Credits,
+                "",
+                &mut hover,
+            );
+            let _ = GdiFlush();
+            let pixels = std::slice::from_raw_parts(bits as *const u32, (width * height) as usize)
+                .iter()
+                .map(|p| p & 0xFFFFFF)
+                .collect();
+            SelectObject(dc, old);
+            let _ = DeleteObject(dib);
+            let _ = DeleteDC(dc);
+            ReleaseDC(HWND::default(), screen);
+            pixels
+        };
+        assert_eq!(hover.len(), 4, "one hover cell per provider and row");
+        let key = (bg.r as u32) << 16 | (bg.g as u32) << 8 | bg.b as u32;
+        (pixels, width, height, key)
+    }
+
+    /// Gaps between the inked columns of the quota rows (both rows together,
+    /// full height, so a mark centred between them counts whole), left to
+    /// right past the drag grip. Ink closer than 3 px is one element.
+    fn rendered_column_gaps(appearance: &Appearance, values: Values) -> Vec<i32> {
+        let (pixels, width, height, key) = render_widget(appearance, None, true, values);
+        let inked = |x: i32| (0..height).any(|y| pixels[(y * width + x) as usize] != key);
+        let mut runs: Vec<(i32, i32)> = Vec::new();
+        for x in drag_handle_reserved_width(true)..width {
+            if !inked(x) {
+                continue;
+            }
+            match runs.last_mut() {
+                Some((_, end)) if x - *end < 3 => *end = x + 1,
+                _ => runs.push((x, x + 1)),
+            }
+        }
+        runs.windows(2).map(|pair| pair[1].0 - pair[0].1).collect()
+    }
+
+    /// The owner's values with marks, measured on rendered pixels (glyph
+    /// bearings count, so -1/+2 px): label, mark, bar and value column are
+    /// one element gap apart, values and countdowns a word space, and the
+    /// provider groups a group gap, for both providers.
+    #[test]
+    fn rendered_quota_rows_follow_one_spacing_system() {
+        let gaps = rendered_column_gaps(&Appearance::default(), OWNER);
+        // label | mark | bar | values | countdowns || mark | bar | values | countdowns
+        assert_eq!(gaps.len(), 8, "{gaps:?}");
+        let near = |gap: i32, rule: i32| (rule - 1..=rule + 2).contains(&gap);
+        for index in [0, 1, 2, 5, 6] {
+            assert!(
+                near(gaps[index], ELEMENT_GAP),
+                "element gap {index}: {gaps:?}"
+            );
+        }
+        for index in [3, 7] {
+            assert!(
+                near(gaps[index], QUOTA_COLUMN_GAP),
+                "word space {index}: {gaps:?}"
+            );
+        }
+        assert!(near(gaps[4], GROUP_GAP), "group gap: {gaps:?}");
+    }
+
     /// Render the real widget painter into image fixtures for visual review:
-    /// `cargo test render_widget_fixtures -- --ignored`, output in
-    /// `target/render-fixtures/*.bmp` (System palettes are composited over a
-    /// sample taskbar colour, as the layered window would be).
+    /// `cargo test render_widget_fixtures -- --ignored --test-threads=1`,
+    /// output in `target/render-fixtures/*.bmp` (System palettes are
+    /// composited over a sample taskbar colour, as the layered window would
+    /// be). `layout-*` cases compare spacing across icons, values and scales.
     #[test]
     #[ignore = "writes image fixtures for visual review"]
     fn render_widget_fixtures() {
@@ -10745,11 +10994,48 @@ mod appearance_tests {
         let mut custom = Appearance::default();
         custom.provider_colors.claude = Some("#9B5DE5".into());
         custom.provider_colors.codex = Some("#F15BB5".into());
-        let cases: Vec<(&str, Appearance, Option<&str>, bool, u32)> = vec![
-            ("default-dark-100", Appearance::default(), None, true, 96),
-            ("default-light-100", Appearance::default(), None, false, 96),
-            ("default-dark-125", Appearance::default(), None, true, 120),
-            ("default-dark-150", Appearance::default(), None, true, 144),
+        let no_icons = Appearance {
+            show_provider_icons: false,
+            ..Appearance::default()
+        };
+        let large = Appearance {
+            font_size: FontSize::Large,
+            ..no_icons.clone()
+        };
+        let solid_dark = no_icons.with_solid_dark_profile();
+        let cases: Vec<(&str, Appearance, Option<&str>, bool, u32, Values)> = vec![
+            (
+                "default-dark-100",
+                Appearance::default(),
+                None,
+                true,
+                96,
+                SAMPLE,
+            ),
+            (
+                "default-light-100",
+                Appearance::default(),
+                None,
+                false,
+                96,
+                SAMPLE,
+            ),
+            (
+                "default-dark-125",
+                Appearance::default(),
+                None,
+                true,
+                120,
+                SAMPLE,
+            ),
+            (
+                "default-dark-150",
+                Appearance::default(),
+                None,
+                true,
+                144,
+                SAMPLE,
+            ),
             (
                 "segmented-dark-100",
                 Appearance {
@@ -10759,13 +11045,15 @@ mod appearance_tests {
                 None,
                 true,
                 96,
+                SAMPLE,
             ),
             (
                 "translucent-preset-125",
-                Appearance::default().with_translucent_dark_preset(),
+                Appearance::default().with_solid_dark_profile(),
                 None,
                 true,
                 120,
+                SAMPLE,
             ),
             (
                 "high-contrast-light-100",
@@ -10776,167 +11064,100 @@ mod appearance_tests {
                 None,
                 false,
                 96,
+                SAMPLE,
             ),
-            ("custom-colors-dark-125", custom, None, true, 120),
+            ("custom-colors-dark-125", custom, None, true, 120, SAMPLE),
             (
                 "windows-accent-dark-100",
                 Appearance::default(),
                 Some(BAR_COLOR_WINDOWS_ACCENT),
                 true,
                 96,
+                SAMPLE,
             ),
-        ];
-        // The owner's Build 13 screenshot values (Claude 98%/24% used, Codex
-        // 100%/44% left), for bar-to-text spacing, with and without marks.
-        let no_icons = Appearance {
-            show_provider_icons: false,
-            ..Appearance::default()
-        };
-        let owner_cases = vec![
             (
-                "owner-icons-dark-100",
+                "layout-owner-no-icons-100",
+                no_icons.clone(),
+                None,
+                true,
+                96,
+                OWNER,
+            ),
+            (
+                "layout-owner-icons-100",
                 Appearance::default(),
                 None,
                 true,
                 96,
+                OWNER,
             ),
-            ("owner-no-icons-dark-100", no_icons.clone(), None, true, 96),
-            ("owner-no-icons-dark-150", no_icons, None, true, 144),
-        ];
-        let sample = [
-            (5.0, "5% 3h41m"),
-            (60.0, "60% 1d06h"),
-            (59.0, "41% 4h12m"),
-            (f64::NAN, "!--"),
-        ];
-        let owner = [
-            (98.0, "98% 3h03m"),
-            (24.0, "24% 1d"),
-            (0.0, "100% 3h09m"),
-            (56.0, "44% 6d1h"),
-        ];
-        let cases = cases
-            .into_iter()
-            .map(|case| (case, sample))
-            .chain(owner_cases.into_iter().map(|case| (case, owner)));
-        for ((name, appearance, legacy, dark, dpi), values) in cases {
-            CURRENT_DPI.store(dpi, Ordering::Relaxed);
-            set_widget_font(&appearance);
-            let texts = values.map(|(_, text)| text);
-            let quota = quota_text_width_for(LanguageId::English, &texts);
-            let width = total_widget_width_for(
-                2,
-                LanguageId::English,
+            (
+                "layout-digits-no-icons-100",
+                no_icons.clone(),
+                None,
                 true,
-                false,
-                CreditValueMode::Credits,
-                "",
-                quota,
-            );
-            let height = sc(WIDGET_HEIGHT);
-            let (bg, text, track) = appearance_colors(&appearance, dark);
-            let mut hover = Vec::new();
-            let pixels = unsafe {
-                let screen = GetDC(HWND::default());
-                let dc = CreateCompatibleDC(screen);
-                let info = BITMAPINFO {
-                    bmiHeader: BITMAPINFOHEADER {
-                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                        biWidth: width,
-                        biHeight: -height,
-                        biPlanes: 1,
-                        biBitCount: 32,
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                };
-                let mut bits = std::ptr::null_mut();
-                let dib = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
-                let old = SelectObject(dc, dib);
-                paint_content(
-                    dc,
-                    width,
-                    height,
-                    dark,
-                    &bg,
-                    &text,
-                    &appearance,
-                    legacy,
-                    &track,
-                    LanguageId::English,
-                    LanguageId::English.strings(),
-                    values[0].0,
-                    values[0].1,
-                    values[1].0,
-                    values[1].1,
-                    values[2].0,
-                    values[2].1,
-                    values[3].0,
-                    values[3].1,
-                    0.0,
-                    "--",
-                    100.0,
-                    "100% 6d",
-                    true,
-                    true,
-                    false,
-                    true,
-                    true,
-                    true,
-                    DisplayDirections::MIXED,
-                    false,
-                    CreditPosition::Left,
-                    CreditValueMode::Credits,
-                    "",
-                    &mut hover,
-                );
-                let _ = GdiFlush();
-                let pixels =
-                    std::slice::from_raw_parts(bits as *const u32, (width * height) as usize)
-                        .to_vec();
-                SelectObject(dc, old);
-                let _ = DeleteObject(dib);
-                let _ = DeleteDC(dc);
-                ReleaseDC(HWND::default(), screen);
-                pixels
-            };
-            assert_eq!(
-                hover.len(),
-                4,
-                "{name}: one hover cell per provider and row"
-            );
+                96,
+                DIGITS,
+            ),
+            (
+                "layout-digits-icons-100",
+                Appearance::default(),
+                None,
+                true,
+                96,
+                DIGITS,
+            ),
+            (
+                "layout-stale-no-icons-100",
+                no_icons.clone(),
+                None,
+                true,
+                96,
+                STALE,
+            ),
+            (
+                "layout-owner-solid-dark-125",
+                solid_dark,
+                None,
+                true,
+                120,
+                OWNER,
+            ),
+            ("layout-owner-large-text-150", large, None, true, 144, OWNER),
+            (
+                "layout-digits-icons-150",
+                Appearance::default(),
+                None,
+                true,
+                144,
+                DIGITS,
+            ),
+        ];
+        for (name, appearance, legacy, dark, dpi, values) in cases {
+            CURRENT_DPI.store(dpi, Ordering::Relaxed);
+            let (pixels, width, height, key) = render_widget(&appearance, legacy, dark, values);
             // Bars are antialiased: some pixels blend between track and fill.
-            let distinct: std::collections::BTreeSet<u32> =
-                pixels.iter().map(|p| p & 0xFFFFFF).collect();
+            let distinct: std::collections::BTreeSet<u32> = pixels.iter().copied().collect();
             assert!(distinct.len() > 40, "{name}: smooth edges and text");
             // System palettes are transparent where the key colour remains;
             // show them over a typical taskbar colour.
-            let key = (bg.r as u32) << 16 | (bg.g as u32) << 8 | bg.b as u32;
             let taskbar = if dark { 0x202020 } else { 0xEEEEEE };
-            let mut bmp = Vec::new();
-            let row_bytes = (width * 3 + 3) & !3;
-            let image_size = row_bytes * height;
-            bmp.extend_from_slice(b"BM");
-            bmp.extend_from_slice(&(54 + image_size as u32).to_le_bytes());
-            bmp.extend_from_slice(&0u32.to_le_bytes());
-            bmp.extend_from_slice(&54u32.to_le_bytes());
-            bmp.extend_from_slice(&40u32.to_le_bytes());
-            bmp.extend_from_slice(&width.to_le_bytes());
-            bmp.extend_from_slice(&(-height).to_le_bytes());
-            bmp.extend_from_slice(&1u16.to_le_bytes());
-            bmp.extend_from_slice(&24u16.to_le_bytes());
-            bmp.extend_from_slice(&[0u8; 24]);
-            for y in 0..height {
-                for x in 0..width {
-                    let mut p = pixels[(y * width + x) as usize] & 0xFFFFFF;
+            let composited: Vec<u32> = pixels
+                .iter()
+                .map(|&p| {
                     if p == key && !appearance.high_contrast() {
-                        p = taskbar;
+                        taskbar
+                    } else {
+                        p
                     }
-                    bmp.extend_from_slice(&[p as u8, (p >> 8) as u8, (p >> 16) as u8]);
-                }
-                bmp.extend(std::iter::repeat_n(0u8, (row_bytes - width * 3) as usize));
-            }
-            std::fs::write(directory.join(format!("{name}.bmp")), bmp).unwrap();
+                })
+                .collect();
+            crate::native_interop::write_bmp(
+                &directory.join(format!("{name}.bmp")),
+                width,
+                height,
+                &composited,
+            );
         }
         CURRENT_DPI.store(96, Ordering::Relaxed);
         set_widget_font(&Appearance::default());

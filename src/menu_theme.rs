@@ -155,7 +155,7 @@ mod tests {
                 let _ = AppendMenuW(submenu, MF_CHECKED, 2, w!("Continuous rounded"));
                 let menu = CreatePopupMenu().unwrap();
                 let _ = AppendMenuW(menu, MF_CHECKED, 1, w!("Show provider icons"));
-                let _ = AppendMenuW(menu, MENU_ITEM_FLAGS(0), 3, w!("Reset appearance"));
+                let _ = AppendMenuW(menu, MENU_ITEM_FLAGS(0), 3, w!("Taskbar Blend"));
                 let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
                 let _ = AppendMenuW(
                     menu,

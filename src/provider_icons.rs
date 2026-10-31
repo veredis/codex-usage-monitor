@@ -16,9 +16,8 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::native_interop::Color;
 
-/// Logical mark size and the gap to its bars.
+/// Logical mark size; the gap to its bars is a widget layout rule.
 pub const SIZE: i32 = 16;
-pub const RIGHT_MARGIN: i32 = 5;
 
 const SOURCE_SIZE: usize = 64;
 
