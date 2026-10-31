@@ -506,6 +506,10 @@ mod tests {
         assert!(!is_version_newer("1.9.1-veredis.6", "v1.9.1-veredis.6"));
         assert!(!is_version_newer("1.9.1-veredis.5", "1.9.1-veredis.6"));
         assert!(is_version_newer("1.10.0-veredis.1", "1.9.1-veredis.6"));
+        // This release over the last published one, and the next fork release over it.
+        assert!(is_version_newer("v1.10.0-veredis.1", "1.9.1-veredis.7"));
+        assert!(is_version_newer("1.10.0-veredis.2", "1.10.0-veredis.1"));
+        assert!(!is_version_newer("1.9.1-veredis.7", "1.10.0-veredis.1"));
         assert!(!is_version_newer("v0.8.2-veredis.5", "1.9.1-veredis.6"));
     }
 

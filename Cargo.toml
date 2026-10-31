@@ -1,6 +1,6 @@
 [package]
 name = "codex-usage"
-version = "1.9.1-veredis.7"
+version = "1.10.0-veredis.1"
 edition = "2021"
 license = "MIT"
 description = "Codex Usage"
@@ -8,13 +8,13 @@ homepage = "https://github.com/upstream-ray/codex-usage-monitor"
 repository = "https://github.com/veredis/codex-usage-monitor"
 
 [package.metadata.winres]
-CompanyName = "Ray"
+CompanyName = "veredis"
 ProductName = "Codex Usage"
 FileDescription = "Lightweight Codex usage monitor for Windows"
 OriginalFilename = "codex-usage.exe"
 InternalName = "CodexUsage"
-Comments = "Derived from Claude Code Usage Monitor under the MIT License"
-LegalCopyright = "Original copyright (C) 2026 Code Zeno Pty Ltd; modifications (C) 2026 Ray"
+Comments = "veredis fork of upstream-ray/codex-usage-monitor, derived from Claude Code Usage Monitor under the MIT License"
+LegalCopyright = "Original copyright (C) 2026 Code Zeno Pty Ltd; modifications (C) 2026 Ray; fork modifications (C) 2026 veredis"
 
 [dependencies]
 ureq = { version = "2", default-features = false, features = ["native-tls", "json", "proxy-from-env"] }

@@ -81,7 +81,7 @@ After the computer resumes from sleep or hibernation, providers refresh about 10
 
 A window the provider does not report is shown as `--`, never as 0% used or 100% remaining, and it never triggers an alert.
 
-Provider results feed one normalized monitor cache. The taskbar UI and MCP server read that cache; MCP requests do not trigger another usage request. During transient failures, the last successful percentages remain visible with a leading `!` while reset countdowns continue from their known timestamps and freshness is reported honestly. A value is marked stale only when its own provider failed or has not succeeded within twice its own interval.
+Provider results feed one normalized monitor cache. The taskbar UI and MCP server read that cache; MCP requests do not trigger another usage request. During transient failures, the last successful percentages remain visible with a leading `!` while reset countdowns continue from their known timestamps and freshness is reported honestly. When a countdown reaches zero, the last value stays for up to five minutes, marked `!` without a countdown, until the next refresh brings the new one; after that it shows `!--`. A value is marked stale only when its own provider failed or has not succeeded within twice its own interval.
 
 ## Local MCP integration
 
@@ -186,7 +186,7 @@ The monitor reads local authentication data for enabled providers and requests u
 
 ## Upstream, attribution, and license
 
-This is a modified fork of [upstream-ray/codex-usage-monitor](https://github.com/upstream-ray/codex-usage-monitor), which carries forward work from [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor). Original attribution and copyright notices are preserved.
+This is a modified fork of [upstream-ray/codex-usage-monitor](https://github.com/upstream-ray/codex-usage-monitor), which carries forward work from [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor). Original attribution and copyright notices are preserved. Fork changes adapt several upstream community pull requests, credited in the source: #8 by feizaodemon (independent polling, retry deadlines, recovery), #16 by benb-atlantis (rounded bars, popup placement, timer rounding), #25 by diogomrpr, #27 by ddddyyyy and #30 by SoKeiKei (taskbar layout, snapshots, display choice). Provider marks come from [Lobe Icons](https://github.com/lobehub/lobe-icons) (MIT, see `src/icons/providers/LICENSE`).
 
 This fork is not an official upstream release. The upstream maintainers do not maintain or endorse this fork unless they explicitly state otherwise.
 
@@ -194,4 +194,4 @@ Released under the [MIT License](LICENSE).
 
 ## Current version
 
-The public fork release is `1.9.1-veredis.7`. The current development binary identifies itself as `1.9.1-veredis.7 (Build 17)`; the Build number is an informational candidate identifier and does not change update ordering.
+The current fork release is `1.10.0-veredis.1`. Fork versions keep upstream's version number with a `-veredis.N` suffix, and the in-app updater and `install.ps1` only ever use this fork's releases. Local development candidates may add an informational "(Build N)" to the displayed version; it never affects update ordering.

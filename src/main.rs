@@ -33,7 +33,7 @@ fn main() {
             diagnose::log(format!(
                 "version={} build={} identity={} install_channel={:?} executable={}",
                 build_info::VERSION,
-                build_info::BUILD_NUMBER,
+                build_info::build_label(),
                 build_info::identity(),
                 updater::current_install_channel(),
                 std::env::current_exe()

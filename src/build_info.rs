@@ -1,11 +1,21 @@
-/// Informational build identifier for local fork candidates. This is kept
-/// separate from the package version so update comparisons remain semantic.
-pub const BUILD_NUMBER: u32 = 17;
+/// Informational build identifier for local fork candidates (`Some(n)` shows
+/// as "(Build n)"); `None` for a public release, which identifies by version
+/// alone. Kept separate from the package version so update comparisons
+/// remain semantic.
+pub const BUILD_NUMBER: Option<u32> = None;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn identity() -> String {
-    format!("{VERSION} (Build {BUILD_NUMBER})")
+    match BUILD_NUMBER {
+        Some(build) => format!("{VERSION} (Build {build})"),
+        None => VERSION.to_string(),
+    }
+}
+
+/// The build number for the operational log, `release` for a public build.
+pub fn build_label() -> String {
+    BUILD_NUMBER.map_or_else(|| "release".to_string(), |build| build.to_string())
 }
 
 #[cfg(test)]
@@ -14,8 +24,9 @@ mod tests {
 
     #[test]
     fn identity_keeps_build_number_out_of_the_semantic_version() {
-        assert_eq!(identity(), "1.9.1-veredis.7 (Build 17)");
-        assert_eq!(VERSION, "1.9.1-veredis.7");
-        assert_eq!(BUILD_NUMBER, 17);
+        assert_eq!(VERSION, "1.10.0-veredis.1");
+        assert_eq!(BUILD_NUMBER, None, "public release");
+        assert_eq!(identity(), "1.10.0-veredis.1");
+        assert_eq!(build_label(), "release");
     }
 }

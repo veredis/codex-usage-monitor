@@ -20,13 +20,21 @@ fn main() {
     res.compile().expect("Failed to compile Windows resources");
 }
 
+/// Numeric FILEVERSION: major.minor.patch, with the fork release number
+/// (`-veredis.N`) as the revision, so 1.10.0-veredis.1 is 1.10.0.1 rather
+/// than upstream's 1.10.0.0.
 fn pack_version(version: &str) -> u64 {
-    let core = version.split('-').next().unwrap_or(version);
+    let (core, pre) = version.split_once('-').unwrap_or((version, ""));
     let mut parts = core.split('.').map(|part| part.parse::<u64>().unwrap_or(0));
 
     let major = parts.next().unwrap_or(0).min(u16::MAX as u64);
     let minor = parts.next().unwrap_or(0).min(u16::MAX as u64);
     let patch = parts.next().unwrap_or(0).min(u16::MAX as u64);
+    let revision = pre
+        .strip_prefix("veredis.")
+        .and_then(|number| number.parse::<u64>().ok())
+        .unwrap_or(0)
+        .min(u16::MAX as u64);
 
-    (major << 48) | (minor << 32) | (patch << 16)
+    (major << 48) | (minor << 32) | (patch << 16) | revision
 }
