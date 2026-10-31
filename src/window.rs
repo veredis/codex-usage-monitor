@@ -6862,6 +6862,16 @@ fn show_context_menu(hwnd: HWND) {
             },
         );
         let _ = AppendMenuW(appearance_menu, MF_SEPARATOR, 0, PCWSTR::null());
+        append_menu_choice(
+            appearance_menu,
+            IDM_PROVIDER_ICONS,
+            appearance.show_provider_icons,
+            if chinese {
+                "显示服务图标"
+            } else {
+                "Show provider icons"
+            },
+        );
 
         let palette_menu = CreatePopupMenu().unwrap();
         for (id, palette, english, simplified) in [
@@ -6958,16 +6968,6 @@ fn show_context_menu(hwnd: HWND) {
             appearance_menu,
             font_menu,
             if chinese { "文字大小" } else { "Text size" },
-        );
-        append_menu_choice(
-            appearance_menu,
-            IDM_PROVIDER_ICONS,
-            appearance.show_provider_icons,
-            if chinese {
-                "显示服务图标"
-            } else {
-                "Show provider icons"
-            },
         );
 
         let colors_menu = CreatePopupMenu().unwrap();

@@ -1,6 +1,6 @@
 /// Informational build identifier for local fork candidates. This is kept
 /// separate from the package version so update comparisons remain semantic.
-pub const BUILD_NUMBER: u32 = 15;
+pub const BUILD_NUMBER: u32 = 16;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -14,8 +14,8 @@ mod tests {
 
     #[test]
     fn identity_keeps_build_number_out_of_the_semantic_version() {
-        assert_eq!(identity(), "1.9.1-veredis.7 (Build 15)");
+        assert_eq!(identity(), "1.9.1-veredis.7 (Build 16)");
         assert_eq!(VERSION, "1.9.1-veredis.7");
-        assert_eq!(BUILD_NUMBER, 15);
+        assert_eq!(BUILD_NUMBER, 16);
     }
 }
