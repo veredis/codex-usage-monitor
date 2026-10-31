@@ -3,6 +3,8 @@
 
 [English](README.md) | **简体中文**
 
+> 本仓库是 [upstream-ray/codex-usage-monitor](https://github.com/upstream-ray/codex-usage-monitor) 的 veredis 分支。本分支新增功能（Claude 桌面版只读登录、MCP 集成、外观设置等）的完整说明以[英文 README](README.md) 为准。
+
 # Codex Usage
 
 <img src=".github/codex-usage-icon.png" alt="Codex Usage 图标" width="96" height="96">
@@ -50,7 +52,7 @@ Antigravity 也是可选功能。若要显示其用量，请安装并登录 Goog
 
 ## 安装
 
-如需按用户安装，请从[最新版本](https://github.com/upstream-ray/codex-usage-monitor/releases/latest)下载 `install.ps1`，然后运行：
+如需按用户安装，请从本分支的[最新版本](https://github.com/veredis/codex-usage-monitor/releases/latest)下载 `install.ps1`，然后运行：
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1

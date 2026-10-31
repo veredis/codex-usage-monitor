@@ -16,7 +16,13 @@ Download the latest fork release from [veredis/codex-usage-monitor](https://gith
 
 The release is portable: download `codex-usage.exe` and run it directly.
 
-To keep **Start with Windows** stable across updates, install it to `%LOCALAPPDATA%\Programs\CodexUsage` with `scripts\install.ps1`. `-SourcePath <exe>` installs a local build, and `-NoLaunch` and `-NoDesktopShortcut` are optional.
+To keep **Start with Windows** stable across updates, install it to `%LOCALAPPDATA%\Programs\CodexUsage`: download `install.ps1` from the same release and run
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+It downloads the latest fork release, verifies its SHA-256 and installs it per user without elevation. `-Version <version>` installs a specific release, `-SourcePath <exe>` (with `-ExpectedSha256`) installs a local build, and `-NoLaunch` and `-NoDesktopShortcut` are optional. Upgrading keeps your settings. This fork is not on WinGet; the `Ray.CodexUsage` WinGet package is upstream's.
 
 **Start with Windows** always registers that installed copy when it exists. The installed copy also repairs a registration left pointing at another `codex-usage.exe`, so a development or older build you launched by hand never takes over sign-in startup.
 

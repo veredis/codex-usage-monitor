@@ -14,7 +14,7 @@ The installer is per-user and does not request elevation. It verifies the releas
 
 ## Portable mode
 
-`codex-usage.exe` can be run from any user-writable directory without installation. Portable mode uses the same `%APPDATA%\CodexUsage\settings.json` settings as a direct or WinGet installation.
+`codex-usage.exe` can be run from any user-writable directory without installation. Portable mode uses the same `%APPDATA%\CodexUsage\settings.json` settings as a direct installation.
 
 ## Settings and startup behavior
 
@@ -26,6 +26,4 @@ The installer is per-user and does not request elevation. It verifies the releas
 
 ## WinGet
 
-The WinGet package uses the release EXE as a portable installer with package identifier `Ray.CodexUsage`. WinGet owns its installation directory and upgrade/uninstall lifecycle. The in-app updater detects WinGet-managed paths and delegates upgrades back to WinGet.
-
-The PowerShell installer is not used as a WinGet installer because the public WinGet community repository does not accept script-based installers.
+The WinGet package `Ray.CodexUsage` belongs to the upstream project and installs upstream's executable. This fork (`veredis/codex-usage-monitor`) is not published to WinGet: install it with `install.ps1` or run it portably. Its in-app updater and `install.ps1` download only from this fork's GitHub Releases and never delegate to WinGet.

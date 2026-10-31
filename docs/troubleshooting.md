@@ -106,11 +106,7 @@ Install or update the stable copy with `scripts\install.ps1 -SourcePath <exe> -N
 
 Direct installations and portable copies download only the exact `codex-usage.exe` asset and verify it against `codex-usage.exe.sha256` from the same GitHub Release. The updater keeps the previous EXE until the downloaded version has been installed and restarted successfully. If restart fails, the old EXE is restored.
 
-WinGet-managed installations delegate upgrades to WinGet:
-
-```powershell
-winget upgrade --id Ray.CodexUsage --exact
-```
+This fork updates only from [veredis/codex-usage-monitor](https://github.com/veredis/codex-usage-monitor/releases) and has no WinGet package. The WinGet package `Ray.CodexUsage` is the upstream project: upgrading it with WinGet installs upstream's executable, not this fork.
 
 ## Reset local position without deleting settings
 
