@@ -510,6 +510,12 @@ mod tests {
         assert!(is_version_newer("v1.10.0-veredis.1", "1.9.1-veredis.7"));
         assert!(is_version_newer("1.10.0-veredis.2", "1.10.0-veredis.1"));
         assert!(!is_version_newer("1.9.1-veredis.7", "1.10.0-veredis.1"));
+        // v1.10.0-veredis.2 over v1.10.0-veredis.1, never the reverse, and the
+        // ".2" release must not sort below ".10" lexically or the other way.
+        assert!(is_version_newer("v1.10.0-veredis.2", "1.10.0-veredis.1"));
+        assert!(!is_version_newer("1.10.0-veredis.1", "1.10.0-veredis.2"));
+        assert!(!is_version_newer("v1.10.0-veredis.2", "1.10.0-veredis.2"));
+        assert!(is_version_newer("1.10.0-veredis.10", "1.10.0-veredis.2"));
         assert!(!is_version_newer("v0.8.2-veredis.5", "1.9.1-veredis.6"));
     }
 

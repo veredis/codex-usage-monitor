@@ -50,6 +50,7 @@ It downloads the latest fork release, verifies its SHA-256 and installs it per u
 - Automatic, manual and dragged positions all stay left of the notification area (Show hidden icons, tray icons and clock); taskbar layout changes are always reconciled, even when they arrive in bursts.
 - Multi-monitor taskbar placement, notification-area integration, and Start with Windows support.
 - Optional Claude Code and Google Antigravity monitoring where their local applications and credentials are available.
+- Antigravity quota groups (Gemini Models, Claude and GPT models, Gemini 4 Argon), each with its own 5-hour and weekly windows. They are read from Antigravity's own local server while Antigravity is open. When Antigravity is closed, the monitor falls back to Google's quota service, which may report fewer groups. **Models > Antigravity quota** picks the group: **Auto** shows Gemini Models first. A chosen group that the current source does not report keeps its last value, marked `!`, and is never replaced by another group's value. The hover popup names the group shown.
 
 ## Usage
 
@@ -182,7 +183,7 @@ The settings file includes display modes, bar color, polling, alerts, provider s
 
 ## Privacy
 
-The monitor reads local authentication data for enabled providers and requests usage information directly from their services. It has no separate telemetry, analytics service, or application backend, and it does not upload project files. The optional MCP server is local, loopback-only, read-only usage telemetry.
+The monitor reads local authentication data for enabled providers and requests usage information directly from their services. It has no separate telemetry, analytics service, or application backend, and it does not upload project files. While Antigravity is open, the monitor reads the temporary local key from the command line of Antigravity's bundled language server. It sends that key only to that process on `127.0.0.1` to read the quota summary. The key is never logged or stored. The optional MCP server is local, loopback-only, read-only usage telemetry.
 
 ## Upstream, attribution, and license
 
@@ -194,4 +195,4 @@ Released under the [MIT License](LICENSE).
 
 ## Current version
 
-The current fork release is `1.10.0-veredis.1`. Fork versions keep upstream's version number with a `-veredis.N` suffix, and the in-app updater and `install.ps1` only ever use this fork's releases. Local development candidates may add an informational "(Build N)" to the displayed version; it never affects update ordering.
+The current fork release is `1.10.0-veredis.2`. Fork versions keep upstream's version number with a `-veredis.N` suffix, and the in-app updater and `install.ps1` only ever use this fork's releases. Local development candidates may add an informational "(Build N)" to the displayed version; it never affects update ordering.
