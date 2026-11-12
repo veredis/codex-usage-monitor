@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+mod antigravity_local;
 mod build_info;
 mod claude_desktop;
 mod claude_local;

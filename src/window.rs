@@ -109,6 +109,8 @@ struct AppState {
     /// Last snapshot written to (or restored from) disk, to limit rewrites.
     persisted: [Option<quota_cache::Snapshot>; 3],
     claude_desktop_sign_in: bool,
+    /// Antigravity quota group shown (`None` = Auto).
+    antigravity_quota_group: Option<String>,
     recovery_gate: recovery_events::RecoveryGate,
     recovery_watch: Option<recovery_events::Watch>,
     /// Text cells from the last paint, for the reset-time popup.
@@ -226,6 +228,10 @@ const IDM_COLOR_CODEX: u16 = 113;
 const IDM_COLOR_ANTIGRAVITY: u16 = 114;
 const IDM_CLAUDE_DESKTOP_SIGN_IN: u16 = 115;
 const IDM_PROVIDER_ICONS: u16 = 116;
+/// Antigravity quota submenu: Auto, then one item per reported group.
+const IDM_ANTIGRAVITY_GROUP_AUTO: u16 = 130;
+const IDM_ANTIGRAVITY_GROUP_FIRST: u16 = 131;
+const IDM_ANTIGRAVITY_GROUP_LAST: u16 = 139;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 /// `WM_MOUSELEAVE`, requested with `TrackMouseEvent` for the hover popup.
@@ -526,6 +532,9 @@ struct SettingsFile {
     /// Claude Code CLI sign-in has expired. Opt-in (Settings menu).
     #[serde(default = "default_claude_desktop_sign_in")]
     use_claude_desktop_sign_in: bool,
+    /// Antigravity quota group to show, as Antigravity names it; absent = Auto.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    antigravity_quota_group: Option<String>,
 }
 
 /// Off unless chosen: new installations never read Claude Desktop's credential
@@ -564,6 +573,7 @@ impl Default for SettingsFile {
             adaptive_polling: false,
             notified_quota_windows: Vec::new(),
             use_claude_desktop_sign_in: default_claude_desktop_sign_in(),
+            antigravity_quota_group: None,
         }
     }
 }
@@ -1277,6 +1287,7 @@ fn save_state_settings() {
             adaptive_polling: s.adaptive_polling,
             notified_quota_windows: s.notified_quota_windows.iter().cloned().collect(),
             use_claude_desktop_sign_in: s.claude_desktop_sign_in,
+            antigravity_quota_group: s.antigravity_quota_group.clone(),
         });
     }
 }
@@ -3553,6 +3564,66 @@ unsafe fn append_menu_choice(menu: HMENU, id: u16, checked: bool, label: &str) {
     let _ = AppendMenuW(menu, flags, id as usize, PCWSTR::from_raw(label.as_ptr()));
 }
 
+/// Groups offered in the Antigravity quota menu: those Antigravity reported
+/// during this run, plus the saved choice when it has not been seen yet.
+fn antigravity_group_choices(current: Option<&str>) -> Vec<String> {
+    let mut groups = poller::antigravity_quota_groups();
+    if let Some(current) = current {
+        if !groups.iter().any(|g| g.eq_ignore_ascii_case(current)) {
+            groups.push(current.to_string());
+        }
+    }
+    groups.truncate(usize::from(
+        IDM_ANTIGRAVITY_GROUP_LAST - IDM_ANTIGRAVITY_GROUP_FIRST + 1,
+    ));
+    groups
+}
+
+unsafe fn append_antigravity_group_menu(models_menu: HMENU, language: LanguageId) {
+    let chinese = language == LanguageId::SimplifiedChinese;
+    let current = lock_state()
+        .as_ref()
+        .and_then(|s| s.antigravity_quota_group.clone());
+    let Ok(menu) = CreatePopupMenu() else {
+        return;
+    };
+    append_menu_choice(
+        menu,
+        IDM_ANTIGRAVITY_GROUP_AUTO,
+        current.is_none(),
+        if chinese {
+            "自动（Gemini 模型优先）"
+        } else {
+            "Auto (Gemini Models first)"
+        },
+    );
+    let groups = antigravity_group_choices(current.as_deref());
+    if !groups.is_empty() {
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    }
+    for (index, group) in groups.iter().enumerate() {
+        let checked = current
+            .as_deref()
+            .is_some_and(|current| current.eq_ignore_ascii_case(group));
+        // `&` would otherwise become a menu mnemonic.
+        append_menu_choice(
+            menu,
+            IDM_ANTIGRAVITY_GROUP_FIRST + index as u16,
+            checked,
+            &group.replace('&', "&&"),
+        );
+    }
+    append_submenu(
+        models_menu,
+        menu,
+        if chinese {
+            "Antigravity 配额"
+        } else {
+            "Antigravity quota"
+        },
+    );
+}
+
 unsafe fn append_submenu(parent: HMENU, child: HMENU, label: &str) {
     let label = native_interop::wide_str(label);
     let _ = AppendMenuW(
@@ -3653,6 +3724,7 @@ pub fn run() {
         let claude_code_available = poller::claude_code_credentials_available();
         let settings = load_settings(claude_code_available);
         poller::set_claude_desktop_sign_in(settings.use_claude_desktop_sign_in);
+        poller::set_antigravity_quota_group(settings.antigravity_quota_group.clone());
         set_widget_font(&settings.appearance);
         diagnose::log(format!(
             "Claude Desktop sign-in fallback enabled={}",
@@ -3764,6 +3836,7 @@ pub fn run() {
                 data_sources: Default::default(),
                 persisted: Default::default(),
                 claude_desktop_sign_in: settings.use_claude_desktop_sign_in,
+                antigravity_quota_group: settings.antigravity_quota_group.clone(),
                 recovery_gate: Default::default(),
                 recovery_watch: None,
                 hover_regions: Vec::new(),
@@ -4502,6 +4575,8 @@ enum PollTrigger {
     Resume,
     /// Internet access returned after being lost.
     NetworkRestored,
+    /// The Antigravity quota group choice changed: refresh Antigravity only.
+    AntigravityGroupChange,
 }
 
 /// `targeted` is the per-provider subset a trigger applies to: providers
@@ -4536,6 +4611,11 @@ fn poll_request(
         },
         PollTrigger::ResetBoundary => Request {
             providers: std::array::from_fn(|id| outside_codex_recovery[id] && past_reset[id]),
+            ignore_due: true,
+            ..Default::default()
+        },
+        PollTrigger::AntigravityGroupChange => Request {
+            providers: [false, false, enabled[2]],
             ignore_due: true,
             ..Default::default()
         },
@@ -6047,6 +6127,34 @@ unsafe extern "system" fn wnd_proc(
                     position_at_taskbar();
                     render_layered();
                 }
+                IDM_ANTIGRAVITY_GROUP_AUTO
+                | IDM_ANTIGRAVITY_GROUP_FIRST..=IDM_ANTIGRAVITY_GROUP_LAST => {
+                    let current = lock_state()
+                        .as_ref()
+                        .and_then(|s| s.antigravity_quota_group.clone());
+                    let choice = if id == IDM_ANTIGRAVITY_GROUP_AUTO {
+                        Some(None)
+                    } else {
+                        antigravity_group_choices(current.as_deref())
+                            .get(usize::from(id - IDM_ANTIGRAVITY_GROUP_FIRST))
+                            .map(|group| Some(group.clone()))
+                    };
+                    if let Some(choice) = choice.filter(|choice| *choice != current) {
+                        diagnose::log(format!(
+                            "Antigravity quota group set to {} (menu)",
+                            choice.as_deref().unwrap_or("Auto")
+                        ));
+                        poller::set_antigravity_quota_group(choice.clone());
+                        if let Some(s) = lock_state().as_mut() {
+                            s.antigravity_quota_group = choice;
+                        }
+                        save_state_settings();
+                        spawn_poll(
+                            SendHwnd::from_hwnd(hwnd),
+                            PollTrigger::AntigravityGroupChange,
+                        );
+                    }
+                }
                 IDM_CLAUDE_DESKTOP_SIGN_IN => {
                     let (enabled, language) = lock_state()
                         .as_ref()
@@ -6627,6 +6735,9 @@ fn show_context_menu(hwnd: HWND) {
             IDM_MODEL_ANTIGRAVITY as usize,
             PCWSTR::from_raw(antigravity_model.as_ptr()),
         );
+        if show_antigravity {
+            append_antigravity_group_menu(models_menu, language);
+        }
 
         let models_label = native_interop::wide_str(strings.models);
         let _ = AppendMenuW(
@@ -10407,6 +10518,7 @@ mod persisted_snapshot_tests {
             data_sources: Default::default(),
             persisted: Default::default(),
             claude_desktop_sign_in: true,
+            antigravity_quota_group: None,
             recovery_gate: Default::default(),
             recovery_watch: None,
             hover_regions: Vec::new(),

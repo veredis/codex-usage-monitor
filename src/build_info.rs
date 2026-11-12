@@ -2,7 +2,7 @@
 /// as "(Build n)"); `None` for a public release, which identifies by version
 /// alone. Kept separate from the package version so update comparisons
 /// remain semantic.
-pub const BUILD_NUMBER: Option<u32> = Some(18);
+pub const BUILD_NUMBER: Option<u32> = Some(19);
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -25,8 +25,8 @@ mod tests {
     #[test]
     fn identity_keeps_build_number_out_of_the_semantic_version() {
         assert_eq!(VERSION, "1.10.0-veredis.1");
-        assert_eq!(BUILD_NUMBER, Some(18), "local development build");
-        assert_eq!(identity(), "1.10.0-veredis.1 (Build 18)");
-        assert_eq!(build_label(), "18");
+        assert_eq!(BUILD_NUMBER, Some(19), "local development build");
+        assert_eq!(identity(), "1.10.0-veredis.1 (Build 19)");
+        assert_eq!(build_label(), "19");
     }
 }

@@ -118,6 +118,27 @@ pub fn set_claude_desktop_sign_in(enabled: bool) {
     CLAUDE_DESKTOP_SIGN_IN.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The Antigravity quota group the owner chose (`None` = Auto).
+static ANTIGRAVITY_QUOTA_GROUP: Mutex<Option<String>> = Mutex::new(None);
+/// Group names from the latest Antigravity quota summary, for the menu.
+static ANTIGRAVITY_QUOTA_GROUPS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Which Antigravity quota group to show: a group name as Antigravity reports
+/// it, or `None` for Auto (Gemini Models, else the first group).
+pub fn set_antigravity_quota_group(group: Option<String>) {
+    *ANTIGRAVITY_QUOTA_GROUP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = group;
+}
+
+/// The quota groups Antigravity reported most recently.
+pub fn antigravity_quota_groups() -> Vec<String> {
+    ANTIGRAVITY_QUOTA_GROUPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 #[derive(Default)]
 struct ClaudeObservation {
     observed_at: Option<SystemTime>,
@@ -942,6 +963,13 @@ fn poll_codex() -> Result<UsageData, PollError> {
 }
 
 fn poll_antigravity() -> Result<UsageData, PollError> {
+    // Antigravity's own language server reports every quota group with both
+    // windows, exactly as its panel shows them. Google's service is the
+    // fallback when Antigravity is not running.
+    if let Some(data) = fetch_antigravity_local_usage() {
+        return Ok(data);
+    }
+
     let creds = match read_antigravity_credentials() {
         Some(creds) => creds,
         None => {
@@ -1734,9 +1762,72 @@ fn antigravity_section_from_summary_bucket(
 /// Gemini group, and then under its own name. Allowances of different groups
 /// are never combined, and a Gemini group without a usable window shows that
 /// window as unavailable (`--`) rather than another group's values.
+///
+/// A group the owner chose (Antigravity quota menu) is shown whenever the
+/// response contains it; otherwise the Auto choice applies.
 fn antigravity_usage_from_summary(response: AntigravityQuotaSummaryResponse) -> Option<UsageData> {
     let groups = response.groups.unwrap_or_default();
     log_antigravity_summary_shape(&groups);
+    remember_antigravity_groups(&groups);
+    let preferred = ANTIGRAVITY_QUOTA_GROUP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    select_antigravity_group(&groups, preferred.as_deref())
+}
+
+/// Antigravity's local language server answers `{"response": <summary>}`.
+#[derive(Deserialize)]
+struct AntigravityLocalSummary {
+    response: Option<AntigravityQuotaSummaryResponse>,
+}
+
+fn fetch_antigravity_local_usage() -> Option<UsageData> {
+    let body = crate::antigravity_local::retrieve_user_quota_summary()?;
+    let summary = match serde_json::from_str::<AntigravityLocalSummary>(&body) {
+        Ok(summary) => summary.response?,
+        Err(error) => {
+            diagnose::log_error(
+                "unable to parse the Antigravity language server quota summary",
+                error,
+            );
+            return None;
+        }
+    };
+    antigravity_usage_from_summary(summary)
+}
+
+/// Keeps every group name seen during this run (first-seen order) so the menu
+/// can offer a group even while only Google's partial summary is available.
+fn remember_antigravity_groups(groups: &[AntigravityQuotaSummaryGroup]) {
+    const MAX_GROUPS: usize = 8;
+    let mut known = ANTIGRAVITY_QUOTA_GROUPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for label in groups.iter().filter_map(antigravity_group_label) {
+        if known.len() < MAX_GROUPS && !known.iter().any(|k| k.eq_ignore_ascii_case(&label)) {
+            known.push(label);
+        }
+    }
+}
+
+fn select_antigravity_group(
+    groups: &[AntigravityQuotaSummaryGroup],
+    preferred: Option<&str>,
+) -> Option<UsageData> {
+    if let Some(preferred) = preferred {
+        let chosen = groups.iter().find(|group| {
+            antigravity_group_label(group)
+                .is_some_and(|label| label.eq_ignore_ascii_case(preferred))
+        });
+        if let Some(group) = chosen {
+            // A window the group does not have (Gemini 4 Argon has no 5h
+            // limit) shows as unavailable.
+            let mut data = antigravity_usage_from_summary_group(group).unwrap_or_default();
+            data.quota_group = antigravity_group_label(group);
+            return Some(data);
+        }
+    }
 
     let gemini = groups
         .iter()
@@ -3731,5 +3822,65 @@ garbage line provider request started provider=claude
         assert!(!window_exhausted(99.99));
         assert!(window_exhausted(100.0));
         assert!(window_exhausted(120.0));
+    }
+
+    /// The local language server response shape (2026-11-12, descriptions
+    /// trimmed): every group with its own windows, as Antigravity's panel.
+    const LOCAL_SUMMARY: &str = r#"{"response":{"groups":[
+        {"displayName":"Gemini Models","description":"Models within this group: Gemini Flash, Gemini Pro","buckets":[
+            {"bucketId":"gemini-weekly","displayName":"Weekly Limit Remaining","window":"weekly","remainingFraction":0.98649085,"resetTime":"2026-11-18T11:52:55Z"},
+            {"bucketId":"gemini-5h","displayName":"Five Hour Limit Remaining","window":"5h","remainingFraction":0.9987804,"resetTime":"2026-11-12T17:44:57Z"}]},
+        {"displayName":"Claude and GPT models","buckets":[
+            {"bucketId":"3p-weekly","window":"weekly","remainingFraction":0.9609568,"resetTime":"2026-11-13T03:35:17Z"},
+            {"bucketId":"3p-5h","window":"5h","remainingFraction":0.9545424,"resetTime":"2026-11-12T17:44:33Z"}]},
+        {"displayName":"Gemini 4 Argon","buckets":[
+            {"bucketId":"gemini-argon-wtu-weekly","displayName":"Gemini 4 Argon Weekly Limit","window":"weekly","remainingFraction":0.8438432,"resetTime":"2026-11-18T11:51:57Z"}]}],
+        "description":"Within each group, models share a weekly limit and a 5-hour limit."}}"#;
+
+    fn local_groups() -> Vec<AntigravityQuotaSummaryGroup> {
+        let local: AntigravityLocalSummary =
+            serde_json::from_str(LOCAL_SUMMARY).expect("local summary should deserialize");
+        local.response.unwrap().groups.unwrap()
+    }
+
+    #[test]
+    fn auto_shows_gemini_models_from_the_local_summary() {
+        let data = select_antigravity_group(&local_groups(), None).unwrap();
+        assert_eq!(data.quota_group.as_deref(), Some("Gemini Models"));
+        assert!((data.session.percentage - 0.12196).abs() < 1e-3);
+        assert!((data.weekly.percentage - 1.350915).abs() < 1e-3);
+        assert_eq!(
+            data.weekly.resets_at,
+            parse_iso8601(Some("2026-11-18T11:52:55Z"))
+        );
+        // A server that is not signed in answers without a summary.
+        assert!(serde_json::from_str::<AntigravityLocalSummary>("{}")
+            .unwrap()
+            .response
+            .is_none());
+    }
+
+    #[test]
+    fn a_chosen_antigravity_group_is_shown_with_only_the_windows_it_has() {
+        let groups = local_groups();
+        let claude = select_antigravity_group(&groups, Some("claude and gpt models")).unwrap();
+        assert_eq!(claude.quota_group.as_deref(), Some("Claude and GPT models"));
+        assert!((claude.session.percentage - 4.54576).abs() < 1e-3);
+        assert!((claude.weekly.percentage - 3.90432).abs() < 1e-3);
+
+        let argon = select_antigravity_group(&groups, Some("Gemini 4 Argon")).unwrap();
+        assert_eq!(argon.quota_group.as_deref(), Some("Gemini 4 Argon"));
+        assert!(!argon.session.available, "Argon has no 5h limit");
+        assert!(argon.weekly.available);
+        assert!((argon.weekly.percentage - 15.61568).abs() < 1e-3);
+
+        // A chosen group missing from the response (Google's partial
+        // summary) falls back to Auto, labelled with the group shown.
+        let partial: Vec<_> = groups.into_iter().skip(1).take(1).collect();
+        let fallback = select_antigravity_group(&partial, Some("Gemini 4 Argon")).unwrap();
+        assert_eq!(
+            fallback.quota_group.as_deref(),
+            Some("Claude and GPT models")
+        );
     }
 }
