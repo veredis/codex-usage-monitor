@@ -235,6 +235,9 @@ const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
 const WM_APP_REARM_POLL: u32 = WM_APP + 4;
 /// From the watchdog: the preferred taskbar is present but not in use.
 const WM_APP_TASKBARS_CHANGED: u32 = WM_APP + 6;
+/// Arms TIMER_LAYOUT_RECONCILE on the UI thread (wParam: delay in ms) for a
+/// placement made on a provider worker.
+const WM_APP_ARM_LAYOUT_RECONCILE: u32 = WM_APP + 7;
 const TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS: u64 = 750;
 
 /// How often the watchdog thread polls for an explorer.exe restart (which
@@ -243,6 +246,9 @@ const TASKBAR_WATCH_INTERVAL_SECS: u64 = 2;
 
 /// Coalesces shell layout events so none is dropped; see taskbar_layout.
 static LAYOUT_GATE: Mutex<LayoutEventGate> = Mutex::new(LayoutEventGate::new());
+/// Ignores one-off notification-area readings; see taskbar_layout::BoundaryGate.
+static BOUNDARY_GATE: Mutex<taskbar_layout::BoundaryGate> =
+    Mutex::new(taskbar_layout::BoundaryGate::new());
 /// Set only by the Exit command. Any other WM_DESTROY means Windows destroyed
 /// our parent taskbar (for example a disconnected display); the message loop
 /// then stays alive for watchdog recovery (adapted from upstream PR #27, ddddyyyy).
@@ -1502,7 +1508,9 @@ fn append_quota_alerts(
         .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
         .map(|value| value.as_secs().to_string())
         .unwrap_or_else(|| "unknown".to_string());
-    let remaining = poller::remaining_percentage(section.percentage).round() as u8;
+    // Decisions use the exact remainder: 0.4% left is not exhausted, even
+    // though a whole-percent display would round it to 0%.
+    let remaining = poller::remaining_percentage(section.percentage);
 
     let exhausted_prefix = format!("{provider_key}:{window_key}:exhausted:");
     let (exhausted_key, exhausted_notified) = reconcile_quota_alert_window(
@@ -1515,7 +1523,7 @@ fn append_quota_alerts(
     // A direct jump to 0% is represented by the exhaustion alert only. If the
     // threshold alert was sent on an earlier poll, the independent exhaustion
     // alert is still allowed through here.
-    if remaining == 0 {
+    if poller::window_exhausted(section.percentage) {
         for threshold in thresholds {
             let (threshold_key, threshold_notified) =
                 threshold_alert_key(notified, provider_key, window_key, *threshold, &reset_key);
@@ -1544,7 +1552,7 @@ fn append_quota_alerts(
         .filter_map(|threshold| {
             let (key, notified_already) =
                 threshold_alert_key(notified, provider_key, window_key, *threshold, &reset_key);
-            (remaining <= *threshold && !notified_already).then_some((*threshold, key))
+            (remaining <= f64::from(*threshold) && !notified_already).then_some((*threshold, key))
         })
         .collect::<Vec<_>>();
     if let Some((deepest_threshold, deepest_key)) = breached
@@ -1644,16 +1652,17 @@ fn append_quota_alert_notification(
     provider_label: &str,
     window_label: &str,
     section: &crate::models::UsageSection,
-    remaining: u8,
+    remaining: f64,
     alert_type: QuotaAlertType,
 ) {
     let reset = format_precise_reset_time(section.resets_at);
+    let remaining = poller::format_percent(remaining);
     let (title, message) = if language == LanguageId::SimplifiedChinese {
         match alert_type {
             QuotaAlertType::Threshold => (
                 format!("{provider_label} 额度提醒"),
                 format!(
-                    "{window_label}额度仅剩 {remaining}%，重置时间：{}",
+                    "{window_label}额度仅剩 {remaining}，重置时间：{}",
                     reset.unwrap_or_else(|| "未知".to_string())
                 ),
             ),
@@ -1670,7 +1679,7 @@ fn append_quota_alert_notification(
             QuotaAlertType::Threshold => (
                 format!("{provider_label} quota alert"),
                 format!(
-                    "{window_label} quota has {remaining}% remaining. Reset: {}",
+                    "{window_label} quota has {remaining} remaining. Reset: {}",
                     reset.unwrap_or_else(|| "unknown".to_string())
                 ),
             ),
@@ -2125,6 +2134,15 @@ fn refresh_usage_texts(state: &mut AppState) {
     // Age against each provider's own cadence, never against an escalating
     // error delay or another provider's backoff.
     let base_interval = effective_poll_interval_ms(state);
+    // Without any data the row keeps its error label; only a reported
+    // provider's missing window reads `--`.
+    let has_data: [bool; provider_schedule::PROVIDERS] = std::array::from_fn(|id| {
+        state
+            .data
+            .as_ref()
+            .and_then(|data| provider_usage(data, id))
+            .is_some()
+    });
     let unknown = [
         [state.session_percent, state.weekly_percent],
         [state.codex_session_percent, state.codex_weekly_percent],
@@ -2134,6 +2152,8 @@ fn refresh_usage_texts(state: &mut AppState) {
         ],
     ]
     .map(|row| row.map(f64::is_nan));
+    let unknown: [[bool; 2]; provider_schedule::PROVIDERS] =
+        std::array::from_fn(|id| unknown[id].map(|nan| nan && has_data[id]));
     let resets = window_reset_states(state, now);
     for (id, session, weekly) in [
         (0, &mut state.session_text, &mut state.weekly_text),
@@ -2211,7 +2231,9 @@ fn sync_provider_percents(state: &mut AppState, now: SystemTime) {
                     }
                 })
             })
-            .unwrap_or([0.0, 0.0]);
+            // No data at all (never fetched, or the sign-in is unavailable)
+            // is unknown, not 0% used: an empty bar, never a full one.
+            .unwrap_or([f64::NAN, f64::NAN]);
         let (session, weekly) = match id {
             CLAUDE => (&mut state.session_percent, &mut state.weekly_percent),
             CODEX => (
@@ -2225,6 +2247,20 @@ fn sync_provider_percents(state: &mut AppState, now: SystemTime) {
         };
         (*session, *weekly) = (values[0], values[1]);
     }
+}
+
+/// Milliseconds until the provider's nearest reported future reset.
+fn until_next_reset_ms(state: &AppState, id: usize, now: SystemTime) -> Option<u64> {
+    let usage = state
+        .data
+        .as_ref()
+        .and_then(|data| provider_usage(data, id))?;
+    [&usage.session, &usage.weekly]
+        .iter()
+        .filter(|section| section.available)
+        .filter_map(|section| section.resets_at?.duration_since(now).ok())
+        .map(|until| u64::try_from(until.as_millis()).unwrap_or(u64::MAX))
+        .min()
 }
 
 /// Providers whose shown values predate a reset that has now passed and
@@ -3254,8 +3290,8 @@ fn codex_credit_panel_visible(
 }
 
 fn codex_included_usage_exhausted(codex: &crate::models::UsageData) -> bool {
-    poller::remaining_percentage(codex.session.percentage).round() == 0.0
-        || poller::remaining_percentage(codex.weekly.percentage).round() == 0.0
+    poller::window_exhausted(codex.session.percentage)
+        || poller::window_exhausted(codex.weekly.percentage)
 }
 
 fn credit_panel_reason(
@@ -5007,12 +5043,25 @@ fn apply_provider_poll(hwnd: HWND, id: usize, generation: u64, result: poller::P
             codex_auth_delay_ms,
             base_interval,
         );
-        state.schedule.finish(
-            id,
-            now,
-            outcome,
-            provider_schedule::provider_interval_ms(id, base_interval),
-        );
+        let interval = provider_schedule::provider_interval_ms(id, base_interval);
+        let next_delay = if outcome == provider_schedule::Outcome::Success {
+            let aligned = provider_schedule::reset_aligned_delay_ms(
+                id,
+                interval,
+                until_next_reset_ms(state, id, SystemTime::now()),
+            );
+            if aligned != interval {
+                diagnose::log(format!(
+                    "{} next request aligned to just after the reset in {} ms",
+                    poller::provider_name(id),
+                    aligned
+                ));
+            }
+            aligned
+        } else {
+            interval
+        };
+        state.schedule.finish(id, now, outcome, next_delay);
         if let provider_schedule::Outcome::Transient { server_delay_ms } = outcome {
             diagnose::log(format!(
                 "{} poll failure retry={} server_retry_after_ms={server_delay_ms:?}; other providers keep their own schedules",
@@ -5313,7 +5362,38 @@ fn position_at_taskbar_with_width(widget_width: i32) -> Option<(RECT, RECT)> {
         }
     };
 
-    let tray_left = tray_left_for_taskbar(taskbar_hwnd, taskbar_rect);
+    let reading = tray_left_for_taskbar(taskbar_hwnd, taskbar_rect);
+    let decision = BOUNDARY_GATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .decide(
+            Instant::now(),
+            taskbar_hwnd.0 as isize,
+            taskbar_rect,
+            reading,
+        );
+    let tray_left = match decision {
+        taskbar_layout::BoundaryDecision::Use(boundary) => boundary,
+        taskbar_layout::BoundaryDecision::Hold {
+            boundary,
+            recheck_ms,
+        } => {
+            diagnose::log(format!(
+                "notification boundary reading {} not yet confirmed; keeping {} and re-reading in {recheck_ms} ms",
+                reading - taskbar_rect.left,
+                boundary - taskbar_rect.left
+            ));
+            unsafe {
+                let _ = PostMessageW(
+                    hwnd,
+                    WM_APP_ARM_LAYOUT_RECONCILE,
+                    WPARAM(recheck_ms as usize),
+                    LPARAM(0),
+                );
+            }
+            boundary
+        }
+    };
     let occupied = native_interop::visible_child_window_rects(taskbar_hwnd, Some(hwnd));
     let anchor = position_anchor_left(taskbar_rect, tray_left, &occupied, manual_position);
     let widget_height = widget_height_for(taskbar_rect);
@@ -5456,6 +5536,10 @@ unsafe extern "system" fn wnd_proc(
                 );
             }
             LRESULT(1)
+        }
+        WM_APP_ARM_LAYOUT_RECONCILE => {
+            arm_layout_reconcile(hwnd, u32::try_from(wparam.0).unwrap_or(u32::MAX));
+            LRESULT(0)
         }
         WM_APP_TASKBARS_CHANGED => {
             if refresh_taskbar_selection(hwnd) {
@@ -7406,14 +7490,20 @@ fn hover_text(state: &AppState, region: &HoverRegion, now: SystemTime) -> Option
         poller::UsageWindowKind::Weekly => strings.weekly_window,
     };
     let health = &state.provider_health[region.provider];
-    let section = state
+    let usage = state
         .data
         .as_ref()
-        .and_then(|data| provider_usage(data, region.provider))
-        .map(|usage| match region.window {
-            poller::UsageWindowKind::Session => &usage.session,
-            poller::UsageWindowKind::Weekly => &usage.weekly,
-        })?;
+        .and_then(|data| provider_usage(data, region.provider))?;
+    // Name the quota group when the provider reports several (Antigravity's
+    // Gemini Models versus its other model groups).
+    let name = match usage.quota_group.as_deref() {
+        Some(group) => format!("{name} ({group})"),
+        None => name.to_string(),
+    };
+    let section = match region.window {
+        poller::UsageWindowKind::Session => &usage.session,
+        poller::UsageWindowKind::Weekly => &usage.weekly,
+    };
     if !section.available {
         return Some(if chinese {
             format!("{name} {window}：账号未提供此限额。\n-- 表示无数据，并非已用 0% 或剩余 100%。")
@@ -8158,6 +8248,7 @@ mod tests {
                     available: true,
                 },
                 credits,
+                quota_group: None,
             }),
             ..AppUsageData::default()
         }
@@ -9185,6 +9276,44 @@ mod tests {
         assert_eq!(alerts[1].title, "Codex quota exhausted");
         assert!(alerts[1].message.contains("5-hour quota has 0% remaining"));
         assert_eq!(notified.len(), 2);
+    }
+
+    #[test]
+    fn a_positive_remainder_below_one_percent_is_low_not_exhausted() {
+        for remaining in [0.01, 0.5, 0.99] {
+            let mut alerts = Vec::new();
+            let mut notified = BTreeSet::new();
+            append_test_codex_session_alert(&mut alerts, &mut notified, 5, remaining, 0);
+            assert_eq!(alerts.len(), 1, "{remaining}");
+            assert_eq!(alerts[0].title, "Codex quota alert");
+            assert!(alerts[0].message.contains("5-hour quota has <1% remaining"));
+            // Exhaustion is still announced once the remainder reaches 0.
+            append_test_codex_session_alert(&mut alerts, &mut notified, 5, 0.0, 0);
+            assert_eq!(alerts.len(), 2);
+            assert_eq!(alerts[1].title, "Codex quota exhausted");
+        }
+        // 1% left breaches a 1% threshold, and is not exhaustion.
+        let mut alerts = Vec::new();
+        let mut notified = BTreeSet::new();
+        append_test_codex_session_alert(&mut alerts, &mut notified, 1, 1.0, 0);
+        assert_eq!(alerts[0].title, "Codex quota alert");
+        assert!(alerts[0].message.contains("has 1% remaining"));
+    }
+
+    #[test]
+    fn credits_when_needed_wait_for_real_exhaustion() {
+        let nearly = test_codex_data(Some(CreditBalance::Amount(12.0)), 0.4, 25.0);
+        assert!(!codex_credit_panel_visible(
+            true,
+            CreditDisplayMode::WhenNeeded,
+            Some(&nearly)
+        ));
+        let weekly_empty = test_codex_data(Some(CreditBalance::Amount(12.0)), 40.0, 0.0);
+        assert!(codex_credit_panel_visible(
+            true,
+            CreditDisplayMode::WhenNeeded,
+            Some(&weekly_empty)
+        ));
     }
 
     #[test]
@@ -10320,6 +10449,7 @@ mod persisted_snapshot_tests {
                 resets_at: Some(weekly_reset),
                 available: true,
             },
+            quota_group: None,
             credits: None,
         }
     }
@@ -10401,6 +10531,32 @@ mod persisted_snapshot_tests {
     /// countdown reached zero and the row went empty (`--`) until the next
     /// poll. Now the last confirmed value stays, marked stale and without a
     /// countdown, for a bounded grace; nothing new is invented.
+    #[test]
+    fn a_provider_without_any_data_shows_empty_bars_and_its_error_label() {
+        // Field case: Antigravity's sign-in expired and no snapshot is
+        // restored; its bars were drawn full (0% used) beside the `!`.
+        let now = SystemTime::now();
+        let hour = Duration::from_secs(3600);
+        let mut state = state();
+        state.show_antigravity = true;
+        let invalidate = state.provider_health[CLAUDE].record(Some("account".into()), None, now);
+        merge_provider_result(
+            state.data.get_or_insert_with(Default::default),
+            CLAUDE,
+            Some(usage(10.0, now + hour, 20.0, now + 24 * hour)),
+            invalidate,
+        );
+        state.provider_health[2].record(None, Some(PollError::TokenExpired), now);
+        state.last_poll_ok = true;
+        refresh_usage_texts(&mut state);
+        assert!(state.antigravity_session_percent.is_nan());
+        assert!(state.antigravity_weekly_percent.is_nan());
+        let label = poll_error_display_label(PollError::TokenExpired, state.language);
+        assert_eq!(state.antigravity_session_text, label);
+        assert_eq!(state.antigravity_weekly_text, label);
+        assert_eq!(state.session_percent, 10.0);
+    }
+
     #[test]
     fn five_hour_rollover_keeps_the_last_value_stale_until_fresh_data() {
         let now = SystemTime::now();

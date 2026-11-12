@@ -46,6 +46,9 @@ struct StoredCache {
     weekly: StoredSection,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     credits: Option<StoredCredits>,
+    /// The provider's quota group (Antigravity). Absent for providers with one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quota_group: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -79,6 +82,13 @@ fn file_name(id: usize) -> Option<&'static str> {
 /// The snapshot for `id` when it belongs to `scope` and is still plausible.
 pub fn load(id: usize, scope: &str) -> Option<Snapshot> {
     load_from(&cache_dir()?.join(file_name(id)?), scope, SystemTime::now())
+        .filter(|snapshot| restorable(id, snapshot))
+}
+
+/// Antigravity snapshots written before Build 18 do not say which quota group
+/// they hold, and earlier builds could pick the wrong one: not restored.
+fn restorable(id: usize, snapshot: &Snapshot) -> bool {
+    id != 2 || snapshot.data.quota_group.is_some()
 }
 
 /// Persist a successful observation. Older or equal-time observations never
@@ -104,7 +114,10 @@ pub fn should_write(previous: Option<&Snapshot>, data: &UsageData, updated_at: S
 }
 
 fn same_values(a: &UsageData, b: &UsageData) -> bool {
-    a.session == b.session && a.weekly == b.weekly && a.credits == b.credits
+    a.session == b.session
+        && a.weekly == b.weekly
+        && a.credits == b.credits
+        && a.quota_group == b.quota_group
 }
 
 fn load_from(path: &Path, scope: &str, now: SystemTime) -> Option<Snapshot> {
@@ -224,6 +237,7 @@ fn to_stored(scope: &str, data: &UsageData, updated_at: SystemTime) -> Option<St
         session: section(&data.session)?,
         weekly: section(&data.weekly)?,
         credits,
+        quota_group: data.quota_group.clone(),
     })
 }
 
@@ -254,6 +268,7 @@ fn from_stored(stored: &StoredCache) -> Option<UsageData> {
         session: section(&stored.session)?,
         weekly: section(&stored.weekly)?,
         credits,
+        quota_group: stored.quota_group.clone(),
     })
 }
 
@@ -307,6 +322,7 @@ mod tests {
                 resets_at: None,
                 available: false,
             },
+            quota_group: None,
             credits: Some(CreditBalance::Amount(12.5)),
         }
     }
@@ -325,6 +341,33 @@ mod tests {
         assert_eq!(loaded.data.credits, Some(CreditBalance::Amount(12.5)));
         let text = std::fs::read_to_string(dir.file()).unwrap();
         assert!(!text.contains("token") && !text.contains('@'));
+    }
+
+    #[test]
+    fn antigravity_snapshots_keep_their_group_and_unlabelled_ones_are_not_restored() {
+        let dir = TempDir::new();
+        // A file without a group, as written before Build 18.
+        save_to(&dir.file(), &scope('a'), &data(2.0), at(NOW - 30), at(NOW)).unwrap();
+        let text = std::fs::read_to_string(dir.file()).unwrap();
+        assert!(
+            !text.contains("quota_group"),
+            "unchanged format without a group"
+        );
+        let old = load_from(&dir.file(), &scope('a'), at(NOW)).unwrap();
+        assert!(!restorable(2, &old));
+        assert!(restorable(0, &old) && restorable(1, &old));
+
+        let mut gemini = data(0.0);
+        gemini.quota_group = Some("Gemini Models".into());
+        save_to(&dir.file(), &scope('a'), &gemini, at(NOW - 10), at(NOW)).unwrap();
+        let loaded = load_from(&dir.file(), &scope('a'), at(NOW)).unwrap();
+        assert_eq!(loaded.data.quota_group.as_deref(), Some("Gemini Models"));
+        assert!(restorable(2, &loaded));
+        assert!(!same_values(&old.data, &{
+            let mut relabelled = old.data.clone();
+            relabelled.quota_group = Some("Gemini Models".into());
+            relabelled
+        }));
     }
 
     #[test]

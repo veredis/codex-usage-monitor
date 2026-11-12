@@ -27,6 +27,32 @@ pub fn provider_interval_ms(id: usize, base_ms: u32) -> u32 {
     }
 }
 
+/// A regular Claude request due this close before a known reset is moved to
+/// just after it. Requests stay at least `CLAUDE_MIN_POLL_MS` apart, so
+/// otherwise the first post-reset reading could trail the reset by up to that
+/// long while the row shows the old value marked `!`.
+pub const RESET_ALIGN_WINDOW_MS: u32 = 60_000;
+/// Margin after the reset, so the provider has rolled the window over.
+pub const RESET_ALIGN_MARGIN_MS: u32 = 5_000;
+
+/// Delay until the next regular request after a success, given the time
+/// until the provider's nearest future reset. Only Claude is aligned (other
+/// providers poll often enough); the request count never grows, and the
+/// moved request is at most `RESET_ALIGN_WINDOW_MS + RESET_ALIGN_MARGIN_MS`
+/// later than planned, inside the stale threshold of twice the cadence.
+pub fn reset_aligned_delay_ms(id: usize, delay_ms: u32, until_reset_ms: Option<u64>) -> u32 {
+    match until_reset_ms {
+        Some(until)
+            if id == CLAUDE
+                && until > u64::from(delay_ms)
+                && until - u64::from(delay_ms) < u64::from(RESET_ALIGN_WINDOW_MS) =>
+        {
+            u32::try_from(until + u64::from(RESET_ALIGN_MARGIN_MS)).unwrap_or(u32::MAX)
+        }
+        _ => delay_ms,
+    }
+}
+
 fn min_request_spacing(id: usize) -> Duration {
     if id == CLAUDE {
         Duration::from_millis(u64::from(CLAUDE_MIN_POLL_MS))
@@ -251,6 +277,41 @@ mod tests {
 
     fn secs(s: u64) -> Duration {
         Duration::from_secs(s)
+    }
+
+    #[test]
+    fn claude_requests_due_just_before_a_reset_move_to_just_after_it() {
+        let interval = CLAUDE_MIN_POLL_MS;
+        // Next request would land 30 s before the reset: moved to reset + 5 s.
+        assert_eq!(
+            reset_aligned_delay_ms(CLAUDE, interval, Some(150_000)),
+            155_000
+        );
+        // Far from the reset, after it, or no reset: unchanged.
+        for until in [Some(181_000), Some(60_000), Some(120_000), None] {
+            assert_eq!(reset_aligned_delay_ms(CLAUDE, interval, until), interval);
+        }
+        // Other providers poll often enough and are never moved.
+        assert_eq!(reset_aligned_delay_ms(CODEX, S30, Some(40_000)), S30);
+        // The moved request stays inside the stale threshold (2x cadence).
+        for until in (interval as u64 + 1)..(interval + RESET_ALIGN_WINDOW_MS) as u64 {
+            let delay = reset_aligned_delay_ms(CLAUDE, interval, Some(until));
+            assert!(delay >= interval && delay < 2 * interval);
+        }
+    }
+
+    #[test]
+    fn a_reset_aligned_claude_request_reads_the_new_window_within_seconds() {
+        // Success at t0; the 5h reset is at t0 + 150 s. Without alignment the
+        // request would run at t0 + 120 s and the next allowed one at
+        // t0 + 240 s, 90 s after the reset.
+        let t0 = Instant::now();
+        let mut schedule = ProviderSchedule::default();
+        assert!(schedule.begin(t0, scheduled())[CLAUDE]);
+        let delay = reset_aligned_delay_ms(CLAUDE, CLAUDE_MIN_POLL_MS, Some(150_000));
+        schedule.finish(CLAUDE, t0, Outcome::Success, delay);
+        assert!(!schedule.begin(t0 + secs(120), scheduled())[CLAUDE]);
+        assert!(schedule.begin(t0 + secs(155), scheduled())[CLAUDE]);
     }
 
     #[test]

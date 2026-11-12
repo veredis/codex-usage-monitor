@@ -19,6 +19,9 @@ pub struct UsageData {
     pub session: UsageSection,
     pub weekly: UsageSection,
     pub credits: Option<CreditBalance>,
+    /// The provider's name for the quota group shown, when it reports several
+    /// (Antigravity: "Gemini Models"). Live data only; not persisted.
+    pub quota_group: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]

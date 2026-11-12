@@ -103,6 +103,105 @@ pub fn safe_anchor_left(taskbar: RECT, boundary: i32, occupied: &[RECT]) -> i32 
         .max(taskbar.left)
 }
 
+/// A suspicious boundary reading must be seen again this much later before
+/// the widget follows it.
+pub const BOUNDARY_CONFIRM_MS: u64 = 750;
+/// A boundary that keeps changing is accepted after this long regardless.
+pub const BOUNDARY_MAX_HOLD_MS: u64 = 5_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundaryDecision {
+    /// Place the widget against this boundary.
+    Use(i32),
+    /// The reading was not confirmed: keep `boundary` (the last confirmed
+    /// one) and re-read after `recheck_ms`.
+    Hold { boundary: i32, recheck_ms: u32 },
+}
+
+/// Explorer briefly reports transient notification-area geometry while the
+/// shell reflows (seen in the field: the tray's left edge at 302 or 1198 px
+/// instead of 1838, or no tray window at all, which falls back to a
+/// reservation over the tray icons), then reports the real geometry again.
+/// Following every reading moved the widget onto the task buttons or the
+/// tray for seconds. The gate follows ordinary tray growth at once (the
+/// widget must make room) and a new taskbar or taskbar size at once, but a
+/// boundary moving right, or jumping left by more than about two tray icons,
+/// only once a second reading `BOUNDARY_CONFIRM_MS` later agrees.
+#[derive(Debug, Default)]
+pub struct BoundaryGate {
+    confirmed: Option<(isize, RECT, i32)>,
+    pending: Option<(i32, Instant)>,
+    diverged_since: Option<Instant>,
+}
+
+impl BoundaryGate {
+    pub const fn new() -> Self {
+        Self {
+            confirmed: None,
+            pending: None,
+            diverged_since: None,
+        }
+    }
+
+    pub fn decide(
+        &mut self,
+        now: Instant,
+        taskbar_key: isize,
+        taskbar: RECT,
+        reading: i32,
+    ) -> BoundaryDecision {
+        let Some(last) = self
+            .confirmed
+            .filter(|(key, rect, _)| *key == taskbar_key && *rect == taskbar)
+            .map(|(_, _, boundary)| boundary)
+        else {
+            return self.accept(taskbar_key, taskbar, reading);
+        };
+        let growth = last - reading;
+        let height = (taskbar.bottom - taskbar.top).max(1);
+        if growth == 0 || (growth > 0 && growth <= height.saturating_mul(2)) {
+            return self.accept(taskbar_key, taskbar, reading);
+        }
+        let since = *self.diverged_since.get_or_insert(now);
+        if now.duration_since(since) >= Duration::from_millis(BOUNDARY_MAX_HOLD_MS) {
+            return self.accept(taskbar_key, taskbar, reading);
+        }
+        match self.pending {
+            Some((pending, seen)) if pending == reading => {
+                let waited = now.duration_since(seen);
+                let confirm = Duration::from_millis(BOUNDARY_CONFIRM_MS);
+                if waited >= confirm {
+                    return self.accept(taskbar_key, taskbar, reading);
+                }
+                BoundaryDecision::Hold {
+                    boundary: last,
+                    recheck_ms: millis_ceil(confirm - waited),
+                }
+            }
+            _ => {
+                self.pending = Some((reading, now));
+                BoundaryDecision::Hold {
+                    boundary: last,
+                    recheck_ms: BOUNDARY_CONFIRM_MS as u32,
+                }
+            }
+        }
+    }
+
+    fn accept(&mut self, taskbar_key: isize, taskbar: RECT, reading: i32) -> BoundaryDecision {
+        self.confirmed = Some((taskbar_key, taskbar, reading));
+        self.pending = None;
+        self.diverged_since = None;
+        BoundaryDecision::Use(reading)
+    }
+}
+
+fn millis_ceil(duration: Duration) -> u32 {
+    u32::try_from(duration.as_nanos().div_ceil(1_000_000))
+        .unwrap_or(u32::MAX)
+        .max(1)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Placement {
     /// Desktop coordinates; callers map them into the parent's client area.
@@ -423,6 +522,106 @@ mod tests {
         let placement = compute_placement(top, 2200, 426, 69, 0);
         assert_eq!(placement.rect.top, 3);
         assert_eq!(placement.rect.bottom, 72);
+    }
+
+    fn ms(value: u64) -> Duration {
+        Duration::from_millis(value)
+    }
+
+    #[test]
+    fn transient_tray_readings_from_the_field_log_never_move_the_widget() {
+        // Field log (PID 39360): boundaries 302, 1198 and the 2368 fallback
+        // (no tray window) each appeared for one reading, then 1838 again.
+        let start = Instant::now();
+        let mut gate = BoundaryGate::new();
+        assert_eq!(
+            gate.decide(start, 1, TASKBAR, 1838),
+            BoundaryDecision::Use(1838)
+        );
+        for (step, transient) in [302, 1198, 2368, 1870].into_iter().enumerate() {
+            let at = start + ms(10_000 * (step as u64 + 1));
+            assert_eq!(
+                gate.decide(at, 1, TASKBAR, transient),
+                BoundaryDecision::Hold {
+                    boundary: 1838,
+                    recheck_ms: BOUNDARY_CONFIRM_MS as u32
+                }
+            );
+            // The re-read finds the real tray again.
+            assert_eq!(
+                gate.decide(at + ms(BOUNDARY_CONFIRM_MS), 1, TASKBAR, 1838),
+                BoundaryDecision::Use(1838)
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_tray_growth_applies_at_once_and_lasting_changes_are_confirmed() {
+        let start = Instant::now();
+        let mut gate = BoundaryGate::new();
+        gate.decide(start, 1, TASKBAR, 1838);
+        // A new tray icon (28 px) must push the widget left immediately.
+        assert_eq!(
+            gate.decide(start, 1, TASKBAR, 1810),
+            BoundaryDecision::Use(1810)
+        );
+        // The icon goes away: the widget follows once the reading holds.
+        assert!(matches!(
+            gate.decide(start + ms(100), 1, TASKBAR, 1838),
+            BoundaryDecision::Hold { boundary: 1810, .. }
+        ));
+        assert_eq!(
+            gate.decide(start + ms(400), 1, TASKBAR, 1838),
+            BoundaryDecision::Hold {
+                boundary: 1810,
+                recheck_ms: 450
+            }
+        );
+        assert_eq!(
+            gate.decide(start + ms(850), 1, TASKBAR, 1838),
+            BoundaryDecision::Use(1838)
+        );
+        // A large real growth (many icons at once) also follows when confirmed.
+        assert!(matches!(
+            gate.decide(start + ms(2_000), 1, TASKBAR, 1500),
+            BoundaryDecision::Hold { .. }
+        ));
+        assert_eq!(
+            gate.decide(start + ms(2_750), 1, TASKBAR, 1500),
+            BoundaryDecision::Use(1500)
+        );
+    }
+
+    #[test]
+    fn new_taskbar_or_size_is_used_at_once_and_unsettled_geometry_is_bounded() {
+        let start = Instant::now();
+        let mut gate = BoundaryGate::new();
+        gate.decide(start, 1, TASKBAR, 1838);
+        // Another display's taskbar, or a resized taskbar: no history applies.
+        assert_eq!(
+            gate.decide(start, 2, TASKBAR, 600),
+            BoundaryDecision::Use(600)
+        );
+        let taller = RECT {
+            top: 1008,
+            ..TASKBAR
+        };
+        assert_eq!(
+            gate.decide(start, 2, taller, 1700),
+            BoundaryDecision::Use(1700)
+        );
+        // Readings that never settle are still followed after the bound.
+        let mut now = start;
+        let mut decision = BoundaryDecision::Use(0);
+        for value in (0..12).map(|step| 1900 + step * 50) {
+            now += ms(700);
+            decision = gate.decide(now, 2, taller, value);
+            if matches!(decision, BoundaryDecision::Use(_)) {
+                break;
+            }
+        }
+        assert!(now - start <= ms(BOUNDARY_MAX_HOLD_MS + 1_400));
+        assert!(matches!(decision, BoundaryDecision::Use(_)));
     }
 
     #[test]

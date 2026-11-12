@@ -201,6 +201,9 @@ struct AntigravityAuthFile {
 #[derive(Deserialize)]
 struct AntigravityTokenData {
     access_token: String,
+    /// RFC 3339 expiry written by Antigravity with the token.
+    #[serde(default)]
+    expiry: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -364,15 +367,30 @@ fn finish_provider_poll<S: PartialEq>(
 }
 
 fn log_provider_success(id: usize, usage: &UsageData) {
+    // Reset times are public window boundaries, logged so rollovers can be
+    // correlated with what the widget showed.
+    let reset = |section: &UsageSection| {
+        section
+            .resets_at
+            .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
+            .map(|at| at.as_secs())
+    };
     match id {
         0 => diagnose::log(format!(
-            "Claude usage poll succeeded session_used={:.2}% weekly_used={:.2}%",
-            usage.session.percentage, usage.weekly.percentage
+            "Claude usage poll succeeded session_used={:.2}% session_reset_unix={:?} weekly_used={:.2}% weekly_reset_unix={:?}",
+            usage.session.percentage,
+            reset(&usage.session),
+            usage.weekly.percentage,
+            reset(&usage.weekly)
         )),
         1 => log_codex_success(usage),
         _ => diagnose::log(format!(
-            "Antigravity usage poll succeeded session_used={:.2}% weekly_used={:.2}%",
-            usage.session.percentage, usage.weekly.percentage
+            "Antigravity usage poll succeeded group={} session_used={:.2}% session_reset_unix={:?} weekly_used={:.2}% weekly_reset_unix={:?}",
+            usage.quota_group.as_deref().unwrap_or("unnamed"),
+            usage.session.percentage,
+            reset(&usage.session),
+            usage.weekly.percentage,
+            reset(&usage.weekly)
         )),
     }
 }
@@ -814,7 +832,16 @@ fn poll_claude_sources(
 ) -> Result<UsageData, PollError> {
     if let Some((data, fetched_at)) = cli.cached_usage.as_ref() {
         let age = now.duration_since(*fetched_at).unwrap_or_default();
-        if age < CLAUDE_LOCAL_CACHE_FRESH {
+        // A reading fetched before a reset that has since passed describes the
+        // old window: it must not stand in for the post-reset request.
+        let predates_reset = [&data.session, &data.weekly].iter().any(|section| {
+            crate::provider_health::window_reset_since(section.resets_at, Some(*fetched_at), now)
+        });
+        if predates_reset {
+            diagnose::log(
+                "Claude Code's local cache predates a passed reset; requesting fresh usage",
+            );
+        } else if age < CLAUDE_LOCAL_CACHE_FRESH {
             diagnose::log(format!(
                 "Claude usage served from Claude Code's local cache age_s={}; no request",
                 age.as_secs()
@@ -923,6 +950,17 @@ fn poll_antigravity() -> Result<UsageData, PollError> {
         }
     };
 
+    // An access token past its stored expiry is rejected by every endpoint;
+    // wait for Antigravity to sign in again instead of sending it.
+    if antigravity_token_expired(creds.expiry.as_deref(), SystemTime::now()) {
+        log_claude_state_change(
+            0,
+            "Antigravity sign-in expired; waiting for Antigravity to renew it, no usage request"
+                .to_string(),
+        );
+        return Err(PollError::TokenExpired);
+    }
+    log_claude_state_change(0, "Antigravity sign-in present".to_string());
     fetch_antigravity_usage(&creds.access_token)
 }
 
@@ -1532,12 +1570,12 @@ fn fetch_antigravity_usage_from_endpoint(
         }
     }
 
-    let session = fetch_antigravity_model_quota(base_url, token, project.as_deref())?;
-    let weekly = UsageSection::default();
+    let (session, quota_group) =
+        fetch_antigravity_model_quota(base_url, token, project.as_deref())?;
 
     Ok(UsageData {
         session,
-        weekly,
+        quota_group,
         ..UsageData::default()
     })
 }
@@ -1580,7 +1618,7 @@ fn fetch_antigravity_model_quota(
     base_url: &str,
     token: &str,
     project: Option<&str>,
-) -> Result<UsageSection, PollError> {
+) -> Result<(UsageSection, Option<String>), PollError> {
     let agent = build_agent()?;
     let body = match project {
         Some(project) => serde_json::json!({ "project": project }),
@@ -1613,14 +1651,25 @@ fn fetch_antigravity_model_quota(
         }
     };
 
-    best_antigravity_section(response.models.into_iter().filter_map(|(model, info)| {
-        let quota = info.quota_info?;
-        if !is_antigravity_display_model(&model) {
-            return None;
-        }
-        antigravity_section_from_quota(quota)
-    }))
-    .ok_or(PollError::RequestFailed)
+    // Gemini models are the primary allowance; other model groups have their
+    // own quota and are used only when no Gemini model reports one.
+    let models: Vec<(String, UsageSection)> = response
+        .models
+        .into_iter()
+        .filter(|(model, _)| is_antigravity_display_model(model))
+        .filter_map(|(model, info)| {
+            Some((model, antigravity_section_from_quota(info.quota_info?)?))
+        })
+        .collect();
+    let has_gemini = models.iter().any(|(model, _)| model.starts_with("gemini"));
+    let section = best_antigravity_section(
+        models
+            .into_iter()
+            .filter(|(model, _)| !has_gemini || model.starts_with("gemini"))
+            .map(|(_, section)| section),
+    )
+    .ok_or(PollError::RequestFailed)?;
+    Ok((section, has_gemini.then(|| "Gemini Models".to_string())))
 }
 
 fn fetch_antigravity_quota_summary(
@@ -1680,40 +1729,47 @@ fn antigravity_section_from_summary_bucket(
     })
 }
 
+/// Gemini Models is Antigravity's primary allowance. Another group (for
+/// example "Claude and GPT models") is shown only when the response names no
+/// Gemini group, and then under its own name. Allowances of different groups
+/// are never combined, and a Gemini group without a usable window shows that
+/// window as unavailable (`--`) rather than another group's values.
 fn antigravity_usage_from_summary(response: AntigravityQuotaSummaryResponse) -> Option<UsageData> {
-    let mut fallback = None;
+    let groups = response.groups.unwrap_or_default();
+    log_antigravity_summary_shape(&groups);
 
-    for group in response.groups.unwrap_or_default() {
-        let is_gemini = is_antigravity_gemini_summary_group(&group);
-        let usage = antigravity_usage_from_summary_group(group);
-
-        if is_gemini && usage.is_some() {
-            return usage;
-        }
-
-        if fallback.is_none() {
-            fallback = usage;
-        }
+    let gemini = groups
+        .iter()
+        .filter_map(|group| antigravity_gemini_match(group).map(|rank| (rank, group)))
+        .min_by_key(|(rank, _)| *rank)
+        .map(|(_, group)| group);
+    if let Some(group) = gemini {
+        let mut data = antigravity_usage_from_summary_group(group).unwrap_or_default();
+        data.quota_group =
+            Some(antigravity_group_label(group).unwrap_or_else(|| "Gemini Models".to_string()));
+        return Some(data);
     }
-
-    fallback
+    groups.iter().find_map(|group| {
+        let mut data = antigravity_usage_from_summary_group(group)?;
+        data.quota_group = antigravity_group_label(group);
+        Some(data)
+    })
 }
 
-fn antigravity_usage_from_summary_group(group: AntigravityQuotaSummaryGroup) -> Option<UsageData> {
+fn antigravity_usage_from_summary_group(group: &AntigravityQuotaSummaryGroup) -> Option<UsageData> {
     let mut data = UsageData::default();
     let mut has_quota = false;
 
-    for bucket in group.buckets.unwrap_or_default() {
-        let Some(section) = antigravity_section_from_summary_bucket(&bucket) else {
+    for bucket in group.buckets.as_deref().unwrap_or_default() {
+        let Some(section) = antigravity_section_from_summary_bucket(bucket) else {
             continue;
         };
-
-        match bucket.window.as_deref() {
-            Some(window) if window.eq_ignore_ascii_case("5h") => {
+        match antigravity_bucket_window(bucket) {
+            Some(UsageWindowKind::Session) if !data.session.available => {
                 data.session = section;
                 has_quota = true;
             }
-            Some(window) if window.eq_ignore_ascii_case("weekly") => {
+            Some(UsageWindowKind::Weekly) if !data.weekly.available => {
                 data.weekly = section;
                 has_quota = true;
             }
@@ -1724,27 +1780,105 @@ fn antigravity_usage_from_summary_group(group: AntigravityQuotaSummaryGroup) -> 
     has_quota.then_some(data)
 }
 
-fn is_antigravity_gemini_summary_group(group: &AntigravityQuotaSummaryGroup) -> bool {
-    group
+/// The bucket's window from its `window` field, or else from its identifier
+/// or name ("gemini-5h", "Five Hour Limit", "Weekly Limit").
+fn antigravity_bucket_window(bucket: &AntigravityQuotaSummaryBucket) -> Option<UsageWindowKind> {
+    fn classify(text: &str) -> Option<UsageWindowKind> {
+        let key: String = text
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        if key.contains("5h") || key.contains("fivehour") || key.contains("5hour") {
+            Some(UsageWindowKind::Session)
+        } else if key.contains("week") || key.contains("7d") || key.contains("sevenday") {
+            Some(UsageWindowKind::Weekly)
+        } else {
+            None
+        }
+    }
+    [
+        bucket.window.as_deref(),
+        bucket.bucket_id.as_deref(),
+        bucket.display_name.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(classify)
+}
+
+/// How confidently a group is the Gemini group: its name (0), its
+/// description (1) or its buckets (2). `None` for other groups.
+fn antigravity_gemini_match(group: &AntigravityQuotaSummaryGroup) -> Option<u8> {
+    let gemini =
+        |text: Option<&str>| text.is_some_and(|t| t.to_ascii_lowercase().contains("gemini"));
+    if gemini(group.display_name.as_deref()) {
+        return Some(0);
+    }
+    if group.display_name.is_none() && gemini(group.description.as_deref()) {
+        return Some(1);
+    }
+    let buckets = group.buckets.as_deref().unwrap_or_default();
+    (group.display_name.is_none()
+        && !buckets.is_empty()
+        && buckets.iter().all(|bucket| {
+            bucket
+                .bucket_id
+                .as_deref()
+                .is_some_and(|id| id.to_ascii_lowercase().starts_with("gemini"))
+                || gemini(bucket.display_name.as_deref())
+        }))
+    .then_some(2)
+}
+
+/// A provider-supplied group name, trimmed to printable text for display.
+fn antigravity_group_label(group: &AntigravityQuotaSummaryGroup) -> Option<String> {
+    let name: String = group
         .display_name
-        .as_deref()
-        .is_some_and(|name| name.to_ascii_lowercase().contains("gemini"))
-        || group
-            .description
-            .as_deref()
-            .is_some_and(|description| description.to_ascii_lowercase().contains("gemini"))
-        || group.buckets.as_ref().is_some_and(|buckets| {
-            buckets.iter().any(|bucket| {
-                bucket
-                    .bucket_id
-                    .as_deref()
-                    .is_some_and(|id| id.to_ascii_lowercase().starts_with("gemini-"))
-                    || bucket
-                        .display_name
-                        .as_deref()
-                        .is_some_and(|name| name.to_ascii_lowercase().contains("gemini"))
-            })
+        .as_deref()?
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(40)
+        .collect();
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Logs the response's group and bucket layout when it changes: names,
+/// windows and which fields are present. No project, account or token data.
+fn log_antigravity_summary_shape(groups: &[AntigravityQuotaSummaryGroup]) {
+    static LAST: Mutex<Option<String>> = Mutex::new(None);
+    let shape = groups
+        .iter()
+        .map(|group| {
+            let buckets = group
+                .buckets
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|bucket| {
+                    format!(
+                        "{}/{}(fraction={},reset={})",
+                        bucket.bucket_id.as_deref().unwrap_or("-"),
+                        bucket.window.as_deref().unwrap_or("-"),
+                        bucket.remaining_fraction.is_some(),
+                        bucket.reset_time.is_some()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "'{}'[{buckets}]",
+                antigravity_group_label(group).unwrap_or_else(|| "-".to_string())
+            )
         })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.as_deref() != Some(shape.as_str()) {
+        diagnose::log(format!("Antigravity quota summary groups: {shape}"));
+        *last = Some(shape);
+    }
 }
 
 fn best_antigravity_section<I>(sections: I) -> Option<UsageSection>
@@ -1947,6 +2081,10 @@ fn diagnose_codex_token_expiry(expiration_unix: u64) {
     }
 }
 
+fn antigravity_token_expired(expiry: Option<&str>, now: SystemTime) -> bool {
+    parse_iso8601(expiry).is_some_and(|expiry| expiry <= now)
+}
+
 fn read_antigravity_credentials() -> Option<AntigravityTokenData> {
     let content = read_windows_generic_credential(ANTIGRAVITY_CREDENTIAL_TARGET)?;
     let auth: AntigravityAuthFile = serde_json::from_str(&content).ok()?;
@@ -2122,20 +2260,31 @@ fn is_token_expired(expires_at: Option<i64>) -> bool {
 
 /// Parse an ISO 8601 timestamp string into a SystemTime.
 fn parse_iso8601(s: Option<&str>) -> Option<SystemTime> {
-    let s = s?;
-    // Strip timezone offset to get "YYYY-MM-DDTHH:MM:SS" or with fractional seconds
-    // The API returns formats like "2026-03-05T08:00:00.321598+00:00"
-    let datetime_part = s.split('+').next().unwrap_or(s);
-    let datetime_part = datetime_part.split('Z').next().unwrap_or(datetime_part);
-
-    // Try parsing with and without fractional seconds
-    let formats = ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S"];
-    for fmt in &formats {
-        if let Ok(secs) = parse_datetime_to_unix(datetime_part, fmt) {
-            return Some(UNIX_EPOCH + Duration::from_secs(secs));
+    let s = s?.trim();
+    // Formats seen: "2026-03-05T08:00:00.321598+00:00", "...Z", and local
+    // offsets such as "2026-11-09T10:30:08.9951974-06:00". The offset is
+    // applied, not dropped.
+    let (date, time) = s.split_once('T')?;
+    let (time, offset_secs) = if let Some(time) = time.strip_suffix(['Z', 'z']) {
+        (time, 0i64)
+    } else if let Some(index) = time.rfind(['+', '-']) {
+        let (clock, offset) = time.split_at(index);
+        let sign = if offset.starts_with('-') { -1 } else { 1 };
+        let (hours, minutes) = offset[1..].split_once(':').unwrap_or((&offset[1..], "0"));
+        let hours: i64 = hours.parse().ok()?;
+        let minutes: i64 = minutes.parse().ok()?;
+        if hours > 23 || minutes > 59 {
+            return None;
         }
-    }
-    None
+        (clock, sign * (hours * 3600 + minutes * 60))
+    } else {
+        (time, 0)
+    };
+    let local = parse_datetime_to_unix(&format!("{date}T{time}"), "%Y-%m-%dT%H:%M:%S%.f").ok()?;
+    let utc = i64::try_from(local).ok()?.checked_sub(offset_secs)?;
+    u64::try_from(utc)
+        .ok()
+        .map(|secs| UNIX_EPOCH + Duration::from_secs(secs))
 }
 
 /// Minimal datetime parser — avoids pulling in chrono/time crates.
@@ -2201,7 +2350,7 @@ pub fn format_line(
     } else {
         section.percentage.clamp(0.0, 100.0)
     };
-    let pct = format!("{percentage:.0}%");
+    let pct = format_percent(percentage);
     let cd = format_countdown(section.resets_at, strings);
     if cd.is_empty() {
         pct
@@ -2236,7 +2385,7 @@ pub fn format_codex_line(
     } else {
         section.percentage.clamp(0.0, 100.0)
     };
-    let percentage = format!("{percentage:.0}%");
+    let percentage = format_percent(percentage);
     let countdown = section
         .resets_at
         .map(|reset| match reset.duration_since(SystemTime::now()) {
@@ -2292,22 +2441,50 @@ fn format_simplified_chinese_values_with_label(
     label: &str,
 ) -> String {
     let Some(reset) = reset else {
-        return format!("{label}{percentage:.0}%");
+        return format!("{label}{}", format_percent(percentage));
     };
     match window {
         UsageWindowKind::Session => {
             format!(
-                "{label}{percentage:.0}% {:02}:{:02}重置",
-                reset.wHour, reset.wMinute
+                "{label}{} {:02}:{:02}重置",
+                format_percent(percentage),
+                reset.wHour,
+                reset.wMinute
             )
         }
         UsageWindowKind::Weekly => {
             format!(
-                "{label}{percentage:.0}% {:02}/{:02}重置",
-                reset.wMonth, reset.wDay
+                "{label}{} {:02}/{:02}重置",
+                format_percent(percentage),
+                reset.wMonth,
+                reset.wDay
             )
         }
     }
+}
+
+/// Whole percent for display, without rounding away the ends of the scale: a
+/// positive value below 1% is `<1%` and a value just short of 100% is `99%`,
+/// so `0%` and `100%` only ever mean exactly empty or exactly full.
+pub fn format_percent(value: f64) -> String {
+    let value = if value.is_finite() {
+        value.clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+    if value > 0.0 && value < 1.0 {
+        "<1%".to_string()
+    } else if value > 99.0 && value < 100.0 {
+        "99%".to_string()
+    } else {
+        format!("{:.0}%", value.round())
+    }
+}
+
+/// Whether a window has no quota left. Exhaustion is exact: a positive
+/// remainder that displays as `<1%` is not exhausted.
+pub fn window_exhausted(used_percentage: f64) -> bool {
+    remaining_percentage(used_percentage) <= 0.0
 }
 
 pub fn remaining_percentage(used_percentage: f64) -> f64 {
@@ -2481,6 +2658,27 @@ mod tests {
                 desktop_consulted,
                 observation: CLAUDE_OBSERVATION.with(|cell| cell.take()),
             }
+        }
+
+        #[test]
+        fn a_cache_fetched_before_a_passed_reset_never_replaces_the_request() {
+            // Claude Code cached 16% 30 s ago; the 5h window reset 10 s ago.
+            let mut cli = cli_state(Some(30));
+            if let Some((data, _)) = cli.cached_usage.as_mut() {
+                data.session.percentage = 16.0;
+                data.session.resets_at = Some(now() - Duration::from_secs(10));
+            }
+            let mut guards = Default::default();
+            let run = run(
+                &cli,
+                Some(synthetic_credentials("cli", Some(FUTURE))),
+                None,
+                &mut guards,
+                |_| Ok(usage_with_session_percent(0.0)),
+            );
+            assert_eq!(run.tokens, vec!["cli".to_string()]);
+            assert_eq!(run.result.unwrap().session.percentage, 0.0);
+            assert_eq!(run.observation.source, DataSource::Live);
         }
 
         #[test]
@@ -3236,7 +3434,8 @@ garbage line provider request started provider=claude
             true,
             UsageWindowKind::Session,
         );
-        assert!(text.starts_with("100% "));
+        // 99.6% remaining is not full: 100% is shown only when exactly full.
+        assert!(text.starts_with("99% "));
         assert!(text.ends_with("2h59m"));
     }
 
@@ -3383,5 +3582,154 @@ garbage line provider request started provider=claude
         assert!((usage.session.percentage - 4.17425).abs() < 0.000001);
         assert!(usage.weekly.resets_at.is_some());
         assert!(usage.session.resets_at.is_some());
+        assert_eq!(usage.quota_group.as_deref(), Some("Gemini Models"));
+    }
+
+    fn summary(json: &str) -> AntigravityQuotaSummaryResponse {
+        serde_json::from_str(json).expect("summary response should deserialize")
+    }
+
+    /// The field case: Antigravity's own panel showed Gemini Models at 100%
+    /// and Claude and GPT models at 97%/98%; the widget showed the latter.
+    const OTHER_GROUP_FIRST: &str = r#"{"groups": [
+        {"displayName": "Claude and GPT models", "buckets": [
+            {"bucketId": "3p-5h", "window": "5h", "resetTime": "2026-06-13T23:32:02Z", "remainingFraction": 0.97},
+            {"bucketId": "3p-weekly", "window": "weekly", "resetTime": "2026-06-20T18:32:02Z", "remainingFraction": 0.98}]},
+        {"displayName": "Gemini Models", "buckets": [
+            {"bucketId": "gemini-5h", "window": "5h", "resetTime": "2026-06-13T22:08:54Z", "remainingFraction": 1},
+            {"bucketId": "gemini-weekly", "window": "weekly", "resetTime": "2026-06-20T17:08:54Z", "remainingFraction": 1}]}]}"#;
+
+    #[test]
+    fn antigravity_selects_gemini_whatever_the_group_order() {
+        let usage = antigravity_usage_from_summary(summary(OTHER_GROUP_FIRST)).unwrap();
+        assert_eq!(remaining_percentage(usage.session.percentage), 100.0);
+        assert_eq!(remaining_percentage(usage.weekly.percentage), 100.0);
+        assert_eq!(usage.quota_group.as_deref(), Some("Gemini Models"));
+    }
+
+    #[test]
+    fn a_gemini_group_without_usable_windows_is_unavailable_not_replaced() {
+        // Gemini reported without fractions: never borrow the other group's values.
+        let usage = antigravity_usage_from_summary(summary(
+            r#"{"groups": [
+                {"displayName": "Claude and GPT models", "buckets": [
+                    {"bucketId": "3p-5h", "window": "5h", "remainingFraction": 0.97}]},
+                {"displayName": "Gemini Models", "buckets": [
+                    {"bucketId": "gemini-5h", "window": "5h"},
+                    {"bucketId": "gemini-weekly", "window": "weekly"}]}]}"#,
+        ))
+        .unwrap();
+        assert!(!usage.session.available && !usage.weekly.available);
+        assert_eq!(usage.quota_group.as_deref(), Some("Gemini Models"));
+
+        let empty = antigravity_usage_from_summary(summary(
+            r#"{"groups": [{"displayName": "Gemini Models"}]}"#,
+        ))
+        .unwrap();
+        assert!(!empty.session.available && !empty.weekly.available);
+    }
+
+    #[test]
+    fn without_a_gemini_group_the_other_group_is_shown_under_its_own_name() {
+        let usage = antigravity_usage_from_summary(summary(
+            r#"{"groups": [
+                {"displayName": "Claude and GPT models", "buckets": [
+                    {"bucketId": "3p-5h", "window": "5h", "remainingFraction": 0.97}]}]}"#,
+        ))
+        .unwrap();
+        assert!((remaining_percentage(usage.session.percentage) - 97.0).abs() < 1e-9);
+        assert!(!usage.weekly.available);
+        assert_eq!(usage.quota_group.as_deref(), Some("Claude and GPT models"));
+        assert!(antigravity_usage_from_summary(summary(r#"{"groups": []}"#)).is_none());
+        assert!(antigravity_usage_from_summary(summary(r#"{}"#)).is_none());
+    }
+
+    #[test]
+    fn antigravity_windows_and_gemini_groups_use_alternative_identifiers() {
+        // No displayName; the group is Gemini by its bucket identifiers, and
+        // windows come from identifiers or names when `window` is absent.
+        let usage = antigravity_usage_from_summary(summary(
+            r#"{"groups": [
+                {"displayName": "Claude and GPT models", "description": "Not Gemini", "buckets": [
+                    {"bucketId": "3p-5h", "window": "FIVE_HOUR", "remainingFraction": 0.5}]},
+                {"buckets": [
+                    {"bucketId": "gemini-5h", "remainingFraction": 0.75},
+                    {"bucketId": "gemini-weekly-limit", "displayName": "Weekly Limit", "remainingFraction": 0.9}]}]}"#,
+        ))
+        .unwrap();
+        assert!((usage.session.percentage - 25.0).abs() < 1e-9);
+        assert!((usage.weekly.percentage - 10.0).abs() < 1e-9);
+        assert_eq!(usage.quota_group.as_deref(), Some("Gemini Models"));
+        // A name match outranks a description that merely mentions Gemini.
+        let named = antigravity_usage_from_summary(summary(
+            r#"{"groups": [
+                {"description": "Gemini models excluded", "buckets": [
+                    {"window": "5h", "remainingFraction": 0.1}]},
+                {"displayName": "Gemini Models", "buckets": [
+                    {"window": "5h", "remainingFraction": 0.6}]}]}"#,
+        ))
+        .unwrap();
+        assert!((named.session.percentage - 40.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn iso8601_offsets_are_applied() {
+        let at = |s: &str| {
+            parse_iso8601(Some(s)).map(|t| t.duration_since(UNIX_EPOCH).unwrap().as_secs())
+        };
+        // 2026-11-09T16:30:08Z
+        let utc = 1_794_241_808;
+        assert_eq!(at("2026-11-09T16:30:08Z"), Some(utc));
+        assert_eq!(at("2026-11-09T16:30:08.5+00:00"), Some(utc));
+        assert_eq!(at("2026-11-09T10:30:08.9951974-06:00"), Some(utc));
+        assert_eq!(at("2026-11-09T22:00:08+05:30"), Some(utc));
+        assert_eq!(at("2026-11-09T16:30:08"), Some(utc));
+        assert_eq!(at("not a time"), None);
+        assert_eq!(at("2026-11-09T16:30:08+99:00"), None);
+    }
+
+    #[test]
+    fn an_expired_antigravity_token_is_not_sent() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_794_241_808);
+        assert!(antigravity_token_expired(
+            Some("2026-11-09T10:30:08-06:00"),
+            now
+        ));
+        assert!(!antigravity_token_expired(
+            Some("2026-11-09T11:30:08-06:00"),
+            now
+        ));
+        // Unknown expiry: let the server decide.
+        assert!(!antigravity_token_expired(None, now));
+        assert!(!antigravity_token_expired(Some("garbage"), now));
+    }
+
+    #[test]
+    fn percent_text_keeps_empty_and_full_exact() {
+        for (value, text) in [
+            (0.0, "0%"),
+            (0.0001, "<1%"),
+            (0.5, "<1%"),
+            (0.99, "<1%"),
+            (1.0, "1%"),
+            (1.4, "1%"),
+            (50.5, "51%"),
+            (98.6, "99%"),
+            (99.01, "99%"),
+            (99.5, "99%"),
+            (99.99, "99%"),
+            (100.0, "100%"),
+            (-3.0, "0%"),
+            (130.0, "100%"),
+            (f64::NAN, "0%"),
+        ] {
+            assert_eq!(format_percent(value), text, "{value}");
+        }
+        // Used 99.5% leaves 0.5%: shown as <1% remaining, not exhausted.
+        assert_eq!(format_percent(remaining_percentage(99.5)), "<1%");
+        assert!(!window_exhausted(99.5));
+        assert!(!window_exhausted(99.99));
+        assert!(window_exhausted(100.0));
+        assert!(window_exhausted(120.0));
     }
 }

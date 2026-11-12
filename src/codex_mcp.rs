@@ -936,6 +936,7 @@ mod tests {
                 available: true,
             },
             credits: None,
+            quota_group: None,
         }
     }
 
