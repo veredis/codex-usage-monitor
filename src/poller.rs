@@ -35,6 +35,9 @@ pub enum PollError {
     RateLimited,
     ServerError,
     RequestFailed,
+    /// The provider answered without the quota the owner chose (an Antigravity
+    /// group the current source does not report). Not retried with backoff.
+    Unavailable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,6 +56,7 @@ impl PollError {
             Self::RateLimited => "rate_limited",
             Self::ServerError => "server_error",
             Self::RequestFailed => "invalid_response",
+            Self::Unavailable => "unavailable",
         }
     }
 }
@@ -966,8 +970,8 @@ fn poll_antigravity() -> Result<UsageData, PollError> {
     // Antigravity's own language server reports every quota group with both
     // windows, exactly as its panel shows them. Google's service is the
     // fallback when Antigravity is not running.
-    if let Some(data) = fetch_antigravity_local_usage() {
-        return Ok(data);
+    if let Some(result) = fetch_antigravity_local_usage() {
+        return result;
     }
 
     let creds = match read_antigravity_credentials() {
@@ -1592,12 +1596,17 @@ fn fetch_antigravity_usage_from_endpoint(
         match fetch_antigravity_quota_summary(base_url, token, project) {
             Ok(data) => return Ok(data),
             Err(PollError::AuthRequired) => return Err(PollError::AuthRequired),
+            Err(PollError::Unavailable) => return Err(PollError::Unavailable),
             Err(error) => diagnose::log(format!(
                 "Antigravity retrieveUserQuotaSummary failed, falling back to model quota: {error:?}"
             )),
         }
     }
 
+    // Per-model quota names no group, so it never stands in for a chosen one.
+    if antigravity_quota_group_chosen() {
+        return Err(PollError::Unavailable);
+    }
     let (session, quota_group) =
         fetch_antigravity_model_quota(base_url, token, project.as_deref())?;
 
@@ -1734,7 +1743,7 @@ fn fetch_antigravity_quota_summary(
         }
     };
 
-    antigravity_usage_from_summary(response).ok_or(PollError::RequestFailed)
+    antigravity_usage_from_summary(response)
 }
 
 fn antigravity_section_from_quota(quota: AntigravityQuotaInfo) -> Option<UsageSection> {
@@ -1763,9 +1772,13 @@ fn antigravity_section_from_summary_bucket(
 /// are never combined, and a Gemini group without a usable window shows that
 /// window as unavailable (`--`) rather than another group's values.
 ///
-/// A group the owner chose (Antigravity quota menu) is shown whenever the
-/// response contains it; otherwise the Auto choice applies.
-fn antigravity_usage_from_summary(response: AntigravityQuotaSummaryResponse) -> Option<UsageData> {
+/// A group the owner chose (Antigravity quota menu) is shown only from a
+/// response that contains it; otherwise the result is `Unavailable`, so the
+/// last value of that group stays on screen marked stale and another group is
+/// never shown in its place.
+fn antigravity_usage_from_summary(
+    response: AntigravityQuotaSummaryResponse,
+) -> Result<UsageData, PollError> {
     let groups = response.groups.unwrap_or_default();
     log_antigravity_summary_shape(&groups);
     remember_antigravity_groups(&groups);
@@ -1776,13 +1789,21 @@ fn antigravity_usage_from_summary(response: AntigravityQuotaSummaryResponse) -> 
     select_antigravity_group(&groups, preferred.as_deref())
 }
 
+fn antigravity_quota_group_chosen() -> bool {
+    ANTIGRAVITY_QUOTA_GROUP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some()
+}
+
 /// Antigravity's local language server answers `{"response": <summary>}`.
 #[derive(Deserialize)]
 struct AntigravityLocalSummary {
     response: Option<AntigravityQuotaSummaryResponse>,
 }
 
-fn fetch_antigravity_local_usage() -> Option<UsageData> {
+/// `None` when Antigravity's server is not available (use Google's service).
+fn fetch_antigravity_local_usage() -> Option<Result<UsageData, PollError>> {
     let body = crate::antigravity_local::retrieve_user_quota_summary()?;
     let summary = match serde_json::from_str::<AntigravityLocalSummary>(&body) {
         Ok(summary) => summary.response?,
@@ -1794,7 +1815,7 @@ fn fetch_antigravity_local_usage() -> Option<UsageData> {
             return None;
         }
     };
-    antigravity_usage_from_summary(summary)
+    Some(antigravity_usage_from_summary(summary))
 }
 
 /// Keeps every group name seen during this run (first-seen order) so the menu
@@ -1814,7 +1835,7 @@ fn remember_antigravity_groups(groups: &[AntigravityQuotaSummaryGroup]) {
 fn select_antigravity_group(
     groups: &[AntigravityQuotaSummaryGroup],
     preferred: Option<&str>,
-) -> Option<UsageData> {
+) -> Result<UsageData, PollError> {
     if let Some(preferred) = preferred {
         let chosen = groups.iter().find(|group| {
             antigravity_group_label(group)
@@ -1825,8 +1846,9 @@ fn select_antigravity_group(
             // limit) shows as unavailable.
             let mut data = antigravity_usage_from_summary_group(group).unwrap_or_default();
             data.quota_group = antigravity_group_label(group);
-            return Some(data);
+            return Ok(data);
         }
+        return Err(PollError::Unavailable);
     }
 
     let gemini = groups
@@ -1838,13 +1860,16 @@ fn select_antigravity_group(
         let mut data = antigravity_usage_from_summary_group(group).unwrap_or_default();
         data.quota_group =
             Some(antigravity_group_label(group).unwrap_or_else(|| "Gemini Models".to_string()));
-        return Some(data);
+        return Ok(data);
     }
-    groups.iter().find_map(|group| {
-        let mut data = antigravity_usage_from_summary_group(group)?;
-        data.quota_group = antigravity_group_label(group);
-        Some(data)
-    })
+    groups
+        .iter()
+        .find_map(|group| {
+            let mut data = antigravity_usage_from_summary_group(group)?;
+            data.quota_group = antigravity_group_label(group);
+            Some(data)
+        })
+        .ok_or(PollError::RequestFailed)
 }
 
 fn antigravity_usage_from_summary_group(group: &AntigravityQuotaSummaryGroup) -> Option<UsageData> {
@@ -3731,8 +3756,8 @@ garbage line provider request started provider=claude
         assert!((remaining_percentage(usage.session.percentage) - 97.0).abs() < 1e-9);
         assert!(!usage.weekly.available);
         assert_eq!(usage.quota_group.as_deref(), Some("Claude and GPT models"));
-        assert!(antigravity_usage_from_summary(summary(r#"{"groups": []}"#)).is_none());
-        assert!(antigravity_usage_from_summary(summary(r#"{}"#)).is_none());
+        assert!(antigravity_usage_from_summary(summary(r#"{"groups": []}"#)).is_err());
+        assert!(antigravity_usage_from_summary(summary(r#"{}"#)).is_err());
     }
 
     #[test]
@@ -3874,13 +3899,17 @@ garbage line provider request started provider=claude
         assert!(argon.weekly.available);
         assert!((argon.weekly.percentage - 15.61568).abs() < 1e-3);
 
-        // A chosen group missing from the response (Google's partial
-        // summary) falls back to Auto, labelled with the group shown.
+        // A chosen group missing from the response (Google's partial summary
+        // while Antigravity is closed) is unavailable: another group's values
+        // never stand in for it. Auto still shows the group that is present.
         let partial: Vec<_> = groups.into_iter().skip(1).take(1).collect();
-        let fallback = select_antigravity_group(&partial, Some("Gemini 4 Argon")).unwrap();
-        assert_eq!(
-            fallback.quota_group.as_deref(),
-            Some("Claude and GPT models")
-        );
+        for chosen in ["Gemini Models", "Gemini 4 Argon"] {
+            assert_eq!(
+                select_antigravity_group(&partial, Some(chosen)).unwrap_err(),
+                PollError::Unavailable
+            );
+        }
+        let auto = select_antigravity_group(&partial, None).unwrap();
+        assert_eq!(auto.quota_group.as_deref(), Some("Claude and GPT models"));
     }
 }

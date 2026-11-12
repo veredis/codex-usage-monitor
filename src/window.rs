@@ -4525,6 +4525,7 @@ fn poll_error_display_label(error: poller::PollError, language: LanguageId) -> &
                 "ERR"
             }
         }
+        poller::PollError::Unavailable => "--",
     }
 }
 
@@ -4950,6 +4951,11 @@ fn schedule_outcome(
         (None, _) => Outcome::Success,
         (Some(_), Some(delay_ms)) => Outcome::Wait { delay_ms },
         (error, None) if is_auth_wait_error(error) => Outcome::Wait {
+            delay_ms: base_interval_ms,
+        },
+        // The source answered; it just lacks the chosen quota. No backoff, so
+        // the quota returns promptly once its source does (Antigravity opens).
+        (Some(poller::PollError::Unavailable), None) => Outcome::Wait {
             delay_ms: base_interval_ms,
         },
         (Some(_), None) => Outcome::Transient {
@@ -8040,6 +8046,22 @@ mod tests {
         merge_provider_result(&mut data, CLAUDE, None, true);
         assert!(data.claude_code.is_none());
         assert!(data.codex.is_some());
+    }
+
+    #[test]
+    fn an_unavailable_chosen_quota_waits_without_backoff_and_shows_as_missing() {
+        use poller::PollError;
+        assert_eq!(
+            schedule_outcome(Some(PollError::Unavailable), None, None, POLL_30_SEC),
+            provider_schedule::Outcome::Wait {
+                delay_ms: POLL_30_SEC
+            }
+        );
+        assert_eq!(
+            poll_error_display_label(PollError::Unavailable, LanguageId::English),
+            "--"
+        );
+        assert_eq!(PollError::Unavailable.category(), "unavailable");
     }
 
     #[test]
